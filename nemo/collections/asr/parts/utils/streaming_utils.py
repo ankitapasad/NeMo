@@ -1604,7 +1604,7 @@ class FrameBatchMultiTaskAED(FrameBatchASR):
         super().__init__(asr_model, frame_len, total_buffer, batch_size, pad_to_buffer_len=False)
 
     def get_input_tokens(self, sample: dict):
-        if self.asr_model.prompt_format == "canary":
+        if self.asr_model.prompt_format == "canary" or self.asr_model.prompt_format == "canary2":
             missing_keys = [k for k in ("source_lang", "target_lang", "taskname", "pnc") if k not in sample]
             if missing_keys:
                 raise RuntimeError(
