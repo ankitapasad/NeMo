@@ -67,8 +67,7 @@ __all__ = ['EncDecMultiTaskModel']
 
 def lens_to_mask(lens, max_length):
     batch_size = lens.shape[0]
-    arange = torch.arange(max_length, device=lens.device)
-    mask = arange.expand(batch_size, max_length) < lens.unsqueeze(1)
+    mask = torch.arange(max_length).repeat(batch_size, 1).to(lens.device) < lens[:, None]
     return mask
 
 
@@ -674,36 +673,38 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
             return torch.tensor([0.0])
 
         input_ids, labels = batch.get_decoder_inputs_outputs()
-        input_ids_lens = batch.prompted_transcript_lens - 1
-
-        num_frames = batch.audio_lens.sum().float()
-        num_tokens = input_ids_lens.sum().float()
-        tot_frames = torch.as_tensor(batch.audio.numel(), device=num_frames.device, dtype=torch.float)
-        tot_tokens = torch.as_tensor(batch.prompted_transcript.numel(), device=num_frames.device, dtype=torch.float)
-
-        num_frames = batch.audio_lens.sum().float()
-        num_tokens = batch.prompted_transcript_lens.sum().float()
-        tot_frames = torch.as_tensor(batch.audio.numel(), device=num_frames.device, dtype=torch.float)
-        tot_tokens = torch.as_tensor(batch.prompted_transcript.numel(), device=num_frames.device, dtype=torch.float)
 
         transf_log_probs, encoded_len, enc_states, enc_mask = self.forward(
             input_signal=batch.audio,
             input_signal_length=batch.audio_lens,
             transcript=input_ids,
-            transcript_length=input_ids_lens,
+            transcript_length=batch.prompted_transcript_lens,
         )
 
-        # Mask components: 1) discard padding  &  2) discard prompt (notice the negation)
-        # For a full decoder sequence O with len M, the loss mask skips the first element,
-        # covering the remaining M-1 elements - hence we subtract 1 from prompt lens to account BOS.
-        maxlen = batch.prompted_transcript.shape[1] - 1
-        loss_mask = lens_to_mask(input_ids_lens, maxlen) & ~lens_to_mask(batch.prompt_lens - 1, maxlen)
-        audio_loss = self.loss(log_probs=transf_log_probs, labels=labels, output_mask=loss_mask)
+        # mask padded tokens
+        output_mask = (labels != self.loss._pad_id).to(transf_log_probs.dtype)
+        
+        # mask prompt tokens
+        B, T = labels.shape
+        prompt_lens_expanded = batch.prompt_lens.unsqueeze(1)  # Shape: B x 1
+        indices = torch.arange(T).to(prompt_lens_expanded.device).unsqueeze(0).expand(B, -1)  # Shape: B x T
+        zero_out_mask = indices < prompt_lens_expanded  # Shape: B x T, True where index < k
+        output_mask[zero_out_mask] = 0
+        
+        audio_loss = self.loss(
+            log_probs=transf_log_probs,
+            labels=labels,
+            output_mask=output_mask
+            )
 
+        num_frames = batch.audio_lens.sum()
+        num_tokens = batch.prompted_transcript_lens.sum()
+        tot_frames = batch.audio.numel()
+        tot_tokens = batch.prompted_transcript.numel()
         tensorboard_logs = {
             'train_loss': audio_loss,
-            'learning_rate': torch.as_tensor(self._optimizer.param_groups[0]['lr']),
-            'batch_size': torch.as_tensor(batch.audio.shape[0]),
+            'learning_rate': self._optimizer.param_groups[0]['lr'],
+            'batch_size': batch.audio.shape[0],
             'num_frames': num_frames,
             'num_tokens': num_tokens,
             'input_to_padding_ratio': num_frames / tot_frames,
@@ -714,7 +715,6 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
 
     def validation_pass(self, batch: PromptedAudioToTextMiniBatch, batch_idx, dataloader_idx=0, eval_mode="val"):
         input_ids, labels = batch.get_decoder_inputs_outputs()
-        input_ids_lens = batch.prompted_transcript_lens - 1
 
         transf_log_probs, encoded_len, enc_states, enc_mask = self.forward(
             input_signal=batch.audio,
@@ -723,14 +723,11 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
             transcript_length=batch.prompted_transcript_lens,
         )
 
-        # Mask components: 1) discard padding  &  2) discard prompt (notice the negation)
-        # For a full decoder sequence O with len M, the loss mask skips the first element,
-        # covering the remaining M-1 elements - hence we subtract 1 from prompt lens to account BOS.
-        maxlen = batch.prompted_transcript.shape[1] - 1
-        loss_mask = lens_to_mask(input_ids_lens, maxlen) & ~lens_to_mask(batch.prompt_lens - 1, maxlen)
-        transf_loss = self.loss(log_probs=transf_log_probs, labels=labels, output_mask=loss_mask)
-        self.val_loss(loss=transf_loss, num_measurements=loss_mask.long().sum())
-        output_dict = {f'{eval_mode}_loss': transf_loss}
+        transf_loss = self.loss(log_probs=transf_log_probs, labels=labels)
+        self.val_loss(loss=transf_loss, num_measurements=transf_log_probs.shape[0] * transf_log_probs.shape[1])
+        output_dict = {
+            f'{eval_mode}_loss': transf_loss,
+        }
 
         self.wer.update(
             predictions=enc_states,
