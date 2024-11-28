@@ -390,6 +390,7 @@ def main(cfg: TranscriptionConfig) -> Union[TranscriptionConfig, List[Hypothesis
 
             override_cfg = asr_model.get_transcribe_config()
             override_cfg.batch_size = cfg.batch_size
+            override_cfg.prompt_format = asr_model.prompt_format
             override_cfg.num_workers = cfg.num_workers
             override_cfg.return_hypotheses = cfg.return_hypotheses
             override_cfg.channel_selector = cfg.channel_selector
