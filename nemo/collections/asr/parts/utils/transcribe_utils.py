@@ -341,8 +341,11 @@ def restore_transcription_order(manifest_path: str, transcriptions: list) -> lis
     if is_list:
         transcriptions = list(zip(*transcriptions))
     reordered = [None] * len(transcriptions)
-    for new, old in enumerate(new2old):
-        reordered[old] = transcriptions[new]
+    try: # added because of mismatched number of samples in manifest and transcription
+        for new, old in enumerate(new2old):
+            reordered[old] = transcriptions[new]
+    except:
+        import pdb; pdb.set_trace()
     if is_list:
         reordered = tuple(map(list, zip(*reordered)))
     return reordered
@@ -478,6 +481,60 @@ def write_transcription(
 
     return cfg.output_filename, pred_text_attr_name
 
+
+def load_json(json_fn):
+    with open(json_fn, 'r') as f:
+        data = [json.loads(line.strip()) for line in f.readlines()]
+    return data
+
+def save_json(data, json_fn):
+    with open(json_fn, 'w') as f:
+        for item in data:
+            f.write(json.dumps(item) + '\n')
+
+def generate_final_manifest_for_eval(pred_dir, gt_fn, save_fn, num_manifests):
+    """
+    Concatenate all previous outputs
+    """
+    pred_txt_dct = {}
+    gt_data = load_json(gt_fn)
+    for idx in range(num_manifests):
+        curr_pred_data = load_json(os.path.join(pred_dir, f'manifest_{idx}.json'))
+        for line in curr_pred_data:
+            key = line['audio_filepath'].split('/')[-1]
+            _ = pred_txt_dct.setdefault(key, [])
+            pred_txt_dct[key].extend(line['pred_text'].split(' '))
+    
+    combined_data = []
+    for line in gt_data:
+        key = line['audio_filepath'].split('/')[-1]
+        assert key in pred_txt_dct
+        line['pred_text'] = ' '.join(pred_txt_dct[key])
+        combined_data.append(line)
+    save_json(combined_data, save_fn)
+
+def generate_manifest_with_context(manifest_idx, pred_fn, gt_fn):
+    """
+    Add decoded text from previous chunks to the current manifest
+    """
+    next_gt_fn_context = gt_fn.replace(f'{manifest_idx}.json', f'{manifest_idx+1}.json')
+    next_gt_fn_base = os.path.join(os.path.dirname(gt_fn), '..', 'base', f'manifest_{manifest_idx+1}.json')
+    pred_data = load_json(pred_fn)
+    base_data = load_json(next_gt_fn_base)
+    pred_dct = {}
+    for item in pred_data:
+        pred_dct[item['audio_filepath']] = item["pred_text"]
+    
+    context_data = []
+    for item in base_data:
+        assert item['audio_filepath'] in pred_dct
+        item['decodercontext'] = pred_dct[item['audio_filepath']]
+        # item['decodercontext'] = ' '.join(pred_dct[item['audio_filepath']].split(' ')[-5:]) # 16.8
+        # item['decodercontext'] = ' '.join(pred_dct[item['audio_filepath']].split(' ')[-10:]) # 19
+        context_data.append(item)
+    
+    save_json(context_data, next_gt_fn_context)
+    print(f'{next_gt_fn_context} created')
 
 def compute_metrics_per_sample(
     manifest_path: str,
