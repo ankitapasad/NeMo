@@ -467,7 +467,7 @@ def main(cfg: TranscriptionConfig) -> Union[TranscriptionConfig, List[Hypothesis
             model_name,
             filepaths=filepaths,
             compute_langs=compute_langs,
-            compute_timestamps=compute_timestamps,
+            timestamps=compute_timestamps,
         )
         logging.info(f"Finished writing predictions to {output_filename}!")
 
