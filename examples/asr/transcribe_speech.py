@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import json
+import numpy as np
 import os
 import time
 from dataclasses import dataclass, field, is_dataclass
@@ -75,6 +76,9 @@ Transcribe audio file on a single CPU/GPU. Useful for transcription of moderate 
   use_cer: Bool to use Character Error Rate (CER)  or Word Error Rate (WER)
 
   calculate_rtfx: Bool to calculate the RTFx throughput to transcribe the input dataset.
+  
+  write_res_fn: Filename where results will be recorded
+  data_name: name of the dataset
 
 # Usage
 ASR model can be specified by either "model_path" or "pretrained_name".
@@ -203,6 +207,9 @@ class TranscriptionConfig:
     extract_nbest: bool = False  # Extract n-best hypotheses from the model
 
     calculate_rtfx: bool = False
+
+    data_name: Optional[str] = None  # Name of the dataset
+    write_res_fn: Optional[str] = None
 
 
 @hydra_runner(config_name="TranscriptionConfig", schema=TranscriptionConfig)
@@ -392,6 +399,7 @@ def main(cfg: TranscriptionConfig) -> Union[TranscriptionConfig, List[Hypothesis
             override_cfg.text_field = cfg.gt_text_attr_name
             override_cfg.lang_field = cfg.gt_lang_attr_name
             override_cfg.timestamps = cfg.timestamps
+            override_cfg.prompt_format = asr_model.prompt_format
             if hasattr(override_cfg, "prompt"):
                 override_cfg.prompt = parse_multitask_prompt(OmegaConf.to_container(cfg.prompt))
 
@@ -451,6 +459,22 @@ def main(cfg: TranscriptionConfig) -> Union[TranscriptionConfig, List[Hypothesis
         if output_manifest_w_wer:
             logging.info(f"Writing prediction and error rate of each sample to {output_manifest_w_wer}!")
             logging.info(f"{total_res}")
+
+        if not os.path.exists(cfg.write_res_fn):
+            with open(cfg.write_res_fn, "w") as f:
+                f.write('exp_id,checkpoint,dataset,WER'+'\n')
+        write_wer = np.round(100*total_res['wer'], 2)
+        ckpt_dir = os.path.dirname(cfg.model_path)
+        if len(os.path.basename(cfg.model_path).split('.')) == 2:
+            ckpt_name = os.path.basename(cfg.model_path).split('.')[0]
+        else:
+            ckpt_name = '.'.join(os.path.basename(cfg.model_path).split('.')[:-1])
+        with open(os.path.join(ckpt_dir, "exp_name_to_id.json"), "r") as json_file:
+            exp_id = json.load(json_file)[ckpt_name]
+        write_line = f'{exp_id},{ckpt_name},{cfg.data_name},{write_wer}'
+        with open(cfg.write_res_fn, "a") as f:
+            f.write(write_line+'\n')
+        print(f"WER written to {cfg.write_res_fn}")
 
     if cfg.calculate_rtfx:
         logging.info(f"Dataset RTFx {(total_duration/transcribe_time)}")

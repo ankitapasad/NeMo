@@ -731,6 +731,7 @@ class ASRTranscriptionMixin(TranscriptionMixin):
             'channel_selector': get_value_from_transcription_config(trcfg, 'channel_selector', None),
             'text_field': get_value_from_transcription_config(trcfg, 'text_field', 'text'),
             'lang_field': get_value_from_transcription_config(trcfg, 'lang_field', 'lang'),
+            'prompt_format': get_value_from_transcription_config(trcfg, 'prompt_format', None),
         }
 
         augmentor = get_value_from_transcription_config(trcfg, 'augmentor', None)
