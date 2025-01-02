@@ -1226,9 +1226,34 @@ class ModelPT(LightningModule, Model):
             # except for if any string from exclude is present
             for e in exclude:
                 if e in k:
-                    excluded_param_names.append(k)
-                    should_add = False
+                    if 'librispeech' in self._cfg.train_ds.input_cfg and self._cfg.init_tokenizer:
+                        print(k)
+                        num_spl_tokens_c1 = 32
+                        num_langs_c1 = 4
+                        num_spl_tokens_c2 = 1152
+                        # num_spl_tokens_c2 = 1024
+                        num_langs_c2 = len(self._cfg.tokenizer.langs)-1
+                        assert v.shape[0] == num_spl_tokens_c1 + num_langs_c1*self._cfg.model_defaults.vocab_size_per_lang
+                        retain_dim = num_langs_c2*self._cfg.model_defaults.vocab_size_per_lang
+
+                        # get value from the initialized model
+                        obj = self
+                        for attr in k.split('.'):
+                            obj = getattr(obj, attr)
+                        assert obj.shape[0] == num_spl_tokens_c2 + retain_dim
+                        v_og = copy.deepcopy(v) # init from ckpt
+                        v = obj.clone().detach() # randomly initialized
+                        v[num_spl_tokens_c2:] = v_og[num_spl_tokens_c1:num_spl_tokens_c1+retain_dim] # update token embeddings from init ckpt
+                        # excluded_param_names.append(k)
+                        should_add = True
+                    else:
+                        excluded_param_names.append(k)
+                        should_add = False
                     break
+                # if e in k:
+                #     excluded_param_names.append(k)
+                #     should_add = False
+                #     break
             if should_add:
                 dict_to_load[k] = v
 
