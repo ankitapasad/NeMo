@@ -975,12 +975,13 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
             map_location="cpu",
         )
 
-        # Reset the weights of the LLM model
-        def reset_weights(m):
-            if hasattr(m, "reset_parameters"):
-                m.reset_parameters()
+        if not cfg.model.restore_weights:
+            # Reset the weights of the LLM model
+            def reset_weights(m):
+                if hasattr(m, "reset_parameters"):
+                    m.reset_parameters()
 
-        model.apply(reset_weights)
+            model.apply(reset_weights)
 
         if "peft" in cfg.model:
             peft_cfg_cls = PEFT_CONFIG_MAP[cfg.model.peft.peft_scheme]
