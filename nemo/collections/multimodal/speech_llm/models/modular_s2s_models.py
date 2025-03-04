@@ -522,12 +522,12 @@ class S2sModularAudioGPTModel(ModularAudioGPTModel):
         cfg: Optional[Union[OmegaConf, str]] = None,
         trainer: Optional[Trainer] = None,
     ):
-        trainer.time_event_callback.logtimeevent.on_model_init_start()
+        # trainer.time_event_callback.logtimeevent.on_model_init_start()
         model = super().restore_from_pretrained_models(cfg, trainer)
-        trainer.time_event_callback.logtimeevent.on_model_init_end()
-        trainer.time_event_callback.logtimeevent.on_load_checkpoint_start()
+        # trainer.time_event_callback.logtimeevent.on_model_init_end()
+        # trainer.time_event_callback.logtimeevent.on_load_checkpoint_start()
         cls.post_restore_from_pretrained_models(cls, model, cfg)
-        trainer.time_event_callback.logtimeevent.on_load_checkpoint_end()
+        # trainer.time_event_callback.logtimeevent.on_load_checkpoint_end()
         return model
 
     def load_state_dict(self, state_dict, strict: bool = True):
