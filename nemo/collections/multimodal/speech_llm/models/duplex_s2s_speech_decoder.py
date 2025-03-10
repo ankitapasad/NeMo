@@ -1494,8 +1494,11 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
         labels = all_channels[:, 1:]
 
         # assert labels.shape[1] == encoded.shape[1]
+        # make sure that all inputs have the same number of frame as something it might deviate in 1 frame
         labels = labels[:, : encoded.shape[1]]
         input_ids = input_ids[:, : encoded.shape[1]]
+        input_audio_tokens = input_audio_tokens[:, : encoded.shape[1]]
+
         loss_mask = torch.ones_like(labels)
         assert self.cfg.get(
             'duplex_loss_on_all_steps', False
