@@ -245,7 +245,6 @@ class SpeechDecoderInverted(NeuralModule):
 
         # create embeddings for encode input tokens
         if self.cond_on_prev_audio_tokens:
-            self.audio_embedding = nn.Embedding(num_audio_tokens_per_codebook * self.num_audio_codebooks, self.speech_decoder_parms["d_model"] * self.num_audio_codebooks)
             audio_embeddings = []
             for _ in range(self.num_audio_codebooks):
                 audio_embeddings.append(nn.Embedding(num_audio_tokens_per_codebook, self.speech_decoder_parms["d_model"]))
