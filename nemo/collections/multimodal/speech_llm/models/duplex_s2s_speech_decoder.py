@@ -206,6 +206,7 @@ class SpeechDecoder(NeuralModule):
                 # if training drop the "text" conditioning in a percentage of batch
                 if torch.rand(1).item() < self.cfg_unconditional_prob:
                     # make the whole batch zeros to the unconditional model
+                    # ToDo: move it to cache to need to just create a 1 frame tensor in inference
                     speech_decoder_input = torch.zeros_like(speech_decoder_input)
             else:
                 # if inference or evaluation create a zero tensor for speech decoder input and concatenate it to compute unconditional logits
@@ -614,7 +615,7 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
         # TODO: we expect only one modality in each batch of inference. In lhotse, can we specify a list of datasets which only have one modality either audio-text or text-only?
         # TODO: support text-only part of mini-batch
         # the following supports STT (audio-text) inference
-        
+
         # enable input and kv cache to the inference
         self.model.speech_decoder.reset_input_and_kv_cache(use_cache=True)
 
@@ -760,6 +761,9 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
         metadata = batch.get('metadata', [{}] * len(batch['tokens']))
         loss = super(MegatronGPTSFTModel, self).validation_step(itertools.chain([batch]), dataloader_idx)
 
+        # make sure that the model is in eval mode
+        self.eval()
+
         # We need _inference_config to get generation params
         # add_BOS and tokens_to_generate are set in dataset
         if self.get_inference_config() is None:
@@ -839,6 +843,9 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                 self.test_step_outputs[dataloader_idx][-1] = outputs
             else:
                 self.test_step_outputs[-1] = outputs
+        
+        # make sure that the model is in training mode after inference is done
+        self.train()
         return outputs
 
     def post_inference_step(self, list_outputs, mode, data_cfg):

@@ -816,7 +816,6 @@ def s2s_sample_sequence_batch(
                 # import pdb; pdb.set_trace()
 
                 prev = [get_prev(logits_i, started, temperature, extra) for logits_i in logits]
-
                 prev = torch.stack(prev, dim=1)
                 started_expand = started.unsqueeze(1).expand(-1, prev.size(1))
                 new_tokens = switch(tokens[:, context_length], prev, started_expand)
