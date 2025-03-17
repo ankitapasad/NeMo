@@ -1239,6 +1239,12 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
 
                         metric_result = metric_fn.compute()
                         metric_fn.reset()
+                    elif text_metric_name == "tts-wer":
+                        for pred, label in zip(deduplicated_outputs['speech_preds_transcribed'], deduplicated_outputs['preds']):
+                            _ = metric_fn(pred, label)
+
+                        metric_result = metric_fn.compute()
+                        metric_fn.reset()
                     elif metric_name == 'mos':
                         metric_result = sum(deduplicated_outputs['mos_scores']) / len(
                             deduplicated_outputs['mos_scores']
