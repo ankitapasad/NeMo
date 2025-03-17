@@ -140,6 +140,7 @@ class SpeechDecoder(NeuralModule):
         self.num_audio_tokens_per_codebook = num_audio_tokens_per_codebook
         # optional configs
         self.cfg_unconditional_prob = self.speech_decoder_parms.pop("cfg_unconditional_prob", None)
+        self.cfg_scale = self.speech_decoder_parms.pop("cfg_scale", 2.5)
         self.cond_on_prev_audio_tokens = self.speech_decoder_parms.pop("cond_on_prev_audio_tokens", False)
         self.detach_input = self.speech_decoder_parms.pop("detach_input", False)
 
@@ -200,11 +201,21 @@ class SpeechDecoder(NeuralModule):
         if speech_mask is None:
             speech_mask = torch.ones((speech_decoder_input.size(0), speech_decoder_input.size(1))).to(speech_decoder_input.device)
 
-        if self.cfg_unconditional_prob and self.training:
-            if torch.rand(1).item() < self.cfg_unconditional_prob:
-                # make the whole batch zeros to the unconditional model
-                speech_decoder_input = torch.zeros_like(speech_decoder_input)
-                speech_mask = torch.ones_like(speech_mask)
+        if self.cfg_unconditional_prob:
+            if self.training:
+                # if training drop the "text" conditioning in a percentage of batch
+                if torch.rand(1).item() < self.cfg_unconditional_prob:
+                    # make the whole batch zeros to the unconditional model
+                    speech_decoder_input = torch.zeros_like(speech_decoder_input)
+            else:
+                # if inference or evaluation create a zero tensor for speech decoder input and concatenate it to compute unconditional logits
+                speech_decoder_input_zeros = torch.zeros_like(speech_decoder_input)
+                speech_decoder_input = torch.cat([speech_decoder_input, speech_decoder_input_zeros], dim=0)
+                # duplicate mask to match the new shape
+                speech_mask = torch.cat([speech_mask, speech_mask], dim=0)
+                # if cond on prev tokens enabled, so duplicate the tokens to the new shape
+                if self.cond_on_prev_audio_tokens:
+                    input_audio_tokens = torch.cat([input_audio_tokens, input_audio_tokens], dim=0)
 
         if self.cond_on_prev_audio_tokens:
             if self.detach_input:
@@ -221,6 +232,13 @@ class SpeechDecoder(NeuralModule):
 
         # get the logits of all codebooks
         all_code_logits = self.final_proj(decoder_out)
+
+        # if using cfg and it is in inference or evaluation mix unconditional and coditional logits
+        if self.cfg_unconditional_prob and not self.training:
+            batch_size = all_code_logits.size(0) // 2
+            cond_logits = all_code_logits[:batch_size]
+            uncond_logits = all_code_logits[batch_size:]
+            all_code_logits = (1 - self.cfg_scale) * uncond_logits + self.cfg_scale * cond_logits
 
         if return_raw_logits:
             return all_code_logits
