@@ -3,6 +3,7 @@ import itertools
 import json
 import math
 import os
+import random
 import re
 import tempfile
 from collections import OrderedDict
@@ -539,20 +540,25 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
         mos_model = cls.get_mos_models_and_configs(cfg)
         logging.info(f"Loaded MOS Model: {mos_model}")
 
-        if cfg.model.get('salm_model_path') is not None:
-            # this may only work for tp=1
-            # check scripts/nlp_language_modeling/merge_lora_weights/merge_salm.py on tp>1
-            salm_model_path = cfg.model.get('salm_model_path')
-            if '.nemo' in salm_model_path:
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    NLPSaveRestoreConnector._unpack_nemo_file(salm_model_path, tmpdir)
-                    salm_model_path = f"{tmpdir}/model_weights.ckpt"
-                    torch_state_dict = torch.load(salm_model_path)
-            else:
-                torch_state_dict = torch.load(salm_model_path)['state_dict']
-            model.setup_complete = False
-            model.load_state_dict(torch_state_dict, strict=False)
-            logging.info(f"loading from {cfg.model.get('salm_model_path')}: {torch_state_dict.keys()}")
+        def overwrite_state_dict_with_ckpt_path(ckpt_path, ignore=[], nemo_path='model_weights.ckpt'):
+            if ckpt_path is not None:
+                # this may only work for tp=1
+                # check scripts/nlp_language_modeling/merge_lora_weights/merge_salm.py on tp>1
+                salm_model_path = ckpt_path
+                if '.nemo' in salm_model_path:
+                    with tempfile.TemporaryDirectory() as tmpdir:
+                        NLPSaveRestoreConnector._unpack_nemo_file(salm_model_path, tmpdir)
+                        salm_model_path = f"{tmpdir}/{nemo_path}"
+                        torch_state_dict = torch.load(salm_model_path)
+                else:
+                    torch_state_dict = torch.load(salm_model_path)['state_dict']
+                torch_state_dict = {k: v for k, v in torch_state_dict.items() if not any([i in k for i in ignore])}
+                model.setup_complete = False
+                model.load_state_dict(torch_state_dict, strict=False)
+                logging.info(f"loading from {ckpt_path}: {torch_state_dict.keys()}")
+
+        overwrite_state_dict_with_ckpt_path(cfg.model.get('salm_model_path'))
+        overwrite_state_dict_with_ckpt_path(cfg.model.get('s2s_salm_model_path'), ignore=['model.'])
 
         model.padded_vocab_size = cfg.model.s2s_vocab_size
 
@@ -1097,6 +1103,9 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
             def replace_speech_code(codes, id):
                 return torch.where(codes == id, codes[:, :1], codes)
 
+            def replace_speech_code_all(codes, id):
+                return torch.where(codes == torch.ones_like(codes[:, :1]) * id, codes[:, :1], codes)
+
             def get_index_of_code(codes, id):
                 # d, t
                 idxs = torch.where(codes[0] == id)[0]
@@ -1121,6 +1130,7 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
             codes = replace_speech_code(codes, self.cfg.data.train_ds.speech_eos_id)
             codes = replace_speech_code(codes, self.cfg.data.train_ds.speech_unk_id)
             codes = replace_speech_code(codes, self.cfg.data.train_ds.speech_pad_id)
+            codes = replace_speech_code_all(codes, 0)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 wav, _ = codec_model.decode(tokens=codes.unsqueeze(0), tokens_len=codec_len)
             wav = wav[0].float()
@@ -1538,6 +1548,8 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
         return torch.ceil(audio_len / self.codec_model_downsampling_factor / decoder_reduction_factor).int() - 1
 
     def prepare_llm_input_duplex_from_multiturn(self, audio_batch):
+        if random.random() < self.cfg.get('noise_prob', 0.0):
+            self.add_noise_to_batch(audio_batch, os.path.join(self.cfg.noise_path, 'train'), random.randint(15, 25))
         # real duplex data read from dataloader
         new_user_signal = audio_batch['audio_signal']
         new_user_signal_length = audio_batch['audio_signal_length']
@@ -1560,7 +1572,9 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
         )  # list, list
 
         answer_codecs_lens = torch.Tensor(answer_codecs_lens).long().cuda()
-        assert all(torch.isclose(answer_codecs_lens, encoded_len, atol=3))
+        assert all(
+            torch.isclose(answer_codecs_lens, encoded_len, atol=3)
+        ), f"answer_codecs_lens: {answer_codecs_lens}, encoded_len: {encoded_len}, sample_ids: {audio_batch['sample_ids']}"
         encoded_len = answer_codecs_lens
         all_channels = []
         for i, answer_codec in enumerate(answer_codecs):
@@ -1704,6 +1718,12 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
         if 'system_prompts' in audio_batch:
             system_prompts = audio_batch['system_prompts']
             system_prompts_length = audio_batch['system_prompts_length']
+            limit_max_seq_length = self.cfg.get("limit_context_max_seq_length", None)
+            if limit_max_seq_length is not None and self.training:
+                system_prompts = system_prompts[:, :limit_max_seq_length]
+                system_prompts_length = torch.minimum(
+                    system_prompts_length, torch.tensor(limit_max_seq_length).long().cuda()
+                )
             embeddings2use = self._get_text_embeddings(system_prompts, None)
             # tmp simplified solution
             encoder_input = torch.cat([embeddings2use.transpose(1, 0), encoder_input], dim=1)
@@ -1716,6 +1736,45 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
             encoder_length += system_prompts.shape[1]
             encoded = torch.cat([embeddings2use.transpose(1, 0), encoded], dim=1)
         return encoder_input, labels, loss_mask, encoded, encoder_length
+
+    # TODO: move the following to dataloader
+    def add_noise_to_batch(self, batch, noise_folder, snr_db=20):
+        batch_audio = batch['audio_signal']  #  torch tensor，Shape: (batch_size, length)
+        batch_size, audio_length = batch_audio.shape
+
+        noise_files = [f for f in os.listdir(noise_folder) if f.endswith('.wav')]
+        if not noise_files:
+            raise ValueError(f"No noise files found in {noise_folder}")
+
+        for i in range(batch_size):
+
+            noise_path = os.path.join(noise_folder, random.choice(noise_files))
+            noise, sr = sf.read(noise_path, dtype='float32')
+
+            if len(noise.shape) > 1:
+                noise = np.mean(noise, axis=1)
+
+            if len(noise) < audio_length:
+
+                repeat_times = (audio_length // len(noise)) + 1
+                noise = np.tile(noise, repeat_times)[:audio_length]
+            else:
+
+                start_idx = random.randint(0, len(noise) - audio_length)
+                noise = noise[start_idx : start_idx + audio_length]
+
+            noise_tensor = torch.tensor(noise, dtype=batch_audio.dtype, device=batch_audio.device)
+
+            signal_power = torch.mean(batch_audio[i] ** 2) + 1e-8
+            noise_power = torch.mean(noise_tensor**2) + 1e-8
+
+            target_noise_power = signal_power / (10 ** (snr_db / 10))
+            scaling_factor = torch.sqrt(target_noise_power / noise_power)
+            noise_tensor = noise_tensor * scaling_factor
+
+            batch_audio[i] = batch_audio[i] + noise_tensor
+
+        batch['audio_signal'] = batch_audio
 
     def prepare_llm_input(self, audio_batch):
         # handle duplex and singleturn s2s
