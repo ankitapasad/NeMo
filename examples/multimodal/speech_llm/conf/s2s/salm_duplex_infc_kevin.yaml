@@ -2093,7 +2093,8 @@ model:
       use_lhotse: True
       force_map_dataset: True
       # names: ['zhehuai_demo']
-      names: ['llamaqa','ultrachat_v2', 'alpaca_dev', 'tqa_context40', 'squadv2_v2_test', 'roleplay1', 'topic']  
+      # names: ['llamaqa','ultrachat_v2', 'alpaca_dev', 'tqa_context40', 'squadv2_v2_test', 'roleplay1', 'topic']
+      names: ['ultrachat_v2', 'alpaca_dev', 'tqa_context40', 'squadv2_v2_test', 'roleplay1', 'topic'] 
       # names: ['alpaca_dev']
       input_cfg:
         - type: group
@@ -2101,10 +2102,10 @@ model:
           tags:
             lang: en
           input_cfg:
-            - type: lhotse_shar
-              shar_path: /lustre/fsw/portfolios/llmservice/users/cchen1/data/inference_llama
-              tags:
-                s2s_duplex: True
+            # - type: lhotse_shar
+            #   shar_path: /lustre/fsw/portfolios/llmservice/users/cchen1/data/inference_llama
+            #   tags:
+            #     s2s_duplex: True
             - type: lhotse_shar
               shar_path: /lustre/fsw/portfolios/llmservice/users/kevinhu/duplex_inf/ultrachat_v2/shar_duplex/manifest_000200/
               tags:
@@ -2199,6 +2200,9 @@ model:
           average: null
           num_classes: null
         - name: "asr-wer"
+          average: null
+          num_classes: null
+        - name: "tts-wer"
           average: null
           num_classes: null
         - name: "mos"

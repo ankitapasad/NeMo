@@ -1221,6 +1221,12 @@ class S2sModularAudioGPTModel(ModularAudioGPTModel):
 
                         metric_result = metric_fn.compute()
                         metric_fn.reset()
+                    elif text_metric_name == "tts-wer":
+                        for pred, label in zip(deduplicated_outputs['speech_preds_transcribed'], deduplicated_outputs['preds']):
+                            _ = metric_fn(pred, label)
+
+                        metric_result = metric_fn.compute()
+                        metric_fn.reset()
                     elif metric_name == 'mos':
                         metric_result = sum(deduplicated_outputs['mos_scores']) / len(
                             deduplicated_outputs['mos_scores']
@@ -1369,7 +1375,7 @@ class S2sModularAudioGPTModel(ModularAudioGPTModel):
             for metric in data_cfg.metrics:
                 if not hasattr(metric, "name"):
                     raise ValueError("Metric name is not provided in the metric config.")
-                base_metric_name = metric.name.replace("asr-", "")
+                base_metric_name = metric.name.replace("asr-", "").replace("tts-", "")
                 if metric.name == "loss" or metric.name == "mos":
                     metrics.append((None, metric.name))
                     continue

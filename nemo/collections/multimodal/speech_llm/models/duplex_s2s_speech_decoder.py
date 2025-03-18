@@ -1418,7 +1418,7 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
             for metric in data_cfg.metrics:
                 if not hasattr(metric, "name"):
                     raise ValueError("Metric name is not provided in the metric config.")
-                base_metric_name = metric.name.replace("asr-", "")
+                base_metric_name = metric.name.replace("asr-", "").replace("tts-", "")
                 if metric.name == "loss" or metric.name == "mos":
                     metrics.append((None, metric.name))
                     continue
