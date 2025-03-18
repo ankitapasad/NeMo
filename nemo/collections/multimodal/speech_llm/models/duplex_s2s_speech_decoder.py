@@ -12,6 +12,7 @@ import hydra
 import numpy as np
 import sacrebleu
 import soundfile as sf
+import string
 import torch
 import torchaudio
 from omegaconf import DictConfig, OmegaConf
@@ -1260,12 +1261,24 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                         )
                     elif text_metric_name == 'wer':  # asr-wer, wer
                         for pred, label in zip(text_preds, labels):
+                            # remove punctuations
+                            pred = pred.translate(str.maketrans('', '', string.punctuation))
+                            label = label.translate(str.maketrans('', '', string.punctuation))
+                            # remove extra spaces
+                            pred = " ".join(pred.split()).lower()
+                            label = " ".join(label.split()).lower()
                             _ = metric_fn(pred, label)
 
                         metric_result = metric_fn.compute()
                         metric_fn.reset()
                     elif text_metric_name == "tts-wer":
                         for pred, label in zip(deduplicated_outputs['speech_preds_transcribed'], deduplicated_outputs['preds']):
+                            # remove punctuations
+                            pred = pred.translate(str.maketrans('', '', string.punctuation))
+                            label = label.translate(str.maketrans('', '', string.punctuation))
+                            # remove extra spaces
+                            pred = " ".join(pred.split()).lower()
+                            label = " ".join(label.split()).lower()
                             _ = metric_fn(pred, label)
 
                         metric_result = metric_fn.compute()
