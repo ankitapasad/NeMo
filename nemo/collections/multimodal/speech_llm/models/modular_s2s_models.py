@@ -22,7 +22,6 @@ from pytorch_lightning.utilities import rank_zero_only
 from torch import Tensor, nn
 from torch.nn.utils.rnn import pad_sequence
 from torchaudio.pipelines import SQUIM_SUBJECTIVE
-from nemo.core.classes.module import NeuralModule
 
 from nemo.collections.asr.parts.utils.eval_utils import remove_punctuations
 from nemo.collections.common.metrics import MetricStringToTorchMetric, TextMetricsSet
