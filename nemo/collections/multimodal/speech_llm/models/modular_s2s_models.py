@@ -1093,6 +1093,14 @@ class S2sModularAudioGPTModel(ModularAudioGPTModel):
         return wavs, start_end_time
 
     def inference_epoch_end(self, outputs, mode, data_cfg):
+        def normalize_text(text, table=str.maketrans('', '', string.punctuation), remove_extra_spaces=True):
+            # remove punctuations and make it lower case
+            text = text.translate(table).lower()
+            if remove_extra_spaces:
+                # remove extra spaces
+                text = " ".join(text.split())
+            return text
+
         # Parent class will handle logging of the loss.
         if not outputs or (all([not x for x in outputs])):
             return None
@@ -1213,29 +1221,32 @@ class S2sModularAudioGPTModel(ModularAudioGPTModel):
                         return [len(re.split('   *', pred)) for pred in input_preds]
 
                     if text_metric_name == 'bleu':  # asr-bleu, bleu
-                        metric_result = torch.Tensor([sacrebleu.corpus_bleu(text_preds, [labels]).score]).to(
+                        # normalize texts
+                        normalized_text_preds = []
+                        normalized_labels = []
+                        for pred, label in zip(text_preds, labels):
+                            pred = normalize_text(pred)
+                            label = normalize_text(label)
+                            normalized_text_preds.append(pred)
+                            normalized_labels.append(label)
+
+                        metric_result = torch.Tensor([sacrebleu.corpus_bleu(normalized_text_preds, [normalized_labels]).score]).to(
                             self.device
                         )
                     elif text_metric_name == 'wer':  # asr-wer, wer
                         for pred, label in zip(text_preds, labels):
-                            # remove punctuations
-                            pred = pred.translate(str.maketrans('', '', string.punctuation))
-                            label = label.translate(str.maketrans('', '', string.punctuation))
-                            # remove extra spaces
-                            pred = " ".join(pred.split()).lower()
-                            label = " ".join(label.split()).lower()
+                            # remove punctuationsa and extra spaces
+                            pred = normalize_text(pred)
+                            label = normalize_text(label)
                             _ = metric_fn(pred, label)
 
                         metric_result = metric_fn.compute()
                         metric_fn.reset()
                     elif text_metric_name == "tts-wer":
                         for pred, label in zip(deduplicated_outputs['speech_preds_transcribed'], deduplicated_outputs['preds']):
-                            # remove punctuations
-                            pred = pred.translate(str.maketrans('', '', string.punctuation))
-                            label = label.translate(str.maketrans('', '', string.punctuation))
-                            # remove extra spaces
-                            pred = " ".join(pred.split()).lower()
-                            label = " ".join(label.split()).lower()
+                            # remove punctuations and extra spaces
+                            pred = normalize_text(pred)
+                            label = normalize_text(label)
                             _ = metric_fn(pred, label)
 
                         metric_result = metric_fn.compute()
@@ -1245,8 +1256,17 @@ class S2sModularAudioGPTModel(ModularAudioGPTModel):
                             deduplicated_outputs['mos_scores']
                         )
                     elif metric_name == 'bleu2':
+                        # normalize texts
+                        normalized_text_preds = []
+                        normalized_labels = []
+                        for pred, label in zip(text_preds, labels):
+                            pred = normalize_text(pred, remove_extra_spaces=False)
+                            label = normalize_text(label, remove_extra_spaces=False)
+                            normalized_text_preds.append(pred)
+                            normalized_labels.append(label)
+
                         metric_result = torch.Tensor(
-                            [sacrebleu.corpus_bleu(get_turn_split(text_preds, 2), [get_turn_split(labels, 2)]).score]
+                            [sacrebleu.corpus_bleu(get_turn_split(normalized_text_preds, 2), [get_turn_split(normalized_labels, 2)]).score]
                         ).to(self.device)
                     elif metric_name == 'turndiff':
                         metric_result = torch.Tensor(
