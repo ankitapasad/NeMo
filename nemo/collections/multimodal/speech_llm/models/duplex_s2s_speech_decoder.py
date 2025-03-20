@@ -1277,7 +1277,6 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
 
                     if text_metric_name == 'bleu':  # asr-bleu, bleu
                         if self.cfg.get('norm_val_metrics', False):
-                            print("Normalizing metrics!!!!")
                             # normalize texts
                             metric_text_preds = []
                             metric_labels = []
