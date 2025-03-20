@@ -836,6 +836,8 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
             'metadata': metadata,  # [dict]
             'batch_idx': batch_idx,
             'audio_signal': batch.get('audio_signal', None),
+            'system_prompts': batch.get('system_prompts', None),
+            'system_prompts_length': batch.get('system_prompts_length', None),
         }
 
         if mode == 'validation':
@@ -969,9 +971,6 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                     num_turns = []
                     max_length = 0
                     trans_new_pred_wav = []
-                    for i in start_end_time:
-                        for start, end in i:
-                            print(end - start)
                     for pred_wav, each_start_end_time in zip(pred_wavs, start_end_time):
                         if len(each_start_end_time) == 0:
                             num_turns.append(0)
@@ -1046,7 +1045,7 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                         for pred_wav, answer_wav in zip(pred_wavs_resampled, answer_wavs_resampled)
                     ]
                 deduplicated_outputs['mos_scores'] = squim_mos_scores
-        
+
         return deduplicated_outputs
 
     def parse_decoder_outputs(
