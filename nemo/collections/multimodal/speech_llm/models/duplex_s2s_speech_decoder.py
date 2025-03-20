@@ -310,7 +310,7 @@ class SpeechDecoder(NeuralModule):
             'input_audio_tokens': None,
         }
 
-
+# ToDo: if condition speech tokens on LLM-backbone does not bring good results, we should decouple speech decoder with MCoreGPTModel to avoid the unnecessary complexity
 class S2sMCoreGPTModelSpeechDecoder(MCoreGPTModel):
     def __init__(
         self,
