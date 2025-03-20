@@ -95,6 +95,7 @@ model:
     cond_on_prev_audio_tokens: true
 
   decoder_reduction_factor: 1
+  norm_val_metrics: true
 
   seed: 1234
   tensor_model_parallel_size: 1 # intra-layer model parallelism

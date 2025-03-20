@@ -76,6 +76,7 @@ model:
   s2s_vocab_size: 48384 # This should be equal to the proj_head_dims[0] + decoder_reduction_factor * sum(proj_head_dims[1:])
   proj_head_loss_weights: [1, 1, 1, 1, 1, 1, 1, 1, 1]
   decoder_reduction_factor: 1
+  norm_val_metrics: true
   speech_decoder_parms:
     n_layers: 12
     d_model: 768

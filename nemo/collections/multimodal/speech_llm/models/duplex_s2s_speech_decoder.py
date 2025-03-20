@@ -1124,6 +1124,7 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                     ],
                     axis=0,
                 )
+
             end_times = end_times[: len(start_times)]
             start_times = start_times[: len(end_times)]
             start_end_time.append([(s, e) for s, e in zip(start_times, end_times)])
@@ -1146,6 +1147,7 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
         return wavs, start_end_time
 
     def inference_epoch_end(self, outputs, mode, data_cfg):
+        # TODO: use whisper normalizer https://pypi.org/project/whisper-normalizer/#:~:text=2%20by%20AssemblyAI-,How%20to%20use,over%20and%20pour%20me%20out%20'
         def normalize_text(text, table=str.maketrans('', '', string.punctuation), remove_extra_spaces=True):
             # remove punctuations and make it lower case
             text = text.translate(table).lower()
@@ -1274,23 +1276,29 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                         return [len(re.split('   *', pred)) for pred in input_preds]
 
                     if text_metric_name == 'bleu':  # asr-bleu, bleu
-                        # normalize texts
-                        normalized_text_preds = []
-                        normalized_labels = []
-                        for pred, label in zip(text_preds, labels):
-                            pred = normalize_text(pred)
-                            label = normalize_text(label)
-                            normalized_text_preds.append(pred)
-                            normalized_labels.append(label)
+                        if self.cfg.get('norm_val_metrics', False):
+                            print("Normalizing metrics!!!!")
+                            # normalize texts
+                            metric_text_preds = []
+                            metric_labels = []
+                            for pred, label in zip(text_preds, labels):
+                                pred = normalize_text(pred)
+                                label = normalize_text(label)
+                                metric_text_preds.append(pred)
+                                metric_labels.append(label)
+                        else:
+                            metric_text_preds = text_preds
+                            metric_labels = labels
 
-                        metric_result = torch.Tensor([sacrebleu.corpus_bleu(normalized_text_preds, [normalized_labels]).score]).to(
+                        metric_result = torch.Tensor([sacrebleu.corpus_bleu(metric_text_preds, [metric_labels]).score]).to(
                             self.device
                         )
                     elif text_metric_name == 'wer':  # asr-wer, wer
                         for pred, label in zip(text_preds, labels):
                             # remove punctuationsa and extra spaces
-                            pred = normalize_text(pred)
-                            label = normalize_text(label)
+                            if self.cfg.get('norm_val_metrics', False):
+                                pred = normalize_text(pred)
+                                label = normalize_text(label)
                             _ = metric_fn(pred, label)
 
                         metric_result = metric_fn.compute()
@@ -1298,8 +1306,9 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                     elif text_metric_name == "tts-wer":
                         for pred, label in zip(deduplicated_outputs['speech_preds_transcribed'], deduplicated_outputs['preds']):
                             # remove punctuations and extra spaces
-                            pred = normalize_text(pred)
-                            label = normalize_text(label)
+                            if self.cfg.get('norm_val_metrics', False):
+                                pred = normalize_text(pred)
+                                label = normalize_text(label)
                             _ = metric_fn(pred, label)
 
                         metric_result = metric_fn.compute()
@@ -1309,17 +1318,21 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                             deduplicated_outputs['mos_scores']
                         )
                     elif metric_name == 'bleu2':
-                        # normalize texts
-                        normalized_text_preds = []
-                        normalized_labels = []
-                        for pred, label in zip(text_preds, labels):
-                            pred = normalize_text(pred, remove_extra_spaces=False)
-                            label = normalize_text(label, remove_extra_spaces=False)
-                            normalized_text_preds.append(pred)
-                            normalized_labels.append(label)
+                        if self.cfg.get('norm_val_metrics', False):
+                            # normalize texts
+                            metric_text_preds = []
+                            metric_labels = []
+                            for pred, label in zip(text_preds, labels):
+                                pred = normalize_text(pred)
+                                label = normalize_text(label)
+                                metric_text_preds.append(pred)
+                                metric_labels.append(label)
+                        else:
+                            metric_text_preds = text_preds
+                            metric_labels = labels
 
                         metric_result = torch.Tensor(
-                            [sacrebleu.corpus_bleu(get_turn_split(normalized_text_preds, 2), [get_turn_split(normalized_labels, 2)]).score]
+                            [sacrebleu.corpus_bleu(get_turn_split(metric_text_preds, 2), [get_turn_split(metric_labels, 2)]).score]
                         ).to(self.device)
                     elif metric_name == 'turndiff':
                         metric_result = torch.Tensor(
