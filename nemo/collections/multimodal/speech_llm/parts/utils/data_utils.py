@@ -243,7 +243,11 @@ class TextProcessing:
         self.sample_alpha = sample_alpha
         self.audio_locator = audio_locator
 
-        if add_bos and hasattr(tokenizer, "bos_id") and tokenizer.bos_id > 0:
+        if add_bos and hasattr(tokenizer, "bos_id") and tokenizer.bos_id is not None and tokenizer.bos_id > 0:
+            self.bos_id = tokenizer.bos_id
+        elif hasattr(tokenizer.tokenizer, "_added_tokens_encoder") and '<|im_start|>' in tokenizer.tokenizer._added_tokens_encoder:
+            tokenizer.bos_token = '<|im_start|>'
+            # tokenizer.bos_token = ' <|endoftext|>' # ref: https://huggingface.co/Qwen/Qwen2-7B-Instruct/discussions/15#66bc689abcf136906383c8c5 
             self.bos_id = tokenizer.bos_id
         else:
             self.bos_id = None
@@ -253,7 +257,11 @@ class TextProcessing:
         else:
             self.eos_id = None
 
-        if hasattr(tokenizer, "unk_id") and tokenizer.unk_id >= 0:
+
+        if hasattr(tokenizer, "unk_id") and tokenizer.unk_id is not None and tokenizer.unk_id >= 0:
+            self.unk_id = tokenizer.unk_id
+        elif hasattr(tokenizer.tokenizer, "_added_tokens_encoder") and '<|endoftext|>' in tokenizer.tokenizer._added_tokens_encoder:
+            tokenizer.unk_token = '<|endoftext|>'
             self.unk_id = tokenizer.unk_id
         else:
             self.unk_id = None
