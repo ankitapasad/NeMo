@@ -240,15 +240,9 @@ model:
     end_string: ""
     train_ds:
       multi_config: true
-      use_lhotse: True
-      seed: 'trng'
-      shuffle: true
-      shard_seed: "trng"
-      sampler_fusion: randomized_round_robin
-      sampler_weights:
-        duplex: 1.0
-        blackwell: 0.01
       blackwell:
+        sampler_fusion: randomized_round_robin
+        sampler_weights : [0.01,1.0]
         input_cfg:
         - type: group
           input_cfg:
@@ -257,8 +251,11 @@ model:
             tags:
               s2s_duplex_overlap: True
               speaker_id: 1
+        shuffle: True
 
       duplex:
+        sampler_fusion: randomized_round_robin
+        sampler_weights : [0.02,1.0]
         input_cfg:
         - type: group
           weight: 2.0
@@ -267,6 +264,125 @@ model:
           input_cfg:
             - type: lhotse_shar
               shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000000
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000001
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000002
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000003
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000004
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000005
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000006
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000007
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000008
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000009
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000010
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000011
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000012
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000013
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000014
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000015
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000016
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000017
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000018
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000019
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000020
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000021
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000022
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000023
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000024
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000025
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000026
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000027
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000028
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000029
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000030
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000031
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000032
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000033
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000034
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000035
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000036
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000037
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000038
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000039
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000040
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000041
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000042
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000043
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000044
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000045
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000046
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000047
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000048
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000049
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000050
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000051
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000052
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000053
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000054
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000055
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000056
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000057
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000058
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000059
+
         - type: group
           weight: 1.0
           tags:
@@ -276,7 +392,7 @@ model:
             - type: lhotse_shar
               shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/brainy_mantis/emma_trimmed_overlap_0.64/nvolve_multiturn/
         - type: group
-          weight: 5.0
+          weight: 4.0
           tags:
             s2s_duplex: True
           input_cfg:
@@ -344,6 +460,22 @@ model:
               shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/ultrachat_v2/shar_duplex/manifest_000030
             - type: lhotse_shar
               shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/ultrachat_v2/shar_duplex/manifest_000031
+            # - type: lhotse_shar
+            #   shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/ultrachat_v2/shar_duplex/manifest_000032
+            # - type: lhotse_shar
+            #   shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/ultrachat_v2/shar_duplex/manifest_000033
+            # - type: lhotse_shar
+            #   shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/ultrachat_v2/shar_duplex/manifest_000034
+            # - type: lhotse_shar
+            #   shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/ultrachat_v2/shar_duplex/manifest_000035
+            # - type: lhotse_shar
+            #   shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/ultrachat_v2/shar_duplex/manifest_000036
+            # - type: lhotse_shar
+            #   shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/ultrachat_v2/shar_duplex/manifest_000037
+            # - type: lhotse_shar
+            #   shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/ultrachat_v2/shar_duplex/manifest_000038
+            # - type: lhotse_shar
+            #   shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/ultrachat_v2/shar_duplex/manifest_000039
             - type: lhotse_shar
               shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/ultrachat_v2/shar_duplex/manifest_000040
             - type: lhotse_shar
@@ -364,6 +496,14 @@ model:
               shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/ultrachat_v2/shar_duplex/manifest_000048
             - type: lhotse_shar
               shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/ultrachat_v2/shar_duplex/manifest_000049
+            # - type: lhotse_shar
+            #   shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/ultrachat_v2/shar_duplex/manifest_000050
+            # - type: lhotse_shar
+            #   shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/ultrachat_v2/shar_duplex/manifest_000051
+            # - type: lhotse_shar
+            #   shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/ultrachat_v2/shar_duplex/manifest_000052
+            # - type: lhotse_shar
+            #   shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/ultrachat_v2/shar_duplex/manifest_000053
             - type: lhotse_shar
               shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/ultrachat_v2/shar_duplex/manifest_000054
             - type: lhotse_shar
@@ -646,18 +786,18 @@ model:
             #   shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/ultrachat_v2/shar_duplex/manifest_000193
             # - type: lhotse_shar
             #   shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/ultrachat_v2/shar_duplex/manifest_000194
-#            - type: lhotse_shar
-#              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/ultrachat_v2/shar_duplex/manifest_000195
-#            - type: lhotse_shar
-#              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/ultrachat_v2/shar_duplex/manifest_000196
-#            - type: lhotse_shar
-#              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/ultrachat_v2/shar_duplex/manifest_000197
-#            - type: lhotse_shar
-#              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/ultrachat_v2/shar_duplex/manifest_000198
-#            - type: lhotse_shar
-#              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/ultrachat_v2/shar_duplex/manifest_000199
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/ultrachat_v2/shar_duplex/manifest_000195
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/ultrachat_v2/shar_duplex/manifest_000196
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/ultrachat_v2/shar_duplex/manifest_000197
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/ultrachat_v2/shar_duplex/manifest_000198
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/ultrachat_v2/shar_duplex/manifest_000199
         - type: group
-          weight: 2.0
+          weight: 1.0
           tags:
             s2s_duplex: True
           input_cfg:
@@ -762,7 +902,7 @@ model:
             - type: lhotse_shar
               shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/topic_v2/Meta-Llama-3.1-70B-Instruct/shar_duplex/manifest_000049
         - type: group
-          weight: 1.0
+          weight: 0.5
           tags:
             s2s_duplex: True
           input_cfg:
@@ -806,7 +946,7 @@ model:
               shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/ultrachat/shar_duplex/manifest_000018
 
         - type: group
-          weight: 0.1
+          weight: 0.4
           input_cfg:
 
           - type: lhotse_shar
@@ -835,6 +975,1082 @@ model:
             tags:
               s2s_duplex: True
               speaker_id: 2
+              #- type: group
+              #  weight: 8.0
+              #  tags:
+              #    s2s_duplex: True
+              #    speaker_id: 1
+              #  input_cfg:
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_0
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_10
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_100
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_101
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_102
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_103
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_104
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_105
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_106
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_107
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_108
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_109
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_11
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_110
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_111
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_112
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_113
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_114
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_115
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_116
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_117
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_118
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_119
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_12
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_120
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_13
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_131
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_132
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_133
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_134
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_14
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_15
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_151
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_152
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_153
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_161
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_162
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_163
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_164
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_165
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_166
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_169
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_173
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_176
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_18
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_180
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_181
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_182
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_183
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_184
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_185
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_186
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_187
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_189
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_190
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_2
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_221
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_234
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_235
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_236
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_238
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_239
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_24
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_240
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_241
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_242
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_243
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_244
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_245
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_247
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_248
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_249
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_25
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_250
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_251
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_252
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_253
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_255
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_256
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_257
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_258
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_259
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_26
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_260
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_261
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_262
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_263
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_264
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_265
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_266
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_267
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_268
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_27
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_270
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_272
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_28
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_280
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_281
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_282
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_283
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_284
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_285
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_286
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_288
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_289
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_29
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_291
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_292
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_293
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_296
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_297
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_298
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_299
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_3
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_30
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_302
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_303
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_306
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_307
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_309
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_31
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_311
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_312
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_314
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_315
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_316
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_317
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_319
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_32
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_320
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_321
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_322
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_323
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_324
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_325
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_326
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_327
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_328
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_329
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_330
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_331
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_332
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_333
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_334
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_335
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_336
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_337
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_338
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_339
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_34
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_340
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_341
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_342
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_343
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_344
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_345
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_346
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_348
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_349
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_35
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_350
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_351
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_352
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_353
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_354
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_355
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_356
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_357
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_358
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_359
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_36
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_360
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_361
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_362
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_363
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_364
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_365
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_366
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_367
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_368
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_369
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_37
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_370
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_371
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_372
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_374
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_375
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_376
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_377
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_378
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_379
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_38
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_380
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_381
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_382
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_384
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_385
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_389
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_39
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_391
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_393
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_394
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_395
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_396
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_397
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_398
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_399
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_4
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_40
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_401
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_402
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_403
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_404
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_406
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_408
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_41
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_410
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_416
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_418
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_419
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_42
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_421
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_422
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_424
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_425
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_426
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_427
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_428
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_429
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_43
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_430
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_432
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_433
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_434
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_435
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_436
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_437
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_439
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_44
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_440
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_441
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_442
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_443
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_444
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_445
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_446
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_447
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_448
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_449
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_45
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_450
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_451
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_453
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_456
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_457
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_458
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_459
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_46
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_461
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_463
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_464
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_465
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_468
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_469
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_47
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_470
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_471
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_473
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_474
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_475
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_476
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_478
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_479
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_48
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_481
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_482
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_483
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_484
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_485
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_486
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_487
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_488
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_489
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_49
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_490
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_491
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_492
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_493
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_494
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_495
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_496
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_497
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_499
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_5
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_50
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_501
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_502
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_503
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_504
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_505
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_506
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_507
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_508
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_509
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_51
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_510
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_52
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_53
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_54
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_55
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_56
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_57
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_58
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_59
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_60
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_61
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_62
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_63
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_64
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_65
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_66
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_67
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_68
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_69
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_7
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_70
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_71
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_72
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_73
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_74
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_75
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_76
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_77
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_78
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_79
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_8
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_80
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_81
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_82
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_83
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_84
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_85
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_86
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_87
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_88
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_89
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_9
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_90
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_91
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_92
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_93
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_94
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_95
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_96
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_97
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_98
+    
+              #  - type: lhotse_shar
+              #    shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_99
         - type: group
           weight: 3.0
           tags:
@@ -1179,19 +2395,19 @@ model:
             weight: 1.0
             tags:
               s2s_duplex: True
-
+    
           - type: lhotse_shar
             shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/precise_instruction_following_v4_second_turn/
             weight: 1.0
             tags:
               s2s_duplex: True
-
+    
           - type: lhotse_shar
             shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/340b_8.19_daring_anteater_lmsys_sft_8801rm3.7p/
             weight: 1.0
             tags:
               s2s_duplex: True
-
+    
           - type: lhotse_shar
             shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/nvolve_chatqa/
             weight: 4.0
@@ -1202,26 +2418,26 @@ model:
             weight: 1.0
             tags:
               s2s_duplex: True
-
-
+    
+    
           - type: lhotse_shar
             shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/precise_instruction_following_v4_single_turn/
             weight: 1.0
             tags:
               s2s_duplex: True
-
+    
           - type: lhotse_shar
             shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/synthetic_roleplay_v2/
-            weight: 1.0
+            weight: 2.0
             tags:
               s2s_duplex: True
-
+    
           - type: lhotse_shar
             shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/340b_8.19_daring_anteater_synth_v2_prompts_8801rm3.7p/
             weight: 1.0
             tags:
               s2s_duplex: True
-
+    
           - type: lhotse_shar
             shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/precise_instruction_following_v4_multi_turn/
             weight: 1.0
@@ -1229,8 +2445,14 @@ model:
               s2s_duplex: True
 
           - type: lhotse_shar
+            shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/squadv2_v2/
+            weight: 0.4
+            tags:
+              s2s_duplex: True
+   
+          - type: lhotse_shar
             shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/alpaca
-            weight: 1.0
+            weight: 6.0
             tags:
               s2s_duplex: True
           - type: lhotse_shar
@@ -1240,7 +2462,7 @@ model:
               s2s_duplex: True
 
         - type: group
-          weight: 3.0
+          weight: 3
           tags:
             s2s_duplex: True
           input_cfg:
@@ -3634,6 +4856,7 @@ model:
       codec_model_downsampling_factor: ${model.codec_model_downsampling_factor}
       global_batch_size: ${model.global_batch_size}
       micro_batch_size: ${model.micro_batch_size}
+      shuffle: True
       num_workers: 0
       pin_memory: True
       max_seq_length: 512
@@ -3674,6 +4897,7 @@ model:
       # bucketing params
       bucketing_strategy: "fully_randomized"
       bucketing_batch_size: null
+      use_lhotse: True
       text_field : "text"
       batch_duration : 80  # 0
       quadratic_duration : 30
@@ -3681,32 +4905,6 @@ model:
       buffer_size : 10000
       shuffle_buffer_size : 10000
       duration_bins: null
-# #
-#     validation_ds:
-#       force_map_dataset: True
-#       names: ['ultrachat', 'imp']
-#       input_cfg:
-#         - type: group
-#           weight: 1.0
-#           tags:
-#             lang: en
-#           input_cfg:
-# #            - type: lhotse_shar
-# #              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/Mixtral8x22b_MMLPC_en/manifest_511/
-# #              tags:
-# #                s2s_duplex: True
-# #            - type: lhotse_shar
-# #              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/nvolve_chatqa_test/
-# #              tags:
-# #                s2s_duplex: True
-#             - type: lhotse_shar
-#               shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/ultrachat_v2/shar_duplex/manifest_000200/
-#               tags:
-#                 s2s_duplex: True
-#             - type: lhotse_shar
-#               shar_path: /lustre/fsw/portfolios/convai/users/cchen1/data/test511_863_with_interruption
-#               tags:
-#                 s2s_duplex: True
 
     validation_ds:
       force_map_dataset: True
@@ -3724,19 +4922,19 @@ model:
             #     lang: en
             #     s2s: True
             #- type: lhotse_shar
-            #  shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/duplex/Mixtral8x22b_MMLPC_en/manifest_511/
+            #  shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/Mixtral8x22b_MMLPC_en/manifest_511/
             #  tags:
             #    s2s_duplex: True
             - type: lhotse_shar
-              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/brainy_mantis/emma_trimmed_overlap_0.64/synthetic_roleplay_v2_test
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/brainy_mantis/emma_trimmed_overlap_0.64/synthetic_roleplay_v2_test/
               tags:
                 s2s_duplex: True
                 #- type: lhotse_shar
-                #  shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/duplex/tts/Lindy_dev/
+                #  shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/tts/Lindy_dev/
                 #  tags:
                 #    s2s_duplex: True
                 #- type: lhotse_shar
-                #  shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_511
+                #  shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_511
                 #  tags:
                 #    s2s_duplex: True
             - type: lhotse_shar
@@ -3748,7 +4946,7 @@ model:
               tags:
                 s2s_duplex: True
                 #- type: lhotse_shar
-                #  shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/duplex/blackwell_test/
+                #  shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/blackwell_test/
                 #  tags:
                 #    s2s_duplex_overlap: True
             - type: lhotse_shar
@@ -3760,10 +4958,19 @@ model:
               tags:
                 s2s_duplex: True 
             - type: lhotse_shar
-              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/brainy_mantis/emma_trimmed_overlap_0.64/nvolve_multiturn_test
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/brainy_mantis/emma_trimmed_overlap_0.64/nvolve_multiturn_test/
               tags:
                 s2s_duplex: True 
-      
+
+
+            # s2s_shars_21fps_with_wavs
+            # - type: lhotse_shar
+            #   shar_path: /lustre/fs7/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/s2s_synthetic_data/s2s_shars_21fps/alpaca_val/ # speech SQA
+            #   weight: 0.1
+            #   tags:
+            #     lang: en
+            #     s2s: True
+          
       load_answer_audio: ${model.extract_codec_on_the_fly}
       codec_model_downsampling_factor: ${model.codec_model_downsampling_factor}
       global_batch_size: ${model.global_batch_size}

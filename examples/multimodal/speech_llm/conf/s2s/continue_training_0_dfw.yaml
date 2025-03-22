@@ -3724,7 +3724,7 @@ model:
             #     lang: en
             #     s2s: True
             #- type: lhotse_shar
-            #  shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/duplex/Mixtral8x22b_MMLPC_en/manifest_511/
+            #  shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/Mixtral8x22b_MMLPC_en/manifest_511/
             #  tags:
             #    s2s_duplex: True
             - type: lhotse_shar
@@ -3732,11 +3732,11 @@ model:
               tags:
                 s2s_duplex: True
                 #- type: lhotse_shar
-                #  shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/duplex/tts/Lindy_dev/
+                #  shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/tts/Lindy_dev/
                 #  tags:
                 #    s2s_duplex: True
                 #- type: lhotse_shar
-                #  shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_511
+                #  shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/s2s_synthetic_data/Mixtral8x22b_MMLPC_en/emma_lhotse_shars/normalized_manifest_511
                 #  tags:
                 #    s2s_duplex: True
             - type: lhotse_shar
@@ -3748,7 +3748,7 @@ model:
               tags:
                 s2s_duplex: True
                 #- type: lhotse_shar
-                #  shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/duplex/blackwell_test/
+                #  shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/blackwell_test/
                 #  tags:
                 #    s2s_duplex_overlap: True
             - type: lhotse_shar

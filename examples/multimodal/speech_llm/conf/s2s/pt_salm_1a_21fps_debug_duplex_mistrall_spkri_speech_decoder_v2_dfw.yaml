@@ -405,8 +405,8 @@ model:
               shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000057
             - type: lhotse_shar
               shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000058
-            # - type: lhotse_shar # reserved for eval
-            #   shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000059
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_train/shar_duplex/manifest_000059
 
         - type: group
           weight: 1.0
