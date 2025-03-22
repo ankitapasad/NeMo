@@ -629,6 +629,7 @@ class S2sModularAudioGPTModel(ModularAudioGPTModel):
             'metadata': metadata,  # [dict]
             'batch_idx': batch_idx,
             'audio_signal': batch.get('audio_signal', None),
+            'user_input': batch['audio_signal'],
         }
 
         if mode == 'validation':
@@ -655,15 +656,17 @@ class S2sModularAudioGPTModel(ModularAudioGPTModel):
             'speech_answers': [],
             'text_answers': [],
             'batch_idx': [],
+            'user_input': [],
         }
         for outputs in list_outputs:
-            for answer, pred, input, metadata, labels_text, pred_context_length in zip(
+            for answer, pred, input, metadata, labels_text, pred_context_length, user_input in zip(
                 outputs['labels'],
                 outputs['preds'],
                 outputs['inputs'],
                 outputs['metadata'],
                 outputs['labels_text'],
                 outputs['context_lengths'],
+                outputs['user_input'],
             ):
                 context_length = 0
                 batch_idx = outputs['batch_idx']
@@ -701,6 +704,7 @@ class S2sModularAudioGPTModel(ModularAudioGPTModel):
                 deduplicated_outputs['inputs'].append(input)
                 deduplicated_outputs['metadata'].append(metadata)
                 deduplicated_outputs['batch_idx'].append(batch_idx)
+                deduplicated_outputs['user_input'].append(user_input)
 
         # Compute metric score
         metric_name = self.val_metric_name if mode == 'validation' else self.test_metric_name
@@ -721,18 +725,27 @@ class S2sModularAudioGPTModel(ModularAudioGPTModel):
 
             with torch.no_grad():
                 logging.info(f"Decoding and saving audio")
-                pred_wavs, start_end_time = self.decode_and_save_wavs(
+                pred_wavs = self.decode_and_save_wavs(
                     codec_model,
                     deduplicated_outputs['speech_preds'],
+                    deduplicated_outputs['user_input'],
                     os.path.join(output_dir, "wav", "pred"),
                     deduplicated_outputs['metadata'],
                 )
-                answer_wavs, _ = self.decode_and_save_wavs(
-                    codec_model,
-                    deduplicated_outputs['speech_answers'],
-                    os.path.join(output_dir, "wav", "answer"),
-                    deduplicated_outputs['metadata'],
-                )
+                answer_wavs = pred_wavs
+                print(output_dir)
+                # pred_wavs, start_end_time = self.decode_and_save_wavs(
+                #     codec_model,
+                #     deduplicated_outputs['speech_preds'],
+                #     os.path.join(output_dir, "wav", "pred"),
+                #     deduplicated_outputs['metadata'],
+                # )
+                # answer_wavs, _ = self.decode_and_save_wavs(
+                #     codec_model,
+                #     deduplicated_outputs['speech_answers'],
+                #     os.path.join(output_dir, "wav", "answer"),
+                #     deduplicated_outputs['metadata'],
+                # )
 
         if run_asr:
             self.additional_models['asr_model'] = self.asr_model
@@ -877,38 +890,27 @@ class S2sModularAudioGPTModel(ModularAudioGPTModel):
             speech_tokens = torch.zeros([1, new_shape[1]]).long().cuda()
         return text_tokens.long(), speech_tokens.long()
 
-    def decode_and_save_wavs(self, codec_model, codes_list, wav_dir, metadata_list):
+
+    def decode_and_save_wavs(self, codec_model, codes_list, user_inputs, wav_dir, metadata_list):
         sample_rate = self.codec_sample_rate
-        os.makedirs(wav_dir, exist_ok=True)
+
         wavs = []
-        start_end_time = []
-        for codes, metadata in zip(codes_list, metadata_list):
+        for codes, metadata, user_input in zip(codes_list, metadata_list, user_inputs):
             codes = torch.tensor(codes).to(codec_model.device).T
             codec_len = torch.Tensor([codes.shape[1]]).long().to(codec_model.device)
 
             # get rid of bos and eos ids in the codec decoding
             def replace_speech_code(codes, id):
                 return torch.where(codes == id, codes[:, :1], codes)
-
-            def get_index_of_code(codes, id):
-                # d, t
-                idxs = torch.where(codes[0] == id)[0]
-                return self.get_duration_by_steps(idxs)[0]
-
-            # get start time of each turn
-            start_times = get_index_of_code(codes, self.cfg.data.train_ds.speech_bos_id)
             codes = replace_speech_code(codes, self.cfg.data.train_ds.speech_bos_id)
-            # get end time of each turn
-            end_times = get_index_of_code(codes, self.cfg.data.train_ds.speech_eos_id)
-            end_times = end_times[: len(start_times)]
-            start_times = start_times[: len(end_times)]
-            start_end_time.append([(s, e) for s, e in zip(start_times, end_times)])
             codes = replace_speech_code(codes, self.cfg.data.train_ds.speech_eos_id)
             codes = replace_speech_code(codes, self.cfg.data.train_ds.speech_unk_id)
             codes = replace_speech_code(codes, self.cfg.data.train_ds.speech_pad_id)
             wav, _ = codec_model.decode(tokens=codes.unsqueeze(0), tokens_len=codec_len)
             wav = wav[0]
             wavs.append(wav)
+
+            os.makedirs(wav_dir, exist_ok=True)
             sf.write(
                 os.path.join(
                     wav_dir, re.sub("_repeat\d*", "", metadata['audio_filepath'].split('.wav')[0]) + ".gen.wav"
@@ -916,8 +918,62 @@ class S2sModularAudioGPTModel(ModularAudioGPTModel):
                 wav.detach().cpu().numpy(),
                 sample_rate,
             )
+            user_input = torchaudio.functional.resample(user_input, 16000, sample_rate)
+            max_len = max(len(wav), len(user_input))
+            a_padded = torch.cat([wav, torch.zeros(max_len - len(wav)).to(wav.device)])
+            b_padded = torch.cat([user_input, torch.zeros(max_len - len(user_input)).to(user_input.device)])
+            merge_wav = a_padded.to(b_padded.device) + b_padded
+            sf.write(
+                os.path.join(
+                    wav_dir, re.sub("_repeat\d*", "", metadata['audio_filepath'].split('.wav')[0]) + ".merge.wav"
+                ),
+                merge_wav.detach().numpy(),
+                sample_rate,
+            )
 
-        return wavs, start_end_time
+        return wavs
+
+    # def decode_and_save_wavs(self, codec_model, codes_list, wav_dir, metadata_list):
+    #     sample_rate = self.codec_sample_rate
+    #     os.makedirs(wav_dir, exist_ok=True)
+    #     wavs = []
+    #     start_end_time = []
+    #     for codes, metadata in zip(codes_list, metadata_list):
+    #         codes = torch.tensor(codes).to(codec_model.device).T
+    #         codec_len = torch.Tensor([codes.shape[1]]).long().to(codec_model.device)
+
+    #         # get rid of bos and eos ids in the codec decoding
+    #         def replace_speech_code(codes, id):
+    #             return torch.where(codes == id, codes[:, :1], codes)
+
+    #         def get_index_of_code(codes, id):
+    #             # d, t
+    #             idxs = torch.where(codes[0] == id)[0]
+    #             return self.get_duration_by_steps(idxs)[0]
+
+    #         # get start time of each turn
+    #         start_times = get_index_of_code(codes, self.cfg.data.train_ds.speech_bos_id)
+    #         codes = replace_speech_code(codes, self.cfg.data.train_ds.speech_bos_id)
+    #         # get end time of each turn
+    #         end_times = get_index_of_code(codes, self.cfg.data.train_ds.speech_eos_id)
+    #         end_times = end_times[: len(start_times)]
+    #         start_times = start_times[: len(end_times)]
+    #         start_end_time.append([(s, e) for s, e in zip(start_times, end_times)])
+    #         codes = replace_speech_code(codes, self.cfg.data.train_ds.speech_eos_id)
+    #         codes = replace_speech_code(codes, self.cfg.data.train_ds.speech_unk_id)
+    #         codes = replace_speech_code(codes, self.cfg.data.train_ds.speech_pad_id)
+    #         wav, _ = codec_model.decode(tokens=codes.unsqueeze(0), tokens_len=codec_len)
+    #         wav = wav[0]
+    #         wavs.append(wav)
+    #         sf.write(
+    #             os.path.join(
+    #                 wav_dir, re.sub("_repeat\d*", "", metadata['audio_filepath'].split('.wav')[0]) + ".gen.wav"
+    #             ),
+    #             wav.detach().cpu().numpy(),
+    #             sample_rate,
+    #         )
+
+    #     return wavs, start_end_time
 
     def inference_epoch_end(self, outputs, mode, data_cfg):
         # Parent class will handle logging of the loss.
