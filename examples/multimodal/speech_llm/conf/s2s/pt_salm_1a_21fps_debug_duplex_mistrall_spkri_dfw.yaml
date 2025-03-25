@@ -4908,7 +4908,7 @@ model:
 
     validation_ds:
       force_map_dataset: True
-      names: ['roleplay','nvolve_chatqa', 'daring_anteater_lmsys_sft', 'ultrachat', 'topic', 'nvolve_multiturn']
+      names: ['mixtral', 'roleplay', 'nvolve_chatqa', 'daring_anteater_lmsys_sft', 'ultrachat', 'ultrachat_v2', 'topic', 'nvolve_multiturn', 'alpaca_dev']
       input_cfg:
         - type: group
           weight: 1.0
@@ -4921,10 +4921,10 @@ model:
             #   tags:
             #     lang: en
             #     s2s: True
-            #- type: lhotse_shar
-            #  shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/Mixtral8x22b_MMLPC_en/manifest_511/
-            #  tags:
-            #    s2s_duplex: True
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/Mixtral8x22b_MMLPC_en/manifest_511/
+              tags:
+                s2s_duplex: True
             - type: lhotse_shar
               shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/brainy_mantis/emma_trimmed_overlap_0.64/synthetic_roleplay_v2_test/
               tags:
@@ -4954,11 +4954,19 @@ model:
               tags:
                 s2s_duplex: True
             - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/ultrachat_v2/shar_duplex/manifest_000200/
+              tags:
+                s2s_duplex: True
+            - type: lhotse_shar
               shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/topic_v2/Meta-Llama-3.1-70B-Instruct/shar_duplex/manifest_000050
               tags:
                 s2s_duplex: True 
             - type: lhotse_shar
               shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/brainy_mantis/emma_trimmed_overlap_0.64/nvolve_multiturn_test/
+              tags:
+                s2s_duplex: True 
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/alpaca_dev_100/
               tags:
                 s2s_duplex: True 
 
