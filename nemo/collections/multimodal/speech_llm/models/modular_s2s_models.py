@@ -12,6 +12,7 @@ import hydra
 import numpy as np
 import sacrebleu
 import soundfile as sf
+import string
 import torch
 import torchaudio
 from omegaconf import DictConfig, OmegaConf
@@ -841,7 +842,7 @@ class S2sModularAudioGPTModel(ModularAudioGPTModel):
                         for pred_wav, answer_wav in zip(pred_wavs_resampled, answer_wavs_resampled)
                     ]
                 deduplicated_outputs['mos_scores'] = squim_mos_scores
-
+        del deduplicated_outputs['user_input']
         return deduplicated_outputs
 
     def parse_decoder_outputs(
@@ -977,6 +978,14 @@ class S2sModularAudioGPTModel(ModularAudioGPTModel):
 
     def inference_epoch_end(self, outputs, mode, data_cfg):
         # Parent class will handle logging of the loss.
+        def normalize_text(text, table=str.maketrans('', '', string.punctuation), remove_extra_spaces=True):
+            # remove punctuations and make it lower case
+            text = text.translate(table).lower()
+            if remove_extra_spaces:
+                # remove extra spaces
+                text = " ".join(text.split())
+            return text
+
         if not outputs or (all([not x for x in outputs])):
             return None
 
@@ -1094,13 +1103,59 @@ class S2sModularAudioGPTModel(ModularAudioGPTModel):
 
                     def get_num_turn(input_preds):
                         return [len(re.split('   *', pred)) for pred in input_preds]
+                    
+                    # if text_metric_name == 'bleu':  # asr-bleu, bleu
+                    #     metric_result = torch.Tensor([sacrebleu.corpus_bleu(text_preds, [labels]).score]).to(
+                    #         self.device
+                    #     )
+                    # elif text_metric_name == 'wer':  # asr-wer, wer
+                    #     for pred, label in zip(text_preds, labels):
+                    #         _ = metric_fn(pred, label)
+
+                    #     metric_result = metric_fn.compute()
+                    #     metric_fn.reset()
+                    # elif metric_name == 'mos':
+                    #     metric_result = sum(deduplicated_outputs['mos_scores']) / len(
+                    #         deduplicated_outputs['mos_scores']
+                    #     )
+                    # elif metric_name == 'bleu2':
+                    #     metric_result = torch.Tensor(
+                    #         [sacrebleu.corpus_bleu(get_turn_split(text_preds, 2), [get_turn_split(labels, 2)]).score]
+                    #     ).to(self.device)
 
                     if text_metric_name == 'bleu':  # asr-bleu, bleu
-                        metric_result = torch.Tensor([sacrebleu.corpus_bleu(text_preds, [labels]).score]).to(
+                        if self.cfg.get('norm_val_metrics', False):
+                            # normalize texts
+                            metric_text_preds = []
+                            metric_labels = []
+                            for pred, label in zip(text_preds, labels):
+                                pred = normalize_text(pred)
+                                label = normalize_text(label)
+                                metric_text_preds.append(pred)
+                                metric_labels.append(label)
+                        else:
+                            metric_text_preds = text_preds
+                            metric_labels = labels
+
+                        metric_result = torch.Tensor([sacrebleu.corpus_bleu(metric_text_preds, [metric_labels]).score]).to(
                             self.device
                         )
                     elif text_metric_name == 'wer':  # asr-wer, wer
                         for pred, label in zip(text_preds, labels):
+                            # remove punctuationsa and extra spaces
+                            if self.cfg.get('norm_val_metrics', False):
+                                pred = normalize_text(pred)
+                                label = normalize_text(label)
+                            _ = metric_fn(pred, label)
+
+                        metric_result = metric_fn.compute()
+                        metric_fn.reset()
+                    elif text_metric_name == "tts-wer":
+                        for pred, label in zip(deduplicated_outputs['speech_preds_transcribed'], deduplicated_outputs['preds']):
+                            # remove punctuations and extra spaces
+                            if self.cfg.get('norm_val_metrics', False):
+                                pred = normalize_text(pred)
+                                label = normalize_text(label)
                             _ = metric_fn(pred, label)
 
                         metric_result = metric_fn.compute()
@@ -1110,8 +1165,21 @@ class S2sModularAudioGPTModel(ModularAudioGPTModel):
                             deduplicated_outputs['mos_scores']
                         )
                     elif metric_name == 'bleu2':
+                        if self.cfg.get('norm_val_metrics', False):
+                            # normalize texts
+                            metric_text_preds = []
+                            metric_labels = []
+                            for pred, label in zip(text_preds, labels):
+                                pred = normalize_text(pred)
+                                label = normalize_text(label)
+                                metric_text_preds.append(pred)
+                                metric_labels.append(label)
+                        else:
+                            metric_text_preds = text_preds
+                            metric_labels = labels
+
                         metric_result = torch.Tensor(
-                            [sacrebleu.corpus_bleu(get_turn_split(text_preds, 2), [get_turn_split(labels, 2)]).score]
+                            [sacrebleu.corpus_bleu(get_turn_split(metric_text_preds, 2), [get_turn_split(metric_labels, 2)]).score]
                         ).to(self.device)
                     elif metric_name == 'turndiff':
                         metric_result = torch.Tensor(
