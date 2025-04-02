@@ -30,7 +30,8 @@ trainer:
   gradient_clip_val: 1.0
   accumulate_grad_batches: 1
 
-model_target: nemo.collections.multimodal.speech_llm.models.modular_s2s_models.S2sModularAudioGPTModel
+# model_target: nemo.collections.multimodal.speech_llm.models.modular_s2s_models.S2sModularAudioGPTModel
+model_target: nemo.collections.multimodal.speech_llm.models.duplex_s2s_speech_decoder.S2sModularAudioGPTModelSpeechDecoder
 
 exp_manager:
   # explicit_log_dir: null
@@ -76,6 +77,23 @@ model:
   proj_head_loss_weights: [1, 1, 1, 1, 1, 1, 1, 1, 1]
   decoder_reduction_factor: 1
   norm_val_metrics: true
+  speech_decoder_parms:
+    n_layers: 12
+    d_model: 768
+    d_ffn: 3072
+    sa_n_heads: 12
+    kernel_size: 3
+    p_dropout: 0.1
+    p_dropout_out: 0.0
+    has_xattn: false
+    xa_d_memory: 768
+    xa_n_heads: 12
+    is_causal: true
+    apply_norm_to_cond: true
+    apply_norm_out: true
+    max_length_causal_mask: 5000
+    use_learnable_pos_emb: false
+    cond_on_prev_audio_tokens: true
 
   seed: 1234
   tensor_model_parallel_size: 1 # intra-layer model parallelism
@@ -2095,7 +2113,8 @@ model:
       force_map_dataset: True
       # names: ['zhehuai_demo']
       # names: ['llamaqa','ultrachat_v2', 'alpaca_dev', 'tqa_context40', 'squadv2_v2_test', 'roleplay1', 'topic']
-      names: ['ultrachat_v2', 'alpaca_dev', 'mixtral', 'tqa_context40', 'tqa_nocontext', 'llamaqa', 'squadv2_v2_test', 'roleplay1', 'topic'] 
+      # names: ['ultrachat_v2', 'alpaca_dev', 'tqa_context40', 'squadv2_v2_test', 'roleplay1', 'topic'] 
+      names: ['mixtral'] 
       # names: ['alpaca_dev']
       input_cfg:
         - type: group
@@ -2107,47 +2126,46 @@ model:
             #   shar_path: /lustre/fsw/portfolios/llmservice/users/cchen1/data/inference_llama
             #   tags:
             #     s2s_duplex: True
-            - type: lhotse_shar
-              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/ultrachat_v2/shar_duplex/manifest_000200/
-              tags:
-                s2s_duplex: True
-            - type: lhotse_shar
-              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/alpaca_dev_100/
-              tags:
-                s2s_duplex: True    
+            # - type: lhotse_shar
+            #   shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/ultrachat_v2/shar_duplex/manifest_000200/
+            #   tags:
+            #     s2s_duplex: True
+            # - type: lhotse_shar
+            #   shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/alpaca_dev_100/
+            #   tags:
+            #     s2s_duplex: True    
             - type: lhotse_shar
               shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/Mixtral8x22b_MMLPC_en/manifest_511/
               tags:
                 s2s_duplex: True 
-            - type: lhotse_shar
-              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_context40/shar_duplex/manifest_000000/
-              tags:
-                s2s_duplex: True
-            - type: lhotse_shar
-              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_validation/shar_duplex/manifest_000000/
-              tags:
-                s2s_duplex: True
-            - type: lhotse_shar
-              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/llama_qa/
-              tags:
-                s2s_duplex: True                 
-            - type: lhotse_shar
-              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/squadv2_v2_test/
-              tags:
-                s2s_duplex: True       
-            - type: lhotse_shar
-              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/synthetic_roleplay_v2_test/
-              tags:
-                s2s_duplex: True       
-                #- type: lhotse_shar
-                #  shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/brainy_mantis/emma_trimmed_overlap_0.64/synthetic_roleplay_v2_test/
-                #  tags:
-                #    s2s_duplex: True       
-            - type: lhotse_shar
-              shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/topic_v2/Meta-Llama-3.1-70B-Instruct/shar_duplex/manifest_000050
-              tags:
-                s2s_duplex: True 
-
+            # - type: lhotse_shar
+            #   shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_context40/shar_duplex/manifest_000000/
+            #   tags:
+            #     s2s_duplex: True
+            # - type: lhotse_shar
+            #   shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/triviaqa_validation/shar_duplex/manifest_000000/
+            #   tags:
+            #     s2s_duplex: True
+            # - type: lhotse_shar
+            #   shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/llama_qa/
+            #   tags:
+            #     s2s_duplex: True                 
+            # - type: lhotse_shar
+            #   shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/squadv2_v2_test/
+            #   tags:
+            #     s2s_duplex: True       
+            # - type: lhotse_shar
+            #   shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/synthetic_roleplay_v2_test/
+            #   tags:
+            #     s2s_duplex: True       
+            #     #- type: lhotse_shar
+            #     #  shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/brainy_mantis/emma_trimmed_overlap_0.64/synthetic_roleplay_v2_test/
+            #     #  tags:
+            #     #    s2s_duplex: True       
+            # - type: lhotse_shar
+            #   shar_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/kevinhu/topic_v2/Meta-Llama-3.1-70B-Instruct/shar_duplex/manifest_000050
+            #   tags:
+            #     s2s_duplex: True 
 
 
 
@@ -2212,9 +2230,9 @@ model:
         - name: "asr-wer"
           average: null
           num_classes: null
-        # - name: "tts-wer"
-        #   average: null
-        #   num_classes: null
+        - name: "tts-wer"
+          average: null
+          num_classes: null
         - name: "mos"
 
   optim:
