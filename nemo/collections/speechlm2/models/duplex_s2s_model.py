@@ -92,6 +92,16 @@ class DuplexS2SModel(LightningModule, HFHubMixin):
         self._use_fsdp = False
         self._use_tp = False
 
+    def setup_audio_codec(self):
+        """Workaround for PTL auto-downcasting the codec model to bf16 with bf16-true precision."""
+        if hasattr(self, "audio_codec") and next(self.audio_codec.parameters()).dtype == torch.float:
+            return  # skip if already set up and has the right dtype
+        with _safe_audio_codec_precision():
+            self.audio_codec = load_pretrained_nemo(
+                AudioCodecModel, self.cfg.pretrained_audio_codec, pretrained_weights=self.cfg.pretrained_weights
+            ).eval()
+        del self.audio_codec.discriminator  # free up some memory
+
     @property
     def speech_vocab_size(self):
         """Return the size of the audio codec codebook including extra speech BOS and EOS tokens."""
@@ -623,3 +633,20 @@ def tokens_to_str(tokens: torch.Tensor, lengths: torch.Tensor, tokenizer: AutoTo
         hyp_ids = hyp_ids[hyp_ids != pad_id]
         ans.append(tokenizer.ids_to_text(hyp_ids))
     return ans
+
+
+@contextmanager
+def _safe_audio_codec_precision():
+    """
+    Works around an issue where PTL setting of precision='bf16-true'
+    interferes with padding shape computations inside of audio codec convolutional layers.
+    This is because bf16-true temporarily changes the default float dtype to bf16,
+    which cannot represent integers used in shape computations, and truncates them.
+    """
+    default_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.float32)
+    try:
+        with torch.amp.autocast(device_type="cuda" if torch.cuda.is_available() else "cpu", dtype=torch.float32):
+            yield
+    finally:
+        torch.set_default_dtype(default_dtype)
