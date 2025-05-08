@@ -104,9 +104,10 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         """Workaround for PTL auto-downcasting the codec model to bf16 with bf16-true precision."""
         if hasattr(self, "audio_codec") and next(self.audio_codec.parameters()).dtype == torch.float:
             return  # skip if already set up and has the right dtype
-        self.audio_codec = load_pretrained_nemo(
-            AudioCodecModel, self.cfg.pretrained_audio_codec, pretrained_weights=self.cfg.pretrained_weights
-        ).eval()
+        with fp32_precision():
+            self.audio_codec = load_pretrained_nemo(
+                AudioCodecModel, self.cfg.pretrained_audio_codec, pretrained_weights=self.cfg.pretrained_weights
+            ).eval()
         for p in self.audio_codec.parameters():
             p.requires_grad = False
         del self.audio_codec.discriminator  # free up some memory
