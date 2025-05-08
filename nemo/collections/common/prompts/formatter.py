@@ -15,7 +15,7 @@
 
 from abc import ABC
 from functools import lru_cache
-from typing import Any, Sequence, Type
+from typing import Any, Type
 
 import torch
 
