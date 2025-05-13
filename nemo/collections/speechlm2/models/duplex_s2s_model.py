@@ -92,16 +92,6 @@ class DuplexS2SModel(LightningModule, HFHubMixin):
         self._use_fsdp = False
         self._use_tp = False
 
-    def setup_audio_codec(self):
-        """Workaround for PTL auto-downcasting the codec model to bf16 with bf16-true precision."""
-        if hasattr(self, "audio_codec") and next(self.audio_codec.parameters()).dtype == torch.float:
-            return  # skip if already set up and has the right dtype
-        with fp32_precision():
-            self.audio_codec = load_pretrained_nemo(AudioCodecModel, self.cfg.pretrained_audio_codec).eval()
-        for p in self.audio_codec.parameters():
-            p.requires_grad = False
-        del self.audio_codec.discriminator  # free up some memory
-
     @property
     def speech_vocab_size(self):
         """Return the size of the audio codec codebook including extra speech BOS and EOS tokens."""
