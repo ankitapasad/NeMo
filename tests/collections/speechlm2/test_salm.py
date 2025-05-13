@@ -45,6 +45,21 @@ def resolve_pretrained_models():
         }
 
 
+def resolve_pretrained_models():
+    if os.path.exists("/home/TestData/speechlm/pretrained_models"):
+        # CI pre-cached paths:
+        return {
+            "pretrained_llm": "/home/TestData/speechlm/pretrained_models/TinyLlama--TinyLlama_v1.1",
+            "pretrained_asr": "/home/TestData/speechlm/pretrained_models/canary-1b-flash.nemo",
+        }
+    else:
+        # HF URLs:
+        return {
+            "pretrained_asr": "nvidia/canary-1b-flash",
+            "pretrained_llm": "TinyLlama/TinyLlama_v1.1",
+        }
+
+
 AUDIO_LOCATOR_TAG = "<|audioplaceholder|>"
 PROMPT = "llama2"
 

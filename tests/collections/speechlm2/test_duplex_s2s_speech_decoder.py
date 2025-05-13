@@ -45,6 +45,25 @@ def resolve_pretrained_models():
         }
 
 
+def resolve_pretrained_models():
+    if os.path.exists("/home/TestData/speechlm/pretrained_models"):
+        # CI pre-cached paths:
+        return {
+            "pretrained_llm": "/home/TestData/speechlm/pretrained_models/TinyLlama--TinyLlama_v1.1",
+            "pretrained_audio_codec": "/home/TestData/speechlm/pretrained_models/Low_Frame-rate_Speech_Codec++_bf16.nemo",
+            "pretrained_asr": "/home/TestData/speechlm/pretrained_models/stt_en_fastconformer_hybrid_large_streaming_80ms.nemo",
+            "scoring_asr": "/home/TestData/speechlm/pretrained_models/stt_en_fastconformer_transducer_large.nemo",
+        }
+    else:
+        # HF URLs:
+        return {
+            "pretrained_asr": "stt_en_fastconformer_hybrid_large_streaming_80ms",
+            "scoring_asr": "stt_en_fastconformer_transducer_large",
+            "pretrained_llm": "TinyLlama/TinyLlama_v1.1",
+            "pretrained_audio_codec": "nvidia/low-frame-rate-speech-codec-22khz",
+        }
+
+
 @pytest.fixture(scope="session")
 def model():
     cfg = {
