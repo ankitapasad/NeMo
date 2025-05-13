@@ -18,7 +18,6 @@ from lightning.pytorch import Trainer
 from omegaconf import OmegaConf
 
 from nemo.collections.speechlm2 import SALM, DataModule, SALMDataset
-from nemo.collections.speechlm2.parts.precision import HalfPrecisionForAudio
 from nemo.core.config import hydra_runner
 from nemo.utils.exp_manager import exp_manager
 from nemo.utils.trainer_utils import resolve_trainer_cfg

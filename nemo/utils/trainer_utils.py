@@ -22,7 +22,7 @@ _HAS_HYDRA = True
 
 try:
     import hydra
-    from omegaconf import DictConfig, OmegaConf
+    from omegaconf import DictConfig, OmegaConf, open_dict
 except ModuleNotFoundError:
     DictConfig = Mapping
     OmegaConf = None
