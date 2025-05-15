@@ -503,7 +503,7 @@ def read_s2s_as_conversation(config) -> tuple[CutSet, bool]:
         turn_cuts = cut.trim_to_supervisions(keep_overlapping=False)
         turns = []
         for per_turn_cut in turn_cuts:
-            assert len(per_turn_cut.supervisions) == 1, f"Expected exactly one supervision per turn, got {len(supervisions)} in cut {turn_cut.id}"
+            assert len(per_turn_cut.supervisions) == 1, f"Expected exactly one supervision per turn, got {len(per_turn_cut.supervisions)} in cut {cut.id}"
             turn_speaker = per_turn_cut.supervisions[0].speaker
             turn_text = _strip_timestamps(per_turn_cut.supervisions[0].text)
             if turn_speaker in user_roles:
@@ -511,7 +511,7 @@ def read_s2s_as_conversation(config) -> tuple[CutSet, bool]:
             elif turn_speaker in agent_roles:
                 turns.append(TextTurn(value=turn_text, role="assistant"))
             else:
-                raise ValueError(f"Speaker '{turn_speaker}' not found in user or agent roles for cut {turn_cut.id}")
+                raise ValueError(f"Speaker '{turn_speaker}' not found in user or agent roles for cut {cut.id}")
         return NeMoMultimodalConversation(
             id=cut.id,
             turns=turns,
