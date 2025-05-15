@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import re
 import warnings
 from functools import partial
 from itertools import repeat
@@ -481,6 +482,45 @@ def read_lhotse_as_conversation(config) -> tuple[CutSet, bool]:
     cuts = cuts.map(cut_to_conversation)
     return cuts, is_tarred
 
+def _strip_timestamps(
+    text: str, _TIMESTAMP_PATTERN=re.compile(r"<\|\d+\|>"), _SPACE_PATTERN=re.compile(r"\s+")
+) -> str:
+    """
+    Strips timestamp tokens from text, e.g. turns:
+      '<|0|> Hey <|3|> <|3|> how <|5|> <|7|> are <|8|> <|8|> <|10|> you? <|12|>'
+      into:
+      'Hey how are you?'
+    """
+    # Regexp pattern args are cached compiled patterns (micro-optimization).
+    text = _TIMESTAMP_PATTERN.sub("", text)  # strip timestamp tokens if present
+    return _SPACE_PATTERN.sub(" ", text).strip()  # strip multi-whitespaces
+
+@data_type_parser(["s2s_as_conversation"])
+def read_s2s_as_conversation(config) -> tuple[CutSet, bool]:
+    def cut_to_conversation(cut: Cut) -> NeMoMultimodalConversation:
+        user_roles = config.input_roles
+        agent_roles = config.output_roles
+        turn_cuts = cut.trim_to_supervisions(keep_overlapping=False)
+        turns = []
+        for per_turn_cut in turn_cuts:
+            assert len(per_turn_cut.supervisions) == 1, f"Expected exactly one supervision per turn, got {len(supervisions)} in cut {turn_cut.id}"
+            turn_speaker = per_turn_cut.supervisions[0].speaker
+            turn_text = _strip_timestamps(per_turn_cut.supervisions[0].text)
+            if turn_speaker in user_roles:
+                turns.append(AudioTurn(cut=per_turn_cut, role="user", audio_locator_tag=config.audio_locator_tag))
+            elif turn_speaker in agent_roles:
+                turns.append(TextTurn(value=turn_text, role="assistant"))
+            else:
+                raise ValueError(f"Speaker '{turn_speaker}' not found in user or agent roles for cut {turn_cut.id}")
+        return NeMoMultimodalConversation(
+            id=cut.id,
+            turns=turns,
+            token_equivalent_duration=config.token_equivalent_duration,
+            custom=cut.custom,
+        )
+    cuts, is_tarred = read_cutset_from_config(config)
+    cuts = cuts.map(cut_to_conversation)
+    return cuts, is_tarred
 
 def _resolve_shar_inputs(path: Union[str, Path], only_metadata: bool) -> dict:
     if only_metadata:
