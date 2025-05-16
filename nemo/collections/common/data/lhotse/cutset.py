@@ -502,7 +502,6 @@ def read_s2s_as_conversation(config) -> tuple[CutSet, bool]:
         agent_roles = config.output_roles
         turn_cuts = cut.trim_to_supervisions(keep_overlapping=False)
         turns = []
-        # try:
         idx = 0
         for per_turn_cut in turn_cuts:
             assert len(per_turn_cut.supervisions) >= 1, f"Expected at least one supervision per turn, got none in cut {cut.id}"
@@ -520,9 +519,7 @@ def read_s2s_as_conversation(config) -> tuple[CutSet, bool]:
             else:
                 raise ValueError(f"Speaker '{turn_speaker}' not found in user or agent roles for cut {cut.id}")
             idx += 1
-        # except:
-        #     breakpoint()
-        #     return -1
+
         return NeMoMultimodalConversation(
             id=cut.id,
             turns=turns,
@@ -532,19 +529,7 @@ def read_s2s_as_conversation(config) -> tuple[CutSet, bool]:
     cuts, is_tarred = read_cutset_from_config(config)
     cuts = cuts.map(cut_to_conversation)
     return cuts, is_tarred
-    # temporary addition for debugging
-    # processed_cuts = []
-    # num_faulty = 0
-    # for cut in cuts:
-    #     processed_cut = cut_to_conversation(cut)
-    #     if processed_cut == -1:
-    #         print(cut.id)
-    #         num_faulty += 1
-    #     else:
-    #         processed_cuts.append(processed_cut)
-    # print(num_faulty)
-    # breakpoint()
-    # return processed_cuts, is_tarred
+
 
 def _resolve_shar_inputs(path: Union[str, Path], only_metadata: bool) -> dict:
     if only_metadata:
