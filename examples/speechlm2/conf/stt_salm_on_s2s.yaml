@@ -116,14 +116,37 @@ data:
     shuffle: true
     shard_seed: "randomized"
     num_workers: 1
-    batch_size: 4
+    # batch_size: 4
     # Optional bucketing:
-    # batch_size: null
-    # batch_duration: 100
+    batch_size: null
+    batch_duration: 600
     # bucket_duration_bins: [8.94766,10.1551,11.64118,19.30376,42.85]
-    # use_bucketing: true
     # num_buckets: 5
-    # bucket_buffer_size: 5000
+    bucket_duration_bins: [18.69587,24.24477,27.98826,31.22068,34.20082,37.25114,40.238,43.23646,46.3995,49.47955,52.04722,54.9649,58.45705,61.80676,65.17624,68.47347,71.63179,74.81107,78.17941,81.47664,85.93488,91.41478,97.45197,103.51918,109.99075,118.72825,127.20354,133.95601,140.90422]
+    num_buckets: 30
+    max_duration: 199.36
+    use_bucketing: true
+    bucket_buffer_size: 5000
+
+  # validation_ds:
+  #   # The entries under 'datasets' are a list of separate dataloaders.
+  #   # The structure is <dataset-name>: {<dataloader-dict-config>}
+  #   # They inherit all settings from validation_ds, but can individually override them.
+  #   prompt_format: ${model.prompt_format}
+  #   token_equivalent_duration: 0.08
+  #   datasets:
+  #     val_set_0:  # rename to your dataset name, add more as needed
+  #       input_cfg:
+  #         - type: s2s_as_conversation
+  #           input_cfg: /lustre/fsw/portfolios/llmservice/users/apasad/nemo_duplex_s2s/configs/data_blends/salm_train_s2s_toy.yaml
+  #           # cuts_path: ???  # needs to be set
+  #           audio_locator_tag: ${model.audio_locator_tag}
+  #           input_roles: ${data.input_roles}
+  #           output_roles: ${data.output_roles}
+  #   sample_rate: 16000
+  #   batch_size: 1
+  #   seed: 42
+  #   shard_seed: "randomized"
 
   validation_ds:
     # The entries under 'datasets' are a list of separate dataloaders.
@@ -131,15 +154,58 @@ data:
     # They inherit all settings from validation_ds, but can individually override them.
     prompt_format: ${model.prompt_format}
     token_equivalent_duration: 0.08
+    input_roles: ${data.input_roles}
+    output_roles: ${data.output_roles}
     datasets:
-      val_set_0:  # rename to your dataset name, add more as needed
+      # nvolve_chatqa_test:
+      #   input_cfg:
+      #     - type: s2s_as_conversation
+      #       input_cfg:
+      #         - type: lhotse_shar
+      #           shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/duplex/nvolve_chatqa_test/
+      #       input_roles: ${data.input_roles}
+      #       output_roles: ${data.output_roles}
+      # nvolve_multiturn_test:
+      #   input_cfg:
+      #     - type: s2s_as_conversation
+      #       input_cfg:
+      #         - type: lhotse_shar
+      #           shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/duplex/brainy_mantis/emma_trimmed_overlap_0.64/nvolve_multiturn_test/
+      #       input_roles: ${data.input_roles}
+      #       output_roles: ${data.output_roles}
+      # synthetic_roleplay_v2_test:
+      #   input_cfg:
+      #     - type: s2s_as_conversation
+      #       input_cfg:
+      #         - type: lhotse_shar
+      #           shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/duplex/brainy_mantis/emma_trimmed_overlap_0.64/synthetic_roleplay_v2_test/
+      #       input_roles: ${data.input_roles}
+      #       output_roles: ${data.output_roles}
+      # 340b_8.19_daring_anteater_lmsys_sft_8801rm3.7p_test:
+      #   input_cfg:
+      #     - type: s2s_as_conversation
+      #       input_cfg:
+      #         - type: lhotse_shar
+      #           shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/duplex/340b_8.19_daring_anteater_lmsys_sft_8801rm3.7p_test/
+      #       input_roles: ${data.input_roles}
+      #       output_roles: ${data.output_roles}
+      ultrachat:
         input_cfg:
           - type: s2s_as_conversation
-            input_cfg: /lustre/fsw/portfolios/llmservice/users/apasad/nemo_duplex_s2s/configs/data_blends/salm_train_s2s_toy.yaml
-            # cuts_path: ???  # needs to be set
+            input_cfg:
+              - type: lhotse_shar
+                shar_path: /lustre/fsw/portfolios/llmservice/users/kevinhu/duplex/ultrachat/shar_duplex/manifest_000019/
             audio_locator_tag: ${model.audio_locator_tag}
             input_roles: ${data.input_roles}
             output_roles: ${data.output_roles}
+      # topic_v2_llama3:
+      #   input_cfg:
+      #     - type: s2s_as_conversation
+      #       input_cfg:
+      #         - type: lhotse_shar
+      #           shar_path: /lustre/fsw/portfolios/llmservice/users/kevinhu/duplex/topic_v2/Meta-Llama-3.1-70B-Instruct/shar_duplex/manifest_000050/
+      #       input_roles: ${data.input_roles}
+      #       output_roles: ${data.output_roles}
     sample_rate: 16000
     batch_size: 1
     seed: 42
