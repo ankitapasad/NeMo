@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from dataclasses import dataclass
+import os
 from time import perf_counter
 from typing import Optional
 
@@ -48,6 +49,7 @@ class SalmEvalConfig:
     device: str = "cuda"
     extra_eos_tokens: Optional[list[str]] = None
     system_prompt: Optional[str] = None
+    user_prompt: Optional[str] = None
 
 
 @hydra_runner(config_name="SalmEvalConfig", schema=SalmEvalConfig)
@@ -56,10 +58,32 @@ def main(cfg: SalmEvalConfig):
 
     with torch.device(cfg.device):
         torch.set_default_dtype(torch.bfloat16)
-        model = SALM.from_pretrained(cfg.pretrained_name).eval().to(torch.bfloat16).to(cfg.device)
+        if cfg.pretrained_name.endswith('.ckpt'):
+            # For local checkpoint files
+            model = SALM.load_from_checkpoint(cfg.pretrained_name).eval().to(torch.bfloat16).to(cfg.device)
+        else:
+            # For Hugging Face model identifiers
+            model = SALM.from_pretrained(cfg.pretrained_name).eval().to(torch.bfloat16).to(cfg.device)
         torch.set_default_dtype(torch.float32)
 
-    cuts = guess_parse_cutset(cfg.inputs).sort_by_duration()
+    # Add audio_locator_tag, input_roles, and output_roles to the input config
+    input_config = OmegaConf.load(cfg.inputs)
+    for cfg_entry in input_config:
+        assert cfg_entry.type == "group"
+        for entry in cfg_entry.input_cfg:
+            if entry.type in ["s2s_as_conversation", "lhotse_as_conversation"]:
+                entry.audio_locator_tag = model.cfg.audio_locator_tag
+                entry.input_roles = ["user", "User"]
+                entry.output_roles = ["agent", "Assistant"]
+                # entry.input_roles = model.cfg.input_roles
+                # entry.output_roles = model.cfg.output_roles
+    
+    # Save modified config
+    modified_inputs = cfg.inputs.replace(".yaml", "_modified.yaml")
+    with open(modified_inputs, "w") as f:
+        f.write(OmegaConf.to_yaml(input_config))
+    # cuts = guess_parse_cutset(cfg.inputs).sort_by_duration()  # Not compatible with lazy loading of SHAR data
+    cuts = guess_parse_cutset(modified_inputs)
     dloader = torch.utils.data.DataLoader(
         dataset=ToAudio(),
         sampler=lhotse.dataset.DynamicCutSampler(cuts, max_cuts=cfg.batch_size),
@@ -82,20 +106,25 @@ def main(cfg: SalmEvalConfig):
     system_prompt = []
     if cfg.system_prompt is not None:
         system_prompt.append({"role": "system", "slots": {"message": cfg.system_prompt}})
-
+    if cfg.user_prompt is not None:
+        user_content = cfg.user_prompt # Example: "Repeat after me, typing in lowercase. "
+    else:
+        user_content = ""
     refs = []
     hyps = []
     input_durations = []
     infer_durations = []
     for batch_idx, batch in enumerate(dloader):
         ts = perf_counter()
+        if user_prompt := cfg.user_prompt:
+            system_prompt.append({"role": "user", "slots": {"message": user_prompt}})
         answer_ids = model.generate(
             prompts=[
                 system_prompt
                 + [
                     {
                         "role": "user",
-                        "content": f"Repeat after me, typing in lowercase. {model.audio_locator_tag}",
+                        "content": f"{user_content}{model.audio_locator_tag}",
                     }
                 ]
             ]
