@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from dataclasses import dataclass
+from itertools import groupby
 import os
 from time import perf_counter
 from typing import Optional
@@ -46,6 +47,34 @@ def save_jsonl(data, json_fn):
             f.write(json.dumps(item) + '\n')
 
 class ToAudio(torch.utils.data.Dataset):
+    def __init__(self, system_prompt=None, user_prompt=None):
+        self.system_prompt = system_prompt
+        self.user_content = user_prompt if user_prompt is not None else ""
+
+    def get_prompt(self, conversation: NeMoMultimodalConversation):
+        """
+        Returns:
+            list of turns in the conversation, alternating between user and agent
+        """
+        # Collapse consecutive same-role turns into single turn for proper prompt formatting.
+        turns = groupby(
+            [
+                {
+                    "role": turn.role,
+                    "slots": {"message": turn.value if isinstance(turn, TextTurn) else f'{self.user_content}{turn.audio_locator_tag}'},
+                }
+                for turn in conversation.turns
+            ],
+            key=lambda turn: turn["role"],
+        )
+        turns = [
+            {"role": role, "slots": {"message": " ".join(t["slots"]["message"] for t in turn_grp)}}
+            for role, turn_grp in turns
+        ]
+        if self.system_prompt is not None:
+            turns = [{"role": "system", "slots": {"message": self.system_prompt}}] + turns
+        return turns
+
     def __getitem__(self, cuts: CutSet):
         # return {"cuts": cuts}
         all_cuts = []
@@ -53,8 +82,11 @@ class ToAudio(torch.utils.data.Dataset):
         ref_user_text = []
         example_idx_to_audio_idxs = []
         cntr = 0
+        prompts = []
         for conversation in cuts:
             assert isinstance(conversation, NeMoMultimodalConversation)
+            prompt = self.get_prompt(conversation)
+            prompts.append(prompt)
             conv_id = conversation.id
             example_idx_to_audio_idxs.append([])
             ref_agent_text.extend([(conv_id, turn.value) for turn in conversation.turns if isinstance(turn, TextTurn)])
@@ -65,11 +97,13 @@ class ToAudio(torch.utils.data.Dataset):
                 cntr += 1
         audios, audio_lens = collate_audio(CutSet(all_cuts))
         return {
+            "og_cuts": cuts,
             "cuts": CutSet(all_cuts),
             "audios": audios,
             "audio_lens": audio_lens,
             "agent_ref": ref_agent_text,
-            "user_ref": ref_user_text
+            "user_ref": ref_user_text,
+            "prompt": prompts,
             }
 
 @dataclass
@@ -111,6 +145,8 @@ def main(cfg: SalmEvalConfig):
                 entry.input_roles = ["user", "User"]
                 entry.output_roles = ["agent", "Assistant", "assistant"]
                 entry.force_finite = True  # Make the dataset finite
+                # entry.input_roles = model.cfg.input_roles
+                # entry.output_roles = model.cfg.output_roles
     
     # Save modified config
     modified_inputs = cfg.inputs.replace(".yaml", "_modified.yaml")
@@ -120,7 +156,7 @@ def main(cfg: SalmEvalConfig):
     cuts = guess_parse_cutset(modified_inputs)
     
     dloader = torch.utils.data.DataLoader(
-        dataset=ToAudio(),
+        dataset=ToAudio(system_prompt=cfg.system_prompt, user_prompt=cfg.user_prompt),  # Pass prompts to ToAudio
         sampler=lhotse.dataset.DynamicCutSampler(
             cuts, 
             max_cuts=cfg.batch_size,
@@ -161,30 +197,9 @@ def main(cfg: SalmEvalConfig):
     processed_ids = set()  # Track unique sample IDs
     print("start")
     for batch_idx, batch in enumerate(dloader):
-        # breakpoint()
-        # if batch_idx > 2:
-        #     break
         ts = perf_counter()
-        # Track unique samples in this batch
-        batch_ids = {cut.id for cut in batch['cuts']}
-        processed_ids.update(batch_ids)
-        logging.info(f"Processing batch {batch_idx} with {len(batch['cuts'])} cuts")
-        logging.info(f"Unique samples processed so far: {len(processed_ids)}")
-        total_samples_processed += len(batch['cuts'])
-        logging.info(f"Total samples processed so far: {total_samples_processed}")
-        if user_prompt := cfg.user_prompt:
-            system_prompt.append({"role": "user", "slots": {"message": user_prompt}})
         answer_ids = model.generate(
-            prompts=[
-                system_prompt
-                + [
-                    {
-                        "role": "user",
-                        "content": f"{user_content}{model.audio_locator_tag}",
-                    }
-                ]
-            ]
-            * len(batch["cuts"]),
+            prompts=batch["prompt"],
             audios=batch["audios"].to(model.device, non_blocking=True),
             audio_lens=batch["audio_lens"].to(model.device, non_blocking=True),
             generation_config=GenerationConfig(
@@ -204,6 +219,7 @@ def main(cfg: SalmEvalConfig):
         batch_hyps = [
             normalizer(model.tokenizer.ids_to_text(parse_hyp(ans, eos_tokens)).strip()) for ans in answer_ids
         ]
+        breakpoint()
         assert len(batch_hyps) == len(batch_user_refs) == len(batch_agent_refs)
         if cfg.verbose:
             batch_wer, _, nins, ndel, nsub = word_error_rate_detail(batch_hyps, batch_agent_refs)
