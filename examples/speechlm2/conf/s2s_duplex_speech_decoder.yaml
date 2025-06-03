@@ -112,7 +112,7 @@ trainer:
     find_unused_parameters: true
     # _target_: lightning.pytorch.strategies.ModelParallelStrategy
     # tensor_parallel_size: 1
-    # data_parallel_size: 2
+    # data_parallel_size: 2 # match number of GPUs
 
 data:
   frame_length: 0.08
