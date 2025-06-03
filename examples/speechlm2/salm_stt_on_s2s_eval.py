@@ -82,8 +82,6 @@ class ToAudio(torch.utils.data.Dataset):
         all_cuts = []
         ref_agent_text = []
         ref_user_text = []
-        example_idx_to_audio_idxs = []
-        cntr = 0
         prompts = []
         num_turns = []
         for conversation in cuts:
@@ -92,13 +90,9 @@ class ToAudio(torch.utils.data.Dataset):
             prompts.append(prompt)
             num_turns.append(len(prompt))
             conv_id = conversation.id
-            example_idx_to_audio_idxs.append([])
             ref_agent_text.extend([(conv_id, turn.value) for turn in conversation.turns if isinstance(turn, TextTurn)])
             ref_user_text.extend([(conv_id, turn.cut.supervisions[0].text) for turn in conversation.turns if isinstance(turn, AudioTurn)])
-            for cut in conversation.list_cuts():
-                all_cuts.append(cut)
-                example_idx_to_audio_idxs[-1].append(cntr)
-                cntr += 1
+            all_cuts.extend(conversation.list_cuts())
         audios, audio_lens = collate_audio(CutSet(all_cuts))
         return {
             "cuts": CutSet(all_cuts),
@@ -110,35 +104,7 @@ class ToAudio(torch.utils.data.Dataset):
             "num_turns": num_turns,
             }
 
-@dataclass
-class SalmEvalConfig:
-    pretrained_name: str
-    inputs: str
-    batch_size: int = 64
-    max_new_tokens: int = 128
-    output_manifest: Optional[str] = "generations.jsonl"
-    verbose: bool = True
-    use_normalizer: bool = True
-    device: str = "cuda"
-    extra_eos_tokens: Optional[list[str]] = None
-    system_prompt: Optional[str] = None
-    user_prompt: Optional[str] = None
-
-
-@hydra_runner(config_name="SalmEvalConfig", schema=SalmEvalConfig)
-def main(cfg: SalmEvalConfig):
-    logging.info(f'Hydra config:\n{OmegaConf.to_yaml(cfg)}')
-
-    with torch.device(cfg.device):
-        torch.set_default_dtype(torch.bfloat16)
-        if cfg.pretrained_name.endswith('.ckpt'):
-            # For local checkpoint files
-            model = SALM.load_from_checkpoint(cfg.pretrained_name).eval().to(torch.bfloat16).to(torch.device(cfg.device))
-        else:
-            # For Hugging Face model identifiers
-            model = SALM.from_pretrained(cfg.pretrained_name).eval().to(torch.bfloat16).to(torch.device(cfg.device))
-        torch.set_default_dtype(torch.float32)
-
+def get_dataloader(cfg, model):
     # Add audio_locator_tag, input_roles, and output_roles to the input config
     input_config = OmegaConf.load(cfg.inputs)
     for cfg_entry in input_config:
@@ -158,7 +124,7 @@ def main(cfg: SalmEvalConfig):
         f.write(OmegaConf.to_yaml(input_config))
     # cuts = guess_parse_cutset(cfg.inputs).sort_by_duration()  # Not compatible with lazy loading of SHAR data
     cuts = guess_parse_cutset(modified_inputs)
-    
+
     dloader = torch.utils.data.DataLoader(
         dataset=ToAudio(system_prompt=cfg.system_prompt, user_prompt=cfg.user_prompt),  # Pass prompts to ToAudio
         sampler=lhotse.dataset.DynamicCutSampler(
@@ -171,18 +137,57 @@ def main(cfg: SalmEvalConfig):
         batch_size=None,
     )
     logging.info(f"Created DataLoader with batch_size={cfg.batch_size}")
+    return dloader
 
-    if cfg.use_normalizer:
-        normalizer = EnglishTextNormalizer()
-    else:
-        normalizer = lambda x: x
 
+def get_eos_tokens(cfg, model):
     eos_tokens = [model.text_eos_id]
     if cfg.extra_eos_tokens is not None:
         for t in cfg.extra_eos_tokens:
             tid = model.tokenizer.token_to_id(t)
             assert tid is not None, f"Token '{t}' is not in the model's vocabulary."
             eos_tokens.append(tid)
+    return eos_tokens
+
+
+@dataclass
+class SalmEvalConfig:
+    pretrained_name: str
+    inputs: str
+    batch_size: int = 64
+    max_new_tokens: int = 128
+    output_manifest: Optional[str] = "generations.jsonl"
+    verbose: bool = True
+    use_normalizer: bool = True
+    device: str = "cuda"
+    extra_eos_tokens: Optional[list[str]] = None
+    system_prompt: Optional[str] = None
+    user_prompt: Optional[str] = None
+    teacher_force: bool = False  # If True, use ground truth text instead of generated text
+
+
+@hydra_runner(config_name="SalmEvalConfig", schema=SalmEvalConfig)
+def main(cfg: SalmEvalConfig):
+    logging.info(f'Hydra config:\n{OmegaConf.to_yaml(cfg)}')
+
+    with torch.device(cfg.device):
+        torch.set_default_dtype(torch.bfloat16)
+        if cfg.pretrained_name.endswith('.ckpt'):
+            # For local checkpoint files
+            model = SALM.load_from_checkpoint(cfg.pretrained_name).eval().to(torch.bfloat16).to(torch.device(cfg.device))
+        else:
+            # For Hugging Face model identifiers
+            model = SALM.from_pretrained(cfg.pretrained_name).eval().to(torch.bfloat16).to(torch.device(cfg.device))
+        torch.set_default_dtype(torch.float32)
+
+    dloader = get_dataloader(cfg, model)
+    
+    if cfg.use_normalizer:
+        normalizer = EnglishTextNormalizer()
+    else:
+        normalizer = lambda x: x
+
+    eos_tokens = get_eos_tokens(cfg, model)
 
     system_prompt = []
     if cfg.system_prompt is not None:
@@ -197,6 +202,7 @@ def main(cfg: SalmEvalConfig):
     infer_durations = []
     per_conv_data = {}
     jsonl_data_single_turn = []
+    
     for batch_idx, batch in enumerate(dloader):
         ts = perf_counter()
         num_conversations = len(batch["prompt"])
@@ -204,41 +210,42 @@ def main(cfg: SalmEvalConfig):
         max_turns = max(turn_counts)
         
         # Pre-compute all valid conversation masks for each turn
+        # For handling samples with different number of turns
         # Shape: (max_turns, num_conversations)
         valid_masks = turn_counts.unsqueeze(0) > torch.arange(max_turns, device=turn_counts.device).unsqueeze(1)
         
-        # Pre-compute cumulative turns for each conversation
+        # Cumulative turns for each conversation, used later for indexing
         cum_turns = torch.cat([torch.tensor([0]), torch.cumsum(turn_counts[:-1], dim=0)])
         
         # Initialize conversation histories
         histories = [[] for _ in range(num_conversations)]
-        # Process each turn
+        # Process each turn sequentially
         for turn_idx in range(max_turns):
             # Get valid conversations for this turn using pre-computed mask
             valid_mask = valid_masks[turn_idx]
             if not valid_mask.any():
                 break
                 
-            # Get all audio indices for valid conversations up to current turn
-            # For each valid conversation, create a range of indices
-            valid_cum_turns = cum_turns[valid_mask]
+            # Get all audio indices up to current turn
             # Create a tensor of shape (num_valid_convs, turn_idx + 1) with indices
             # For example, if turn_idx=2 and valid_cum_turns=[0,4,8], we get:
             # [[0,1,2],
             #  [4,5,6],
             #  [8,9,10]]
+            valid_cum_turns = cum_turns[valid_mask]
             audio_indices = (valid_cum_turns.unsqueeze(1) + torch.arange(turn_idx + 1, device=turn_counts.device)).flatten()
+            current_turn_indices = valid_cum_turns + turn_idx  # Only get current indices from the current turn
             
             # Create batch for current turn
             current_batch = {
                 "prompt": [
                     histories[i] + [batch["prompt"][i][turn_idx]]
                     for i in range(num_conversations) if valid_mask[i]
-                ],
-                "audios": batch["audios"][audio_indices],
-                "audio_lens": batch["audio_lens"][audio_indices],
-                "user_ref": [batch["user_ref"][i] for i in audio_indices],
-                "agent_ref": [batch["agent_ref"][i] for i in audio_indices],
+                ], # all past turns
+                "audios": batch["audios"][audio_indices], # all past turns
+                "audio_lens": batch["audio_lens"][audio_indices], # all past turns
+                "user_ref": [batch["user_ref"][i] for i in current_turn_indices],  # current turn
+                "agent_ref": [batch["agent_ref"][i] for i in current_turn_indices],  # current turn
             }
             # Generate for current turn
             answer_ids = model.generate(
@@ -255,24 +262,30 @@ def main(cfg: SalmEvalConfig):
             answer_ids = answer_ids.cpu()
             
             # Process results
-            current_batch_hyps = [
-                model.tokenizer.ids_to_text(parse_hyp(ans, eos_tokens)).strip()
-                for ans in answer_ids
-            ]
-            
-            # Update histories and store results using valid_mask
+            current_batch_conv_ids = [ref[0] for ref in current_batch["user_ref"]]
+            check_conv_ids = [ref[0] == current_batch_conv_ids[i] for i, ref in enumerate(current_batch["agent_ref"])]
+            assert all(check_conv_ids), "conv_ids in user_ref and agent_ref do not match"
+            current_batch_user_refs = [ref[1] for ref in current_batch["user_ref"]]
+            current_batch_refs = [ref[1] for ref in current_batch["agent_ref"]]
+            current_batch_hyps = [model.tokenizer.ids_to_text(parse_hyp(ans, eos_tokens)).strip() for ans in answer_ids]
+
+            # Update histories and store results
             valid_indices = torch.where(valid_mask)[0]
-            for idx, hyp in zip(valid_indices, current_batch_hyps):
+            for idx, ref, hyp, user_ref, conv_id in zip(valid_indices, current_batch_refs, current_batch_hyps, current_batch_user_refs, current_batch_conv_ids):
                 conv_idx = idx.item()
+                if cfg.teacher_force:
+                    pass_context = ref
+                else:
+                    pass_context = hyp
+
                 # Add current turn and response to history
                 histories[conv_idx].extend([
                     batch["prompt"][conv_idx][turn_idx],
-                    {"role": "assistant", "slots": {"message": hyp}}
+                    {"role": "assistant", "slots": {"message": pass_context}}
                 ])
+
                 hyp = normalizer(hyp)
                 # Store results
-                current_audio_idx = cum_turns[conv_idx] + turn_idx
-                conv_id = batch["user_ref"][current_audio_idx][0]
                 if conv_id not in per_conv_data:
                     per_conv_data[conv_id] = {
                         "id": conv_id,
@@ -282,20 +295,20 @@ def main(cfg: SalmEvalConfig):
                         "turns_processed": 0
                     }
                 per_conv_data[conv_id]["pred_agent_text"] += f"|{hyp}"
-                per_conv_data[conv_id]["ref_user_text"] += f"|{batch["user_ref"][current_audio_idx][1]}"
-                per_conv_data[conv_id]["ref_agent_text"] += f"|{batch["agent_ref"][current_audio_idx][1]}"
+                per_conv_data[conv_id]["ref_user_text"] += f"|{user_ref}"
+                per_conv_data[conv_id]["ref_agent_text"] += f"|{ref}"
                 per_conv_data[conv_id]["turns_processed"] += 1
                 
                 batch_hyps.append(normalizer(hyp))
-                batch_refs.append(batch["agent_ref"][current_audio_idx][1])
+                batch_refs.append(ref)
 
                 # Store single turn data
                 jsonl_data_single_turn.append({
                     "id": conv_id,
                     "turn_idx": turn_idx,
-                    "ref_user_text": batch["user_ref"][current_audio_idx][1],
+                    "ref_user_text": user_ref,
                     "pred_agent_text": hyp,
-                    "ref_agent_text": batch["agent_ref"][current_audio_idx][1],
+                    "ref_agent_text": ref,
                 })
         
         batch_infer_duration = perf_counter() - ts
