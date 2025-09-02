@@ -16,6 +16,7 @@ from pathlib import Path
 
 import torch
 from omegaconf import OmegaConf
+import os
 
 from nemo.core.config import hydra_runner
 from nemo.utils.model_utils import import_class_by_path
@@ -61,7 +62,8 @@ def main(cfg: HfExportConfig):
     cls = import_class_by_path(cfg.class_path)
     model = cls(model_cfg)
     load_checkpoint(model, cfg.ckpt_path)
-    model.save_pretrained(cfg.output_dir, config=model_cfg)
+    if not os.path.exists(os.path.join(cfg.output_dir, "model.safetensors")): # if not converted already
+        model.save_pretrained(cfg.output_dir, config=model_cfg)
 
 
 if __name__ == "__main__":
