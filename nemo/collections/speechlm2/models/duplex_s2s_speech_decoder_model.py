@@ -996,23 +996,23 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
             dataset_batch = dataset_batch["audio_data"]
 
-            force_bos_positions = None
-            breakpoint()
-            force_bos_num_tokens_after_user_eos = self.prediction_cfg.get("force_bos_num_tokens_after_user_eos", None)
-            if force_bos_num_tokens_after_user_eos is not None:
-                force_bos_positions = []
-                for cur_source_tokens in dataset_batch["source_tokens"]:
-                    tmp = torch.where(cur_source_tokens == self.text_eos_id)[0]
-                    if len(tmp) > 0:
-                        force_bos_positions.append(tmp[0].item() + force_bos_num_tokens_after_user_eos)
-                    else:
-                        force_bos_positions.append(None)
+            # force_bos_positions = None
+            # breakpoint()
+            # force_bos_num_tokens_after_user_eos = self.prediction_cfg.get("force_bos_num_tokens_after_user_eos", None)
+            # if force_bos_num_tokens_after_user_eos is not None:
+            #     force_bos_positions = []
+            #     for cur_source_tokens in dataset_batch["source_tokens"]:
+            #         tmp = torch.where(cur_source_tokens == self.text_eos_id)[0]
+            #         if len(tmp) > 0:
+            #             force_bos_positions.append(tmp[0].item() + force_bos_num_tokens_after_user_eos)
+            #         else:
+            #             force_bos_positions.append(None)
             results = self.offline_inference(
                 dataset_batch["source_audio"],
                 dataset_batch["source_audio_lens"],
-                decode_audio=self.prediction_cfg.decode_audio,
-                input_pad_len=self.prediction_cfg.max_new_seconds * self.prediction_cfg.input_sample_rate,
-                force_bos_positions=force_bos_positions,
+                # decode_audio=self.prediction_cfg.decode_audio,
+                # input_pad_len=self.prediction_cfg.max_new_seconds * self.prediction_cfg.input_sample_rate,
+                # force_bos_positions=force_bos_positions,
             )
 
 
