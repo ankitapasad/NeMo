@@ -118,6 +118,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         self.source_sample_rate = cfg.data.source_sample_rate
         self.validation_save_path = os.path.join(cfg.exp_manager.explicit_log_dir, "validation_logs")
         self.decode_audio = cfg.model.get("decode_audio", True)
+        self.text_input = cfg.model.get("text_input", False)
         # move back text channel by x, in inference it advance the text channel prediction by x frames
         self.advance_text_channel_by = self.cfg.get("advance_text_channel_by", None)
 
@@ -164,7 +165,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         maybe_install_lora(self)
 
         # Load the pretrained streaming ASR model and copy its parameters into the audio perception module.
-        setup_speech_encoder(self)
+        if not self.text_input:
+            setup_speech_encoder(self)
 
         llm_tokenizer_vocab_items = self.tokenizer.vocab
         # if vocab is a dict it already has the subword and token id, if not, get it from the tokenizer
@@ -518,100 +520,37 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
         return batch_audio
 
-    def prepare_inputs(self, batch: dict):
+    def prepare_t2t_inputs(self, batch: dict):
         """
         Similar to DuplexS2SModel.prepare_inputs, with following changes:
             (1) Add 'input_audio_tokens' and 'seq_mask' in return value for TransformerARSpeechDecoder
             (2) Remove audio codec embedding from 'input_embeds'
         """
-        # check if audios has the same batch size
-        assert batch["source_audio"].size(0) == batch["target_audio"].size(0)
-        assert batch["target_first_turn_audio"].size(0) == batch["target_audio"].size(0)
-
-        if self.cfg.get('use_old_noise_aug', None):
-            # ToDo we are applying it in all datasets, old codebase does not applied in real conv data
-            noise_prob = 0.99
-            noise_min_snr = 20
-            noise_max_snr = 50
-            noise_path = self.cfg.get(
-                'old_noise_aug_path',
-                None
-            )
-            noise_path_name = "*"
-            no_noise_audio = batch["source_audio"].clone()
-            if (
-                self.training
-                and batch["formatter"][0] != 's2s_duplex_overlap_as_s2s_duplex'
-                and noise_prob
-                and random.random() < noise_prob
-            ):
-                batch["source_audio"] = self.add_noise_to_batch(
-                    batch["source_audio"],
-                    os.path.join(noise_path, noise_path_name),
-                    snr_db=random.randint(noise_min_snr, noise_max_snr),
-                    noise_prob_scale_user=0.3,
-                    noise_prob_scale_user_min_snr=-15,
-                    noise_prob_scale_user_max_snr=24,
-                    snr_measure_dur=0.0,
-                    noise_resample=True,
-                    noise_prob_low_pass=0.1,
-                )
-        else:
-            # change audio volume randomly
-            if self.training and random.random() < self.cfg.get('noise_prob_scale_user', 0.0):
-                # prev codebase had 0.0631 and 5.6234 here we round the values
-                min_scale_val = self.cfg.get('noise_scale_user_min', 0.0631)  # -15 snr
-                max_scale_val = self.cfg.get('noise_scale_user_min', 5.6234)  # 24 snr
-
-                # get a random float value between min and max
-                scaling_factor = (
-                    torch.rand(batch["source_audio"].size(0), device=batch["source_audio"].device)
-                    * (max_scale_val - min_scale_val)
-                    + min_scale_val
-                )
-                batch["source_audio"] = batch["source_audio"] * scaling_factor.unsqueeze(-1)
-
-            # apply low pass filter
-            if self.training and random.random() < self.cfg.get('noise_prob_low_pass', 0.0):
-                # prev codebase had 0.0631 and 5.6234 here we round the values
-                cutoff_freq = self.cfg.get('noise_low_pass_cutoff_freq', 1000.0)
-                # note here we are using a biquad filter, older codebase we are using a filter of order 5
-                batch["source_audio"] = torchaudio.functional.lowpass_biquad(
-                    waveform=batch["source_audio"], sample_rate=self.source_sample_rate, cutoff_freq=cutoff_freq
-                )
-
-        source_encoded, source_encoded_lens, asr_emb = self.perception(
-            input_signal=batch["source_audio"],
-            input_signal_length=batch["source_audio_lens"],
-            return_encoder_emb=True,
-        )
-
-        # if inference return speaker embedding None and it will uses the cached speaker embedding
-        if not self.training:
-            speaker_encoder_emb = None
-        else:  # if training or eval extract embedding from first agent turn returned by the dataloader
-            if self.decode_audio and self.speech_generation.use_speaker_encoder:
-                target_first_turn_audio = batch["target_first_turn_audio"]
-                target_first_turn_audio_lens = batch["target_first_turn_audio_lens"]
-                speaker_encoder_emb = self.speech_generation.get_speaker_embedding(
-                    target_first_turn_audio, target_first_turn_audio_lens, self.target_sample_rate
-                )
-            else:
-                speaker_encoder_emb = None
-
+        source_tokens = batch["source_tokens"]
         target_tokens = batch["target_tokens"]
-        if (diff := target_tokens.shape[1] - source_encoded.shape[1]) < 0:
-            target_tokens = torch.cat(
+
+        diff = target_tokens.shape[1] - source_tokens.shape[1]
+        assert diff < 2, f"Source and target sequences must have similar lengths, got {source_tokens.shape[1]} and {target_tokens.shape[1]}"
+        if diff > 0:
+            source_tokens = torch.cat(
                 [
-                    target_tokens,
+                    source_tokens,
                     (
-                        torch.ones(source_encoded.shape[0], abs(diff), device=source_encoded.device) * self.text_pad_id
+                        torch.ones(source_tokens.shape[0], abs(diff), device=source_tokens.device) * self.speech_pad_id
                     ).to(torch.long),
                 ],
                 dim=-1,
             )
-        elif diff > 0:
-            target_tokens = target_tokens[:, : source_encoded.shape[1]]
+        elif diff < 0:
+            target_tokens = torch.cat(
+                [
+                    target_tokens,
+                    (
+                        torch.ones(target_tokens.shape[0], abs(diff), device=target_tokens.device) * self.text_pad_id
+                    ).to(torch.long),
+                ],
+                dim=-1,
+            )
 
         with fp32_precision(), torch.no_grad():
             target_codes, target_codes_lens = self.audio_codec.encode(
