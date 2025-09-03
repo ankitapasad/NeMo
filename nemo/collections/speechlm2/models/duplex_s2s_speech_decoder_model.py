@@ -255,6 +255,13 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             else:
                 checkpoint_state = torch.load(checkpoint_path, weights_only=False, map_location='cpu')['state_dict']
 
+            if self.cfg.get("reinit_llm", False):
+                # filter out llm keys from the pretrained checkpoint: llm.*, embed_tokens.*, lm_head.*
+                tot_num_keys = len(checkpoint_state)
+                excluded_prefixes = ("llm.", "embed_tokens.", "lm_head.")
+                checkpoint_state = {k: v for k, v in checkpoint_state.items() if not k.startswith(excluded_prefixes)}
+                print(f"Filtered out {tot_num_keys - len(checkpoint_state)} keys from the pretrained checkpoint: {excluded_prefixes}")
+
             # partial initialization support
             checkpoint_state = set_model_dict_for_partial_init(checkpoint_state, self.state_dict())
             self.load_state_dict(checkpoint_state, strict=True)
@@ -941,8 +948,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         return res
 
     def on_train_epoch_start(self) -> None:
-        setup_audio_codec(self)  # potentially reloads the audio codec to make sure it's in fp32
         if self.decode_audio:
+            setup_audio_codec(self)  # potentially reloads the audio codec to make sure it's in fp32
             if hasattr(self.speech_generation, "use_speaker_encoder") and self.speech_generation.use_speaker_encoder:
                 self.speech_generation.setup_speaker_encoder()  # potentially reloads the speaker encoder to make sure it's in fp32
 
@@ -996,23 +1003,23 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
             dataset_batch = dataset_batch["audio_data"]
 
-            force_bos_positions = None
-            breakpoint()
-            force_bos_num_tokens_after_user_eos = self.prediction_cfg.get("force_bos_num_tokens_after_user_eos", None)
-            if force_bos_num_tokens_after_user_eos is not None:
-                force_bos_positions = []
-                for cur_source_tokens in dataset_batch["source_tokens"]:
-                    tmp = torch.where(cur_source_tokens == self.text_eos_id)[0]
-                    if len(tmp) > 0:
-                        force_bos_positions.append(tmp[0].item() + force_bos_num_tokens_after_user_eos)
-                    else:
-                        force_bos_positions.append(None)
+            # force_bos_positions = None
+            # breakpoint()
+            # force_bos_num_tokens_after_user_eos = self.prediction_cfg.get("force_bos_num_tokens_after_user_eos", None)
+            # if force_bos_num_tokens_after_user_eos is not None:
+            #     force_bos_positions = []
+            #     for cur_source_tokens in dataset_batch["source_tokens"]:
+            #         tmp = torch.where(cur_source_tokens == self.text_eos_id)[0]
+            #         if len(tmp) > 0:
+            #             force_bos_positions.append(tmp[0].item() + force_bos_num_tokens_after_user_eos)
+            #         else:
+            #             force_bos_positions.append(None)
             results = self.offline_inference(
                 dataset_batch["source_audio"],
                 dataset_batch["source_audio_lens"],
-                decode_audio=self.prediction_cfg.decode_audio,
-                input_pad_len=self.prediction_cfg.max_new_seconds * self.prediction_cfg.input_sample_rate,
-                force_bos_positions=force_bos_positions,
+                # decode_audio=self.prediction_cfg.decode_audio,
+                # input_pad_len=self.prediction_cfg.max_new_seconds * self.prediction_cfg.input_sample_rate,
+                # force_bos_positions=force_bos_positions,
             )
 
 
@@ -1399,3 +1406,11 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             logging.info(f"Error loading model state_dict !! Retrying with partial initialization!")
             model_dict = set_model_dict_for_partial_init(state_dict, self.state_dict())
             return super().load_state_dict(model_dict, strict=False)
+
+    def save_to(self, save_path: str):
+        # If the path ends with .nemo from the callback, map it to .ckpt
+        path = save_path if save_path.endswith(".ckpt") else save_path.replace(".nemo", ".ckpt")
+        if getattr(self, "trainer", None) is None:
+            raise RuntimeError("Trainer is not attached; cannot save checkpoint.")
+        self.trainer.save_checkpoint(path)
+        return path
