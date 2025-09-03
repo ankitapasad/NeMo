@@ -93,8 +93,7 @@ class S2SDuplexPredictionWriter(BasePredictionWriter):
 
             del prediction["audio"]
             del prediction["audio_len"]
-
-        del prediction["tokens_audio"]
+            del prediction["tokens_audio"]
         del prediction["source_audio"]
         del prediction["source_audio_len"]
 
