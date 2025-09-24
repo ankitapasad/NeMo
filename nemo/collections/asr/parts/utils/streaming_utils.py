@@ -14,12 +14,15 @@
 
 import copy
 import os
-from typing import Optional
-
+from dataclasses import dataclass
+from pathlib import Path
+from typing import NamedTuple, Optional
+import librosa
 import numpy as np
 import torch
 from omegaconf import OmegaConf
-from torch.utils.data import DataLoader
+from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import DataLoader, Dataset
 
 from nemo.collections.asr.data.audio_to_text_lhotse_prompted import PromptedAudioToTextMiniBatch
 from nemo.collections.asr.models import ASRModel
@@ -27,6 +30,8 @@ from nemo.collections.asr.parts.mixins.streaming import StreamingEncoder
 from nemo.collections.asr.parts.preprocessing.features import normalize_batch
 from nemo.collections.asr.parts.preprocessing.segment import get_samples
 from nemo.collections.asr.parts.utils import rnnt_utils
+from nemo.collections.asr.parts.utils.timestamp_utils import get_forced_aligned_timestamps_with_external_model
+from nemo.collections.common.tokenizers.canary_tokenizer import CanaryBPETokenizer
 from nemo.core.classes import IterableDataset
 from nemo.core.neural_types import LengthsType, MelSpectrogramType, NeuralType
 
@@ -288,39 +293,62 @@ def longest_common_subsequence_merge(X, Y, filepath=None):
     return result_idx, LCSuff
 
 
-def lcs_alignment_merge_buffer(buffer, data, delay, model, max_steps_per_timestep: int = 5, filepath: str = None):
+def lcs_alignment_merge_buffer(
+    buffer,
+    data,
+    delay,
+    model,
+    max_steps_per_timestep: int = 5,
+    filepath: str = None,
+    min_lcs_length: int = 1,
+    parallel_chunking: bool = False,
+):
     """
     Merges the new text from the current frame with the previous text contained in the buffer.
 
     The alignment is based on a Longest Common Subsequence algorithm, with some additional heuristics leveraging
-    the notion that the chunk size is >= the context window. In case this assumptio is violated, the results of the
+    the notion that the chunk size is >= the context window. In case this assumption is violated, the results of the
     merge will be incorrect (or at least obtain worse WER overall).
+
+    If the LCS found is shorter than min_lcs_length, no deduplication is performed.
+
+    Args:
+        buffer: The existing buffer of tokens
+        data: New data to merge with buffer
+        delay: Number of delay timesteps
+        model: The ASR model
+        max_steps_per_timestep: Maximum steps per timestep
+        filepath: Optional filepath for debugging
+        min_lcs_length: Minimum LCS length for deduplication
+        parallel_chunking: If True, remove the LCS from the buffer as well, then concatenate with data; if False, make changes only to the data
     """
-    # If delay timesteps is 0, that means no future context was used. Simply concatenate the buffer with new data.
-    if delay < 1:
+    if delay < 1 or len(buffer) == 0:
         buffer += data
         return buffer
 
-    # If buffer is empty, simply concatenate the buffer and data.
-    if len(buffer) == 0:
-        buffer += data
-        return buffer
-
-    # Prepare a subset of the buffer that will be LCS Merged with new data
     search_size = int(delay * max_steps_per_timestep)
     buffer_slice = buffer[-search_size:]
 
-    # Perform LCS Merge
     lcs_idx, lcs_alignment = longest_common_subsequence_merge(buffer_slice, data, filepath=filepath)
+    i_rel, j_rel, length = lcs_idx
 
-    # Slice off new data
-    # i, j, slice_len = lcs_idx
-    slice_idx = lcs_idx[1] + lcs_idx[-1]  # slice = j + slice_len
-    data = data[slice_idx:]
+    if length < min_lcs_length:
+        return buffer + data
 
-    # Concat data to buffer
-    buffer += data
-    return buffer
+    if parallel_chunking:
+        base = len(buffer) - len(buffer_slice)
+        i_abs_start = base + i_rel
+        i_abs_end = i_abs_start + length  # end position (exclusive) in `buffer`
+        j_after = j_rel + length  # first index after LCS in `data`
+
+        merged = buffer[:i_abs_end] + data[j_after:]
+        return merged
+    else:
+        # Slice off new data based on LCS and concatenate
+        slice_idx = j_rel + length
+        data = data[slice_idx:]
+        buffer += data
+        return buffer
 
 
 def inplace_buffer_merge(buffer, data, timesteps, model):
@@ -739,7 +767,10 @@ class FrameBatchASR:
         self.unmerged = []
 
         if self.decoder is None:
-            self.blank_id = len(asr_model.tokenizer.vocabulary)
+            if isinstance(asr_model.tokenizer, CanaryBPETokenizer):
+                self.blank_id = asr_model.tokenizer.vocab_size
+            else:
+                self.blank_id = len(asr_model.tokenizer.vocabulary)
         elif hasattr(asr_model.decoder, "vocabulary"):
             self.blank_id = len(asr_model.decoder.vocabulary)
         else:
@@ -1710,6 +1741,16 @@ class CacheAwareStreamingAudioBuffer:
 
 class FrameBatchMultiTaskAED(FrameBatchASR):
     def __init__(self, asr_model, frame_len=4, total_buffer=4, batch_size=4):
+
+        self.timestamps_asr_model = asr_model.timestamps_asr_model
+        if self.timestamps_asr_model is not None:
+            self.timestamps_frame_asr = FrameBatchASR(
+                asr_model=self.timestamps_asr_model,
+                frame_len=frame_len,
+                total_buffer=total_buffer,
+                batch_size=batch_size,
+            )
+
         super().__init__(asr_model, frame_len, total_buffer, batch_size, pad_to_buffer_len=False)
         self.window_stride = asr_model._cfg.preprocessor.window_stride
         self.subsampling_factor = asr_model._cfg.encoder.subsampling_factor
@@ -1722,6 +1763,19 @@ class FrameBatchMultiTaskAED(FrameBatchASR):
         self.chunk_offsets = [
             0,
         ]
+
+        if self.timestamps_asr_model is not None:
+            self.timestamps_frame_asr.reset()
+
+    @torch.no_grad()
+    def infer_logits(self, keep_logits=False, timestamps=False):
+        frame_buffers = self.frame_bufferer.get_buffers_batch()
+
+        while len(frame_buffers) > 0:
+            self.frame_buffers += frame_buffers[:]
+            self.data_layer.set_signal(frame_buffers[:])
+            self._get_batch_preds(keep_logits=keep_logits, timestamps=timestamps)
+            frame_buffers = self.frame_bufferer.get_buffers_batch()
 
     def get_input_tokens(self, sample: dict):
         if self.asr_model.prompt_format == "canary":
@@ -1750,6 +1804,9 @@ class FrameBatchMultiTaskAED(FrameBatchASR):
         # fill optional slots
         for k, v in default_slot_values.items():
             sample[k] = sample.get(k, v)
+            if k == 'timestamp' and self.timestamps_asr_model is not None:
+                sample[k] = "<|notimestamp|>"
+
         tokens = self.asr_model.prompt.encode_dialog(
             turns=[
                 {
@@ -1765,16 +1822,33 @@ class FrameBatchMultiTaskAED(FrameBatchASR):
         return torch.tensor(tokens, dtype=torch.long, device=self.asr_model.device).unsqueeze(0)  # [1, T]
 
     def read_audio_file(self, audio_filepath: str, delay, model_stride_in_secs, meta_data):
+        timestamps = meta_data.get('timestamp', False) == "yes"
         self.input_tokens = self.get_input_tokens(meta_data)
         samples = get_samples(audio_filepath)
-        samples = np.pad(samples, (0, int(delay * model_stride_in_secs * self.asr_model._cfg.sample_rate)))
+        padded_samples = np.pad(samples, (0, int(delay * model_stride_in_secs * self.asr_model._cfg.sample_rate)))
+
         frame_reader = AudioFeatureIterator(
-            samples, self.frame_len, self.raw_preprocessor, self.asr_model.device, pad_to_frame_len=False
+            padded_samples, self.frame_len, self.raw_preprocessor, self.asr_model.device, pad_to_frame_len=False
         )
         self.set_frame_reader(frame_reader)
+        if timestamps and self.timestamps_asr_model is not None:
+            ts_model_feature_stride = self.timestamps_asr_model._cfg.preprocessor['window_stride']
+            ts_model_stride_in_secs = ts_model_feature_stride * self.timestamps_asr_model.encoder.subsampling_factor
+
+            ts_model_padded_samples = np.pad(
+                samples, (0, int(delay * ts_model_stride_in_secs * self.timestamps_asr_model._cfg.sample_rate))
+            )
+
+            ts_model_frame_reader = AudioFeatureIterator(
+                ts_model_padded_samples,
+                self.frame_len,
+                self.timestamps_frame_asr.raw_preprocessor,
+                self.timestamps_frame_asr.asr_model.device,
+            )
+            self.timestamps_frame_asr.set_frame_reader(ts_model_frame_reader)
 
     @torch.no_grad()
-    def _get_batch_preds(self, keep_logits=False):
+    def _get_batch_preds(self, keep_logits=False, timestamps=False):
         device = self.asr_model.device
         for batch in iter(self.data_loader):
             feat_signal, feat_signal_len = batch
@@ -1794,20 +1868,39 @@ class FrameBatchMultiTaskAED(FrameBatchASR):
                 prompted_transcript=None,
                 prompted_transcript_lens=None,
             )
-            predictions = self.asr_model.predict_step(batch_input, has_processed_signal=True)
+            predictions = self.asr_model.predict_step(batch_input, has_processed_signal=True, timestamps=timestamps)
+
             self.all_preds.extend(predictions)
             del predictions
 
     def transcribe(
-        self, tokens_per_chunk: Optional[int] = None, delay: Optional[int] = None, keep_logits: bool = False
+        self,
+        tokens_per_chunk: Optional[int] = None,
+        delay: Optional[int] = None,
+        keep_logits: bool = False,
+        timestamps: bool = False,
     ):
         """
         unsued params are for keeping the same signature as the parent class
         """
-        self.infer_logits(keep_logits)
+        self.infer_logits(keep_logits=keep_logits, timestamps=timestamps)
+        if timestamps and self.timestamps_asr_model is not None:
+            self.timestamps_frame_asr.infer_logits(keep_logits=True)
+            timestamps_model_hypotheses = [
+                rnnt_utils.Hypothesis(y_sequence=logits, score=0.0) for logits in self.timestamps_frame_asr.all_logits
+            ]
+            self.all_preds = get_forced_aligned_timestamps_with_external_model(
+                audio=timestamps_model_hypotheses,
+                external_ctc_model=self.timestamps_asr_model,
+                main_model_predictions=self.all_preds,
+                batch_size=self.batch_size,
+                timestamp_type=['word', 'segment'],
+                viterbi_device=self.timestamps_frame_asr.asr_model.device,
+                has_hypotheses=True,
+            )
 
         # join hypotheses
-        hypothesis = self._join_hypotheses(self.all_preds)
+        hypothesis = self._join_hypotheses(self.all_preds, timestamps=timestamps)
 
         if not keep_logits:
             return hypothesis
@@ -1815,7 +1908,7 @@ class FrameBatchMultiTaskAED(FrameBatchASR):
         print("keep_logits=True is not supported for MultiTaskAEDFrameBatchInfer. Returning empty logits.")
         return hypothesis, []
 
-    def _join_hypotheses(self, hypotheses):
+    def _join_hypotheses(self, hypotheses, timestamps=False):
         if len(hypotheses) == 1:
             return hypotheses[0]
 
@@ -1823,17 +1916,20 @@ class FrameBatchMultiTaskAED(FrameBatchASR):
         merged_hypthesis = rnnt_utils.Hypothesis(
             score=0.0,
             y_sequence=torch.tensor([]),
-            timestamp={
-                'char': [],
-                'word': [],
-                'segment': [],
-            },
         )
 
         # join
         merged_hypthesis = self._join_text(merged_hypthesis, hypotheses)
+
         merged_hypthesis = self._join_y_sequence(merged_hypthesis, hypotheses)
-        merged_hypthesis = self._join_timestamp(merged_hypthesis, hypotheses)
+
+        if timestamps:
+            merged_hypthesis.timestamp = {
+                'char': [],
+                'word': [],
+                'segment': [],
+            }
+            merged_hypthesis = self._join_timestamp(merged_hypthesis, hypotheses)
 
         return merged_hypthesis
 
@@ -2008,3 +2104,213 @@ class FrameBatchChunkedCTC(FrameBatchASR):
 
         print("keep_logits=True is not supported for FrameBatchChunkedCTC. Returning empty logits.")
         return hypothesis, []
+
+
+@dataclass
+class ContextSize:
+    left: int
+    chunk: int
+    right: int
+
+    def total(self) -> int:
+        """Total context size"""
+        return self.left + self.chunk + self.right
+
+    def subsample(self, factor: int) -> "ContextSize":
+        """
+        Subsample context size by factor
+
+        Args:
+            factor: subsampling factor
+        """
+        return ContextSize(
+            left=self.left // factor,
+            chunk=self.chunk // factor,
+            right=self.right // factor,
+        )
+
+    def add_frames_get_removed_(self, num_frames: int, is_last_chunk: bool, expected_context: "ContextSize") -> int:
+        """
+        Add frames to context size
+        Args:
+            num_frames: number of frames to add
+            is_last_chunk: if last chunk
+
+        Returns:
+            number of frames removed from the left side
+        """
+        if num_frames > expected_context.chunk + expected_context.right:
+            raise ValueError(
+                f"Added chunk length {num_frames} is larger "
+                f"than expected chunk with right context {expected_context}"
+            )
+        # consider first everything is moved to right/left context, then move to chunk
+        self.left += self.chunk
+        self.chunk = 0
+        self.right += num_frames
+        if is_last_chunk:
+            # move all samples to chunk, empty right part
+            self.chunk = self.right
+            self.right = 0
+        else:
+            self.chunk = expected_context.chunk
+            self.right -= expected_context.chunk
+        extra_samples = max(self.total() - expected_context.total(), 0)
+        self.left -= extra_samples
+        if not is_last_chunk:
+            assert self.right == expected_context.right
+        return extra_samples
+
+    def __str__(self):
+        return f"Left {self.left} - Chunk {self.chunk} - Right {self.right}"
+
+
+@dataclass
+class ContextSizeBatch:
+    """Batched context size"""
+
+    left: torch.Tensor
+    chunk: torch.Tensor
+    right: torch.Tensor
+
+    def total(self) -> torch.Tensor:
+        """Total context size"""
+        return self.left + self.chunk + self.right
+
+    def subsample(self, factor: int) -> "ContextSizeBatch":
+        """
+        Subsample context size by factor
+
+        Args:
+            factor: subsampling factor
+        """
+        return ContextSizeBatch(
+            left=torch.div(self.left, factor, rounding_mode="floor"),
+            chunk=torch.div(self.chunk, factor, rounding_mode="floor"),
+            right=torch.div(self.right, factor, rounding_mode="floor"),
+        )
+
+    def add_frames_(
+        self, num_frames_batch: torch.Tensor, is_last_chunk_batch: torch.Tensor, expected_context: "ContextSize"
+    ):
+        """
+        Add frames to context size
+        Args:
+            num_frames_batch: number of frames to add
+            is_last_chunk_batch: if last chunk
+
+        Returns:
+            number of frames removed from the left side
+        """
+        self.left += self.chunk
+        self.chunk.fill_(0)
+        self.right += num_frames_batch
+
+        self.chunk = torch.where(is_last_chunk_batch, self.right, expected_context.chunk)
+        self.right = torch.where(is_last_chunk_batch, 0, self.right - expected_context.chunk)
+
+        # fix left context
+        self.left = torch.where(self.chunk > 0, self.left, 0)
+
+        extra_samples = torch.maximum(self.total() - expected_context.total(), torch.zeros_like(self.left))
+        self.left -= extra_samples
+        self.left = torch.where(self.left < 0, torch.zeros_like(self.left), self.left)
+
+
+class StreamingBatchedAudioBuffer:
+    """Batched audio buffer with strict context management for streaming inference without left padding."""
+
+    def __init__(self, batch_size: int, context_samples: ContextSize, dtype: torch.dtype, device: torch.device | str):
+        """
+        Init batched audio buffer for streaming inference
+        Args:
+            batch_size: batch size
+            context_samples: context size
+            dtype: buffer dtype
+            device: device for buffer
+        """
+        self.batch_size = batch_size
+        self.expected_context = context_samples
+        self.samples = torch.zeros([batch_size, 0], dtype=dtype, device=device)
+        self.context_size = ContextSize(left=0, chunk=0, right=0)
+        self.context_size_batch = ContextSizeBatch(
+            left=torch.zeros([batch_size], dtype=torch.long, device=device),
+            chunk=torch.zeros([batch_size], dtype=torch.long, device=device),
+            right=torch.zeros([batch_size], dtype=torch.long, device=device),
+        )
+
+    def add_audio_batch_(
+        self,
+        audio_batch: torch.Tensor,
+        audio_lengths: torch.Tensor,
+        is_last_chunk: bool,
+        is_last_chunk_batch: torch.Tensor,
+    ):
+        """
+        Add audio batch to buffer
+
+        Args:
+            audio_batch: chunk with audio
+            audio_lengths: length of audio
+            is_last_chunk: if last chunk
+            is_last_chunk_batch: if last chunk for each audio utterance
+        """
+        added_chunk_length = audio_batch.shape[1]
+
+        # concat new chunk with buffer, remove extra samples
+        self.samples = torch.cat((self.samples, audio_batch), dim=1)
+        extra_samples_in_buffer = self.context_size.add_frames_get_removed_(
+            added_chunk_length, is_last_chunk=is_last_chunk, expected_context=self.expected_context
+        )
+        self.context_size_batch.add_frames_(
+            num_frames_batch=audio_lengths,
+            is_last_chunk_batch=is_last_chunk_batch,
+            expected_context=self.expected_context,
+        )
+        # leave only full_ctx_audio_samples in buffer
+        if extra_samples_in_buffer > 0:
+            self.samples = self.samples[:, extra_samples_in_buffer:].clone()
+
+
+def load_audio(file_path: str | Path, sample_rate: int = 16000) -> tuple[torch.Tensor, int]:
+    """Load audio from file"""
+    audio, sr = librosa.load(file_path, sr=sample_rate)
+    return torch.tensor(audio, dtype=torch.float32), sr
+
+
+class AudioBatch(NamedTuple):
+    audio_signals: torch.Tensor
+    audio_signal_lengths: torch.Tensor
+
+    @staticmethod
+    def collate_fn(
+        audio_batch: list[torch.Tensor],
+    ) -> "AudioBatch":
+        """
+        Collate audio signals to batch
+        """
+        audio_signals = pad_sequence(
+            [audio_tensor for audio_tensor in audio_batch], batch_first=True, padding_value=0.0
+        )
+        audio_signal_lengths = torch.tensor([audio_tensor.shape[0] for audio_tensor in audio_batch]).long()
+
+        return AudioBatch(
+            audio_signals=audio_signals,
+            audio_signal_lengths=audio_signal_lengths,
+        )
+
+
+class SimpleAudioDataset(Dataset):
+    """Dataset constructed from audio filenames. Each item - audio"""
+
+    def __init__(self, audio_filenames: list[str | Path], sample_rate: int = 16000):
+        super().__init__()
+        self.audio_filenames = audio_filenames
+        self.sample_rate = sample_rate
+
+    def __getitem__(self, item: int) -> torch.Tensor:
+        audio, _ = load_audio(self.audio_filenames[item])
+        return audio
+
+    def __len__(self):
+        return len(self.audio_filenames)

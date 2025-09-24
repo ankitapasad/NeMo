@@ -15,7 +15,7 @@
 import _io
 import lightning.pytorch as pl
 import torch
-from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor, BitsAndBytesConfig
+from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor
 
 from nemo.automodel.dist_utils import FirstRankPerNode
 from nemo.collections.llm import fn
@@ -42,6 +42,13 @@ class HFAutoModelForImageTextToText(pl.LightningModule, io.IOMixin, fn.FNMixin):
         freeze_vision_model=False,
         **kwargs,
     ):
+        from nemo.utils.decorators import deprecated_warning
+
+        deprecated_warning(
+            old_method="Automodel on NVIDIA/NeMo",
+            new_method="https://github.com/NVIDIA-NeMo/Automodel repo",
+            wait_seconds=2,
+        )
         super().__init__()
         self.save_hyperparameters()
         self.model_name = model_name
@@ -86,6 +93,8 @@ class HFAutoModelForImageTextToText(pl.LightningModule, io.IOMixin, fn.FNMixin):
 
         quantization_config = None
         if self.load_in_4bit:
+            from transformers import BitsAndBytesConfig
+
             quantization_config = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_quant_type="nf4",
