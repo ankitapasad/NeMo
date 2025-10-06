@@ -225,6 +225,7 @@ class ResultsLogger:
                 # Compute metrics on merged results
                 if name in special_subset_names and merged_results:
                     correct_count = 0
+                    correct_count_phrase = 0
                     empty_count = 0
                     total_count = len(merged_results)
 
@@ -242,23 +243,29 @@ class ResultsLogger:
                         possible_targets = target_text.split(';')
 
                         is_correct = False
+                        phrase_found = False
+                        bow_found = False
                         for target_option in possible_targets:
                             normalized_target_option = self.normalizer(target_option.strip())
+                            if normalized_target_option in normalized_pred and not phrase_found:
+                                correct_count_phrase += 1
+                                phrase_found = True
                             target_words = set(normalized_target_option.split())
 
-                            if not target_words or target_words.issubset(pred_words):
+                            if (not target_words or target_words.issubset(pred_words)) and not bow_found:
                                 is_correct = True
-                                break
+                                bow_found = True
 
                         if is_correct:
                             correct_count += 1
 
+                    acc_phrase = correct_count_phrase / total_count if total_count > 0 else 0.0
                     acc = correct_count / total_count if total_count > 0 else 0.0
                     empty_rate = empty_count / total_count if total_count > 0 else 0.0
 
-                    metrics_results[name] = {'acc': torch.tensor(acc), 'empty_rate': torch.tensor(empty_rate)}
+                    metrics_results[name] = {'acc': torch.tensor(acc), 'acc_phrase': torch.tensor(acc_phrase), 'empty_rate': torch.tensor(empty_rate)}
                     logging.info(
-                        f"Metrics for special subset '{name}': Accuracy={acc}, Empty Rate={empty_rate} (total samples: {total_count})")
+                        f"Metrics for special subset '{name}': Accuracy={acc}, Accuracy (phrase)={acc_phrase}, Empty Rate={empty_rate} (total samples: {total_count})")
                 
                 # Compute MCQ metrics for MCQ datasets
                 if name in mcq_subset_names and merged_results and self.mcq_evaluator:
@@ -299,6 +306,9 @@ class ResultsLogger:
                         metrics_to_broadcast[name]['mcq_acc'] = metrics['mcq_acc'].item()
                     if 'empty_rate' in metrics:
                         metrics_to_broadcast[name]['empty_rate'] = metrics['empty_rate'].item()
+                    # Only include acc_phrase if it exists (for special_subset_names only)
+                    if 'acc_phrase' in metrics:
+                        metrics_to_broadcast[name]['acc_phrase'] = metrics['acc_phrase'].item()
             else:
                 metrics_to_broadcast = {}
 
@@ -317,5 +327,8 @@ class ResultsLogger:
                         metrics_results[name]['mcq_acc'] = torch.tensor(metrics['mcq_acc'])
                     if 'empty_rate' in metrics:
                         metrics_results[name]['empty_rate'] = torch.tensor(metrics['empty_rate'])
+                    # Only include acc_phrase if it was broadcasted (for special_subset_names only)
+                    if 'acc_phrase' in metrics:
+                        metrics_results[name]['acc_phrase'] = torch.tensor(metrics['acc_phrase'])
 
         return metrics_results
