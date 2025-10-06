@@ -230,7 +230,11 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
         if self.cfg.get("pretrained_s2s_model", None):
             self.init_from_model_from_ckpt(self.cfg.pretrained_s2s_model)
-
+        
+        # load perception module from ASR ckpt
+        if self.cfg.get("init_from_asr_ckpt", None) is not None:
+            self.init_from_model_from_ckpt(self.cfg.init_from_asr_ckpt, perception_only=True)
+        
         # load pretrained TTS model
         if self.cfg.get("pretrained_tts", None):
             self.init_speech_generation_from_tts_checkpoint(self.cfg.pretrained_tts)
@@ -279,7 +283,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             checkpoint_state = set_model_dict_for_partial_init(checkpoint_state, self.speech_generation.state_dict())
             self.speech_generation.load_state_dict(checkpoint_state, strict=True)
 
-    def init_from_model_from_ckpt(self, checkpoint_path):
+    def init_from_model_from_ckpt(self, checkpoint_path, perception_only=False):
         if checkpoint_path is not None:
             if '.nemo' in checkpoint_path:
                 with tempfile.TemporaryDirectory() as tmpdir:
@@ -294,7 +298,12 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 del pretrained_model
             else:
                 checkpoint_state = torch.load(checkpoint_path, weights_only=False, map_location='cpu')['state_dict']
-
+            if perception_only:
+                # Retain perception keys only
+                tot_num_keys = len(checkpoint_state)
+                checkpoint_state = {k: v for k, v in checkpoint_state.items() if k.startswith("perception.")}
+                logging.info(f"Load ASR: Retained {len(checkpoint_state)} / {tot_num_keys} keys from the pretrained checkpoint")
+                identifier = "ASR_perception"
             # partial initialization support
             checkpoint_state = set_model_dict_for_partial_init(checkpoint_state, self.state_dict())
             self.load_state_dict(checkpoint_state, strict=True)
@@ -959,6 +968,11 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             # if 'empty_rate' in result_dict:
             #     self.log(f"{prefix}_{name}_empty_rate", result_dict['empty_rate'].to(self.device), on_epoch=True, sync_dist=True)
 
+            self.log(f"{prefix}_{name}_acc", result_dict['acc'].to(self.device), on_epoch=True, sync_dist=True)
+            if 'acc_phrase' in result_dict:
+                self.log(f"{prefix}_{name}_acc_phrase", result_dict['acc_phrase'].to(self.device), on_epoch=True, sync_dist=True)
+            # self.log(f"{prefix}_{name}_empty_rate", result_dict['empty_rate'].to(self.device), on_epoch=True, sync_dist=True)
+        
         # Log turn taking metrics
         turn_taking_metrics = self.turn_taking_metrics.compute()
         for k, m in turn_taking_metrics.items():
