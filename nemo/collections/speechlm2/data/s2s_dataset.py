@@ -154,8 +154,6 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
 
             audio_data = {
                 "sample_id": [str(cut.id) for cut in all_cuts_combined],
-                "prompt_tokens": prompt_tokens,
-                "prompt_token_lens": prompt_token_lens,
                 "source_audio": source_audio,
                 "source_audio_lens": source_audio_lens,
                 "target_audio": target_audio,
@@ -172,6 +170,10 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 "target_first_turn_audio_lens": target_first_turn_audio_lens,
                 "formatter": [getattr(cut, "formatter", "s2s_duplex") for cut in all_cuts_combined],
             }
+
+            if torch.sum(prompt_token_lens) > 0:
+                audio_data['prompt_tokens'] = prompt_tokens
+                audio_data['prompt_token_lens'] = prompt_token_lens
 
         
         text_cuts = all_cuts.filter(lambda c: isinstance(c, Formattable))
