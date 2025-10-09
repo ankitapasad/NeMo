@@ -578,7 +578,42 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             input_signal_length=batch["source_audio_lens"],
             return_encoder_emb=True,
         )
-     
+
+        target_tokens = batch["target_tokens"]
+        if "prompt_tokens" in batch:
+            prompt_embedded = self.embed_tokens(batch["prompt_tokens"])
+            B, max_prompt_len, H = prompt_embedded.shape
+            T_src = source_encoded.shape[1]
+            T_tgt = target_tokens.shape[1]
+            
+            # Pre-allocate padded tensors with max_prompt_len extra space
+            new_source_encoded = torch.zeros(B, max_prompt_len + T_src, H, 
+                                             dtype=source_encoded.dtype, device=source_encoded.device)
+            new_target_tokens = torch.full((B, max_prompt_len + T_tgt), self.text_pad_id,
+                                          dtype=target_tokens.dtype, device=target_tokens.device)
+            
+            # For each item, insert prompt and original data at correct offsets
+            for i, prompt_len in enumerate(batch["prompt_token_lens"]):
+                prompt_len = prompt_len.item()
+                
+                # Insert prompt embeddings at the start
+                if prompt_len > 0:
+                    new_source_encoded[i, :prompt_len, :] = prompt_embedded[i, :prompt_len, :]
+                
+                # Copy original data RIGHT AFTER the prompt
+                src_len = source_encoded_lens[i].item()
+                new_source_encoded[i, prompt_len:prompt_len + src_len, :] = source_encoded[i, :src_len, :]
+                
+                tgt_len = batch["target_token_lens"][i].item()
+                new_target_tokens[i, prompt_len:prompt_len + tgt_len] = target_tokens[i, :tgt_len]
+                
+                # Update lengths
+                source_encoded_lens[i] = prompt_len + src_len
+                batch["target_token_lens"][i] = prompt_len + tgt_len
+            
+            source_encoded = new_source_encoded
+            target_tokens = new_target_tokens
+
         # if self.cfg.get('noise_prob', None) and self.cfg.noise_prob > 0:
         #
         #     if (
@@ -615,8 +650,6 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         else:
             speaker_encoder_emb = None
 
-        target_tokens = batch["target_tokens"]
-        
 
         if (diff := target_tokens.shape[1] - source_encoded.shape[1]) < 0:
             target_tokens = torch.cat([
