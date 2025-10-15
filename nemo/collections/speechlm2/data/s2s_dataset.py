@@ -91,7 +91,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         target_sample_rate: int,
         input_roles: list[str] = None,
         output_roles: list[str] = None,
-        aug_by_swap_role: bool = True,
+        aug_by_swap_role: bool = False,
     ):
         self.tokenizer = tokenizer
         self.frame_length = frame_length
