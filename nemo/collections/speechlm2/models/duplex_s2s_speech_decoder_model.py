@@ -580,6 +580,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         )
 
         target_tokens = batch["target_tokens"]
+        prompt_token_lens = None
+        
         if "prompt_tokens" in batch:
             prompt_embedded = self.embed_tokens(batch["prompt_tokens"])
             B, max_prompt_len, H = prompt_embedded.shape
@@ -592,8 +594,11 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             new_target_tokens = torch.full((B, max_prompt_len + T_tgt), self.text_pad_id,
                                           dtype=target_tokens.dtype, device=target_tokens.device)
             
+            # Store prompt lengths for later mask creation
+            prompt_token_lens = batch["prompt_token_lens"]
+            
             # For each item, insert prompt and original data at correct offsets
-            for i, prompt_len in enumerate(batch["prompt_token_lens"]):
+            for i, prompt_len in enumerate(prompt_token_lens):
                 prompt_len = prompt_len.item()
                 
                 # Insert prompt embeddings at the start
@@ -719,6 +724,18 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
             input_embeds = self.embed_tokens(text_inputs)
             input_embeds.add_(source_encoded[:, :-1] * self.cfg.get("duplex_user_channel_weight", 1.0))
+            
+            # Create system prompt mask after text_labels are generated
+            # Mask shape matches text_labels: (B, T-1)
+            # Convention: 1 = include in loss, 0 = mask out from loss (consistent with seq_mask)
+            system_prompt_mask = None
+            if prompt_token_lens is not None:
+                B, T = text_labels.shape
+                system_prompt_mask = torch.ones(B, T, dtype=torch.bool, device=text_labels.device)
+                for i, prompt_len in enumerate(prompt_token_lens):
+                    prompt_len = prompt_len.item()
+                    if prompt_len > 1:  # Only mask if we have at least 2 prompt tokens (first is input, rest are labels)
+                        system_prompt_mask[i, :prompt_len - 1] = 0
 
             # 完整的seq_mask
             seq_mask = torch.ones_like(
@@ -770,6 +787,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 "perception_emb": source_encoded[:, :-1],
                 "asr_emb": asr_emb[:, :-1],
                 "speaker_encoder_emb": speaker_encoder_emb,
+                "system_prompt_mask": system_prompt_mask,
             }
         
         else:
@@ -779,6 +797,18 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             
             input_embeds = self.embed_tokens(text_inputs)
             input_embeds.add_(source_encoded[:, :-1] * self.cfg.get("duplex_user_channel_weight", 1.0))
+            
+            # Create system prompt mask after text_labels are generated
+            # Mask shape matches text_labels: (B, T-1)
+            # Convention: 1 = include in loss, 0 = mask out from loss (consistent with seq_mask)
+            system_prompt_mask = None
+            if prompt_token_lens is not None:
+                B, T = text_labels.shape
+                system_prompt_mask = torch.ones(B, T, dtype=torch.bool, device=text_labels.device)
+                for i, prompt_len in enumerate(prompt_token_lens):
+                    prompt_len = prompt_len.item()
+                    if prompt_len > 1:  # Only mask if we have at least 2 prompt tokens (first is input, rest are labels)
+                        system_prompt_mask[i, :prompt_len - 1] = 0
 
             seq_mask = torch.ones_like(text_labels.unsqueeze(-1), device=self.device, dtype=torch.bool)
             
@@ -819,6 +849,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 "text_labels": text_labels,
                 "loss_scale": loss_scale,
                 "seq_mask": seq_mask,
+                "system_prompt_mask": system_prompt_mask,
             }
 
     def training_step(self, batch: dict, batch_idx: int):
@@ -835,6 +866,13 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
         if batch["audio_data"] is not None:
             inputs = self.prepare_inputs(batch["audio_data"])
+            
+            # Apply system prompt mask to loss_scale if config flag is set
+            if self.cfg.get("mask_system_prompt_loc", False) and inputs.get("system_prompt_mask") is not None:
+                # Convention: system_prompt_mask has 1 where loss should be included, 0 where masked out
+                system_prompt_mask_expanded = inputs["system_prompt_mask"].unsqueeze(-1).expand_as(inputs["loss_scale"])
+                inputs["loss_scale"] = inputs["loss_scale"] * system_prompt_mask_expanded.float()
+            
             if self.cfg.audio_loss_weight > 0:
                 forward_outputs = self(
                     inputs["input_embeds"],

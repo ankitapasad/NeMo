@@ -91,7 +91,8 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         target_sample_rate: int,
         input_roles: list[str] = None,
         output_roles: list[str] = None,
-        aug_by_swap_role: bool = True,
+        aug_by_swap_role: bool = False,
+        system_bos_eos: bool = False,
     ):
         self.tokenizer = tokenizer
         self.frame_length = frame_length
@@ -100,7 +101,8 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         self.input_roles = set(ifnone(input_roles, ["user"]))
         self.output_roles = set(ifnone(output_roles, ["agent"]))
         self.aug_by_swap_role = aug_by_swap_role  # 保存标志
-        
+        self.system_bos_eos = system_bos_eos
+
         assert tokenizer.bos is not None, "BOS support in the tokenizer is required for S2S models."
         assert tokenizer.eos is not None, "EOS support in the tokenizer is required for S2S models."
 
@@ -130,7 +132,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             else:
                 all_cuts_combined = cuts
             prompt_tokens, prompt_token_lens = collate_system_prompt(
-                all_cuts_combined, self.tokenizer
+                all_cuts_combined, self.tokenizer, system_bos_eos=self.system_bos_eos
             )
             source_audio, source_audio_lens = collate_audio(all_cuts_combined.resample(self.source_sample_rate))
             target_audio, target_audio_lens = collate_audio(
@@ -406,24 +408,39 @@ def collate_token_channel(
 def collate_system_prompt(
     cuts: CutSet,
     tokenizer: TokenizerSpec,
+    system_bos_eos: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Collate system prompts from cuts.
     System prompts should be stored in cut.custom['system_prompt'].
+    Per-cut add_default_prompt can be set via tags in the input_cfg YAML files.
     """
     pad_id = get_pad_id(tokenizer)
+    bos_id = tokenizer.bos if not system_bos_eos else 151648 # "<|box_start|>"
+    eos_id = tokenizer.eos if not system_bos_eos else 151649 # "<|box_end|>"
     tokens = []
     for c in cuts:
+        # Check if this specific cut should use default prompt
+        # Priority: cut.add_default_prompt (from tags) > global add_default_prompt
+        use_default_prompt = getattr(c, 'add_default_prompt', False)
+        
         # Check if system prompt exists in custom field
         if c.custom and c.custom.get("system_prompt", None):
             prompt_text = c.custom["system_prompt"]
             tokens.append(torch.as_tensor(
-                [tokenizer.bos] + tokenizer.text_to_ids(prompt_text) + [tokenizer.eos],
+                [bos_id] + tokenizer.text_to_ids(prompt_text) + [eos_id],
                 dtype=torch.long
             ))
         else:
-            # No system prompt for this cut
-            tokens.append(torch.as_tensor([], dtype=torch.long))
+            # No system prompt provided for this cut
+            if use_default_prompt:
+                default_prompt_text = "You are a helpful assistant. Answer questions or provide advice in a clear and engaging way."
+                tokens.append(torch.as_tensor(
+                    [bos_id] + tokenizer.text_to_ids(default_prompt_text) + [eos_id],
+                    dtype=torch.long
+                ))
+            else:
+                tokens.append(torch.as_tensor([], dtype=torch.long))
     
     token_lens = torch.tensor([len(tt) for tt in tokens])
     tokens = collate_vectors(tokens, padding_value=pad_id)
