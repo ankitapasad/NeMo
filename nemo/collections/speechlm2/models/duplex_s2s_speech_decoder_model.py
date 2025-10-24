@@ -619,27 +619,24 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             source_encoded = new_source_encoded
             target_tokens = new_target_tokens
 
-        # if self.cfg.get('noise_prob', None) and self.cfg.noise_prob > 0:
-        #
-        #     if (
-        #         self.training
-        #         and batch["formatter"][0] != 's2s_duplex_overlap_as_s2s_duplex'
-        #         and random.random() < self.cfg.noise_prob
-        #     ):
-        #         batch["source_audio"] = self.add_noise_to_batch(
-        #             batch["source_audio"],
-        #             os.path.join(self.cfg.noise_file_path, "*"),
-        #             snr_db=random.randint(20, 50),          #   noise_min_snr = 20 and noise_max_snr = 50
-        #             noise_prob_scale_user=0.3,
-        #             noise_prob_scale_user_min_snr=-15,
-        #             noise_prob_scale_user_max_snr=24,
-        #             snr_measure_dur=0.0,
-        #             noise_resample=True,
-        #             noise_prob_low_pass=0.1,
-        #         )
-
-
-
+        if self.cfg.get('noise_prob', None) and self.cfg.noise_prob > 0:
+        
+            if (
+                self.training
+                and batch["formatter"][0] != 's2s_duplex_overlap_as_s2s_duplex'
+                and random.random() < self.cfg.noise_prob
+            ):
+                batch["source_audio"] = self.add_noise_to_batch(
+                    batch["source_audio"],
+                    os.path.join(self.cfg.noise_file_path, "*"),
+                    snr_db=random.randint(-30, 60),          #   noise_min_snr = 20 and noise_max_snr = 50
+                    noise_prob_scale_user=0.3,
+                    noise_prob_scale_user_min_snr=-15,
+                    noise_prob_scale_user_max_snr=24,
+                    snr_measure_dur=0.0,
+                    noise_resample=True,
+                    noise_prob_low_pass=0.1,
+                )
 
         if self.cfg.audio_loss_weight > 0 and not self.training:
             speaker_encoder_emb = None
