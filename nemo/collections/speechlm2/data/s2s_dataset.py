@@ -71,6 +71,11 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 at positions aligned with audio frames
             - source_token_lens: Tensor of source token sequence lengths [B]
             - target_texts: List of full target texts joined from output_roles supervisions [B]
+            - target_turn_texts: (Optional, if include_turn_metadata=True) List of lists of turn dictionaries [B]
+                Each turn dict contains: start_time, duration, role, text
+            - source_turn_texts: (Optional, if include_turn_metadata=True) List of lists of turn dictionaries [B]
+                Each turn dict contains: start_time, duration, role, text
+            - system_prompt: (Optional, if include_turn_metadata=True) List of system prompts [B]
 
     Notes:
         - The dataset ensures frame-level alignment between audio and text by inserting tokens at
@@ -93,6 +98,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         output_roles: list[str] = None,
         aug_by_swap_role: bool = False,
         system_bos_eos: bool = False,
+        include_turn_metadata: bool = False,
     ):
         self.tokenizer = tokenizer
         self.frame_length = frame_length
@@ -102,7 +108,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         self.output_roles = set(ifnone(output_roles, ["agent"]))
         self.aug_by_swap_role = aug_by_swap_role  # 保存标志
         self.system_bos_eos = system_bos_eos
-
+        self.include_turn_metadata = include_turn_metadata
         assert tokenizer.bos is not None, "BOS support in the tokenizer is required for S2S models."
         assert tokenizer.eos is not None, "EOS support in the tokenizer is required for S2S models."
 
@@ -172,7 +178,36 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 "target_first_turn_audio_lens": target_first_turn_audio_lens,
                 "formatter": [getattr(cut, "formatter", "s2s_duplex") for cut in all_cuts_combined],
             }
-
+            # Optionally include detailed turn metadata for analysis/validation
+            if self.include_turn_metadata:
+                audio_data["target_turn_texts"] = [
+                    [
+                        {
+                            "start_time": s.start,
+                            "duration": s.duration,
+                            "role": s.speaker,
+                            "text": s.text,
+                        }
+                        for s in cut.supervisions if s.speaker in self.output_roles
+                    ]
+                    for cut in all_cuts_combined
+                ]
+                audio_data["source_turn_texts"] = [
+                    [
+                        {
+                            "start_time": s.start,
+                            "duration": s.duration,
+                            "role": s.speaker,
+                            "text": s.text,
+                        }
+                        for s in cut.supervisions if s.speaker in self.input_roles
+                    ]
+                    for cut in all_cuts_combined
+                ]
+                audio_data["system_prompt"] = [
+                    cut.custom.get('system_prompt', '') for cut in all_cuts_combined
+                ]
+                
             if torch.sum(prompt_token_lens) > 0:
                 audio_data['prompt_tokens'] = prompt_tokens
                 audio_data['prompt_token_lens'] = prompt_token_lens

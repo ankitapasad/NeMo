@@ -75,8 +75,8 @@ class ResultsLogger:
 
     def reset(self):
         metadata_files = os.listdir(self.matadata_save_path)
-        for f in metadata_files:
-            open(os.path.join(self.matadata_save_path, f), 'w').close()
+        # for f in metadata_files:
+        #     open(os.path.join(self.matadata_save_path, f), 'w').close()
         self.cached_results = defaultdict(list)
         return self
 
@@ -100,6 +100,44 @@ class ResultsLogger:
         torchaudio.save(out_audio_path, combined_wav.squeeze(), pred_audio_sr)
         logging.info(f"Audio saved at: {out_audio_path}")
 
+    @staticmethod
+    def merge_turns_chronologically(
+        turns_list_1: Optional[List[dict]] = None,
+        turns_list_2: Optional[List[dict]] = None,
+    ) -> List[dict]:
+        """
+        Merge two lists of turns chronologically based on start_time.
+        
+        Args:
+            turns_list_1: List of turn dicts with keys: start_time, duration, role, text
+            turns_list_2: List of turn dicts with keys: start_time, duration, role, text
+                         OR predicted turns with keys: start_time, end_time, duration, text, 
+                         token_ids, start_token_idx, end_token_idx, num_tokens, is_complete
+        
+        Returns:
+            List of turn dicts sorted by start_time, each with role and text
+        """
+        all_turns = []
+        
+        if turns_list_1:
+            all_turns.extend(turns_list_1)
+        if turns_list_2:
+            all_turns.extend(turns_list_2)
+        
+        # Sort by start_time
+        all_turns.sort(key=lambda x: x.get('start_time', 0))
+        
+        # Extract role and text for each turn
+        merged_turns = [
+            {
+                "role": turn.get("role", "agent"),  # Default to agent for predicted turns
+                "text": turn.get("text", ""),
+            }
+            for turn in all_turns
+        ]
+        
+        return merged_turns
+
     def update(
             self,
             name,
@@ -111,9 +149,13 @@ class ResultsLogger:
             pred_audio_sr,
             user_audio,
             user_audio_sr,
+            hyps_tokens=None,
+            system_prompt=None,
+            source_turns: Optional[List[List[dict]]] = None,
+            target_turns: Optional[List[List[dict]]] = None,
+            pred_turns: Optional[List[List[dict]]] = None,
     ):
         rank = get_rank()
-
         for i in range(len(refs)):
             sample_id = samples_id[i][:150]
             # Add rank info to audio filename to avoid conflicts
@@ -121,13 +163,50 @@ class ResultsLogger:
                 out_audio_path = os.path.join(self.audio_save_path, f"{name}_{sample_id}_rank{rank}.wav")
                 self.merge_and_save_audio(out_audio_path, pred_audio[i], pred_audio_sr, user_audio[i], user_audio_sr)
 
+            # Convert tokens tensor to list for JSON serialization
+            pred_tokens_list = None
+            if hyps_tokens is not None:
+                if isinstance(hyps_tokens[i], torch.Tensor):
+                    pred_tokens_list = hyps_tokens[i].cpu().tolist()
+                else:
+                    pred_tokens_list = hyps_tokens[i]
+            
             out_dict = {
                 "id": sample_id,
                 "target_text": refs[i],
                 "pred_text": hyps[i],
                 "pred_audio": asr_hyps[i] if asr_hyps is not None else None,
+                "pred_tokens": pred_tokens_list,
             }
+            
+            # Add conversation turns only if there are multiple user turns (multi-turn conversation)
+            user_turns = source_turns[i] if source_turns is not None else None
+            has_multi_turn_conversation = user_turns is not None and len(user_turns) > 1
+            
+            if has_multi_turn_conversation and (target_turns is not None or pred_turns is not None):
+                if system_prompt is not None:
+                    out_dict["system_prompt"] = system_prompt[i]
+                
+                conversation_turns = {}
+                
+                # Create ground truth conversation: source (user) + target (agent) turns
+                if target_turns is not None:
+                    conversation_turns["gt_conversation"] = self.merge_turns_chronologically(
+                        turns_list_1=user_turns,
+                        turns_list_2=target_turns[i],
+                    )
+                
+                # Create predicted conversation: source (user) + predicted (agent) turns
+                if pred_turns is not None:
+                    conversation_turns["pred_conversation"] = self.merge_turns_chronologically(
+                        turns_list_1=user_turns,
+                        turns_list_2=pred_turns[i],
+                    )
+                
+                out_dict["conversation_turns"] = conversation_turns
+            
             self.cached_results[name].append(out_dict)
+
 
 
 
@@ -216,7 +295,21 @@ class ResultsLogger:
                 # Merge results from all ranks
                 merged_results = self._merge_rank_files(name)
 
-                # Save merged results
+                # Extract and save tokens separately before saving JSON
+                id_to_tokens = {}
+                for item in merged_results:
+                    if "pred_tokens" in item and item["pred_tokens"] is not None:
+                        id_to_tokens[item["id"]] = item["pred_tokens"]
+                        # Remove from the dict to keep JSON clean
+                        del item["pred_tokens"]
+                
+                # Save tokens.pt if we have any
+                if id_to_tokens:
+                    tokens_path = os.path.join(self.matadata_save_path, f"{name}_hyp_tokens.pt")
+                    torch.save(id_to_tokens, tokens_path)
+                    logging.info(f"Tokens saved at: {tokens_path} (contains {len(id_to_tokens)} samples)")
+
+                # Save merged results (now without tokens)
                 final_json_path = os.path.join(self.matadata_save_path, f"{name}.json")
                 with open(final_json_path, 'w', encoding='utf-8') as fout:
                     json.dump(merged_results, fout, indent=4, ensure_ascii=False)
