@@ -179,6 +179,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 return self._create_minimal_batch()
             cuts = CutSet.from_cuts(filtered_cuts)
 
+        if cuts:
             swapped_cuts = []
 
             if self.aug_by_swap_role:
@@ -244,22 +245,11 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 
             try:
                 target_first_turn_audio, target_first_turn_audio_lens = collate_first_turn_audio(
-                    all_cuts_combined.resample(self.target_sample_rate), roles=self.output_roles,
-                    recording_field="target_audio"
+                    all_cuts_combined.resample(self.target_sample_rate), roles=self.output_roles, recording_field="target_audio"
                 )
             except Exception as e:
                 target_first_turn_audio = None
                 target_first_turn_audio_lens = None
-
-            if self.model_cfg is not None and self.model_cfg.get("debug", False):
-                print("source_tokens[0]:", source_tokens[0][:500]*(source_tokens[0][:500]!=self.tokenizer.pad_id))
-                print("target_tokens[0]:", target_tokens[0][:500]*(target_tokens[0][:500]!=self.tokenizer.pad_id))
-                print("cut.supervisions[0].duration:", int(cuts[0].supervisions[0].duration / 0.08))
-                # Find the indices of the first non-pad tokens in target_tokens[0]
-                first_non_pad_idx = (target_tokens[0] != self.tokenizer.pad_id).nonzero(as_tuple=True)[0][0].item() if (target_tokens[0] != self.tokenizer.pad_id).any() else None
-                print("First non-pad token index in target_tokens[0]:", first_non_pad_idx)
-                # print('Agent start timestamp: ', int(cuts[0].supervisions[1].start / 0.08))
-                import pdb; pdb.set_trace()
 
 
             audio_data = {
@@ -467,9 +457,9 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
 
 
 def collate_first_turn_audio(
-        cuts: CutSet,
-        roles: set[str],
-        recording_field: str = "target_audio",
+    cuts: CutSet,
+    roles: set[str],
+    recording_field: str = "target_audio",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     first_turn_audios = []
     first_turn_audios_lens = []
@@ -613,7 +603,7 @@ def build_token_channel(
 
 
 def _strip_timestamps(
-        text: str, _TIMESTAMP_PATTERN=re.compile(r"<\|\d+\|>"), _SPACE_PATTERN=re.compile(r"\s+")
+    text: str, _TIMESTAMP_PATTERN=re.compile(r"<\|\d+\|>"), _SPACE_PATTERN=re.compile(r"\s+")
 ) -> str:
     """
     Strips timestamp tokens from text, e.g. turns:
@@ -684,13 +674,6 @@ def _text_with_timestamps_to_ids(text: str, tokenizer: TokenizerSpec,
     text_ids = []
     text_ids, start_times, end_times, word_lens = _extract_text_and_time_tokens(text, tokenizer, _TIMESTAMP_PATTERN_STR)
     text_ids_with_timestamps = _expand_text_with_timestamps_and_word_lengths(text_ids, word_lens, start_times, end_times, available_frames_for_text, frame_rate=0.08, pad_id=get_pad_id(tokenizer), word_align_position=word_align_position)
-    
-    if random.random() < 0.1:
-        logging.info(f'text_ids_with_timestamps: {text_ids_with_timestamps}')
-        logging.info(f'text_ids: {text_ids}')
-        logging.info(f'start_times: {start_times}')
-        logging.info(f'end_times: {end_times}')
-        logging.info(f'word_lens: {word_lens}')
     return text_ids_with_timestamps
 
 

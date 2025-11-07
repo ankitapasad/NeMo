@@ -125,13 +125,8 @@ def prepare_labels(
             dtype=torch.long,
         )
         target_tokens = torch.cat([target_tokens[:, advance_text_channel_by :], pad], dim=-1)
-        # make sure that eos/bos is in the place (it can cut tokens from the first advance_text_channel_by tokens and this will breaks everything)
 
     if cfg.get("delay_text_channel_by", 0) > 0:
-        # if batch.get("formatter", None) and batch["formatter"][0] == 'nemo_tarred_to_duplex':
-        #     delay_by = cfg.get("delay_source_text_by", 0)
-        # else:
-        #     delay_by = cfg.get("delay_text_channel_by", 0)
         delay_by = cfg.get("delay_text_channel_by", 0)
 
         eos_mask = (target_tokens == text_eos_id) & (torch.arange(target_tokens.size(1), device=target_tokens.device).unsqueeze(0) >= (target_tokens.size(1) - delay_by))
@@ -146,7 +141,6 @@ def prepare_labels(
             dtype=torch.long,
         )
         target_tokens = torch.cat([pad, target_tokens[:, :-delay_by]], dim=-1)
-        # batch["target_token_lens"] = batch["target_token_lens"] + delay_by
 
     original_target_tokens = target_tokens.clone()
     if cfg.get("delay_text_eos_by", None):
@@ -176,13 +170,7 @@ def prepare_labels(
                 device=source_tokens.device,
                 dtype=torch.long,
             )
-            # if cfg.get("debug", False):
-                # import pdb; pdb.set_trace()
-            # source_tokens_delayed = torch.cat([pad, source_tokens], dim=-1)
-            # batch["source_token_lens"] = batch["source_token_lens"] + delay_source_text_by
             source_tokens_delayed = torch.cat([pad, source_tokens[:, :-delay_source_text_by]], dim=-1)
-            # Add back user_eos_id since it may be truncated
-            # source_tokens_delayed[:, -1] = user_eos_id
         else:
             source_tokens_delayed = source_tokens
 
@@ -192,19 +180,6 @@ def prepare_labels(
         if cfg.get("allow_user_text_in_agent_turn", False):
 
             assert cfg.get("use_separate_asr_head", False), "allow_user_text_in_agent_turn is only supported when use_separate_asr_head is True"
-
-            # Keep user and agent text in separate channels and allow overlap between them
-            if cfg.get("debug", False):
-                i = 0
-                target_tokens_flat_masked = target_tokens_flat[i] * (target_tokens_flat[i] != text_pad_id)
-                print(f"target_tokens_flat[i]:", target_tokens_flat_masked)
-                target_tokens_masked = target_tokens[i] * (target_tokens[i] != text_pad_id)
-                print(f"target_tokens[i]:", target_tokens_masked)
-                source_tokens_flat_masked = source_tokens_flat[i] * (source_tokens_flat[i] != text_pad_id)
-                print(f"source_tokens_flat[i]:", source_tokens_flat_masked)
-                stacked = torch.stack([source_tokens_flat_masked, target_tokens_flat_masked], dim=1)
-                print("stacked[:500]:", stacked[:500])
-                import pdb; pdb.set_trace()
 
             # To be consistent with the single channel case, replace the user_eos_id with agent_eos_id
             source_tokens_flat = source_tokens_flat.clone()
@@ -223,17 +198,6 @@ def prepare_labels(
                 text_labels = target_tokens_flat[:, 1:]
                 audio_inputs = None
                 audio_labels = None
-
-            print(f"asr_inputs.shape: {asr_inputs.shape}")
-            print(f"text_inputs.shape: {text_inputs.shape}")
-            if audio_inputs is not None:
-                print(f"audio_inputs.shape: {audio_inputs.shape}")
-            else:
-                print("audio_inputs: None")
-            if asr_inputs.shape[1] != text_inputs.shape[1]:
-                import pdb; pdb.set_trace()
-            if audio_inputs is not None and text_inputs.shape[1] != audio_inputs.shape[1]:
-                import pdb; pdb.set_trace()
 
             result = {
                 "asr_inputs": asr_inputs,
@@ -288,23 +252,8 @@ def prepare_labels(
                 mask[i, user_bos_idx:user_eos_idx] = True
 
         target_tokens = torch.where(mask, source_tokens_flat, target_tokens_flat)
-        logging.info(f"target_tokens[0] w/ delay of {delay_source_text_by}: {target_tokens[0]}")
     else:
         target_tokens_flat = target_tokens
-
-    if cfg.get("debug", False):
-        import pdb; pdb.set_trace()
-        i = 0
-        target_tokens_flat_masked = target_tokens_flat[i] * (target_tokens_flat[i] != text_pad_id)
-        print(f"target_tokens_flat[i]:", target_tokens_flat_masked)
-        target_tokens_masked = target_tokens[i] * (target_tokens[i] != text_pad_id)
-        print(f"target_tokens[i]:", target_tokens_masked)
-        if predict_user_text:
-            source_tokens_flat_masked = source_tokens_flat[i] * (source_tokens_flat[i] != text_pad_id)
-            print(f"source_tokens_flat[i]:", source_tokens_flat_masked)
-            stacked = torch.stack([source_tokens_flat_masked, target_tokens_flat_masked], dim=1)
-            print("ori_stacked[:500]:", stacked[:500])
-        import pdb; pdb.set_trace()
 
     if target_codes is not None:
         input_ids = torch.cat([target_codes, target_tokens[..., None]], dim=-1)
@@ -371,24 +320,6 @@ def prepare_labels(
     
     result["audio_inputs"] = audio_inputs
     result["audio_labels"] = audio_labels
-
-    if cfg.get("debug", False):
-        ori_stacked = torch.stack(
-            [
-                batch['source_tokens'][0] * (batch['source_tokens'][0] != text_pad_id),
-                batch['target_tokens'][0] * (batch['target_tokens'][0] != text_pad_id)
-            ],
-            dim=1
-        )
-        print("ori_stacked[:500]:", ori_stacked)
-        i = 0
-        asr_masked = result.get("asr_labels", result["text_labels"])[i][:1000] * (
-            result.get("asr_labels", result["text_labels"])[i][:1000] != text_pad_id
-        )
-        text_masked = result["text_labels"][i][:1000] * (result["text_labels"][i][:1000] != text_pad_id)
-        stacked = torch.stack([asr_masked, text_masked], dim=1)
-        print("delayed stacked[:500]:", stacked[:500])
-        import pdb; pdb.set_trace()
 
     result["source_encoded"] = source_encoded
 

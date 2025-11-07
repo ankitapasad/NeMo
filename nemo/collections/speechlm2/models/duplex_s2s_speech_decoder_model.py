@@ -407,7 +407,6 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             asr_logits = self.asr_head(asr_in)  # (B, T, asr_vocab_size)
 
         if not self.training:
-            # logging.info(f'boosting text logits: {self.cfg.inference_pad_boost}, {self.cfg.inference_bos_boost}, {self.cfg.inference_eos_boost}')
             if self.cfg.get("inference_pad_boost", None):
                 text_logits[:, :, self.text_pad_id] += self.cfg.inference_pad_boost
             if self.cfg.get("inference_bos_boost", None):
@@ -749,17 +748,6 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         elif diff > 0:
             target_tokens = target_tokens[:, : source_encoded.shape[1]]
 
-        # Apply text channel temporal alignment operations (before audio processing)
-        if self.advance_text_channel_by:
-            if self.advance_text_channel_by > 0:
-                pad = torch.full((target_tokens.shape[0], self.advance_text_channel_by),
-                                 fill_value=self.text_pad_id, device=target_tokens.device, dtype=torch.long)
-                target_tokens = torch.cat([target_tokens[:, self.advance_text_channel_by:], pad], dim=-1)
-
-        if self.cfg.get("delay_text_eos_by", None):
-            target_tokens = delay_eos(target_tokens, self.text_eos_id, self.text_pad_id,
-                                      shift=self.cfg.delay_text_eos_by)
-
         # Optional: convert pad tokens to sil tokens between bos-eos pairs
         sil_id = None
         if self.cfg.get("use_sil_token", False):
@@ -828,12 +816,10 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
             input_embeds = self.embed_tokens(text_inputs) * self.cfg.get("duplex_text_channel_weight", 1.0)
             input_embeds.add_(source_encoded[:, :-1] * self.cfg.get("duplex_user_channel_weight", 1.0))
-
             if self.cfg.get("use_separate_asr_head", False):
                 asr_inputs_embeds = self.embed_asr_tokens(asr_inputs) * self.cfg.get("duplex_asr_text_weight", 1.0)
                 input_embeds.add_(asr_inputs_embeds)
 
-            # 完整的seq_mask
             seq_mask = torch.ones_like(
                 torch.cat([text_labels.unsqueeze(-1), audio_labels], dim=-1),
                 device=self.device, dtype=torch.bool,
@@ -994,9 +980,6 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                         )
                     )
 
-            if self.cfg.get("debug", False):
-                import pdb; pdb.set_trace()
-
             ans = {
                 "input_embeds": input_embeds,
                 "input_lens": source_encoded_lens - 1,
@@ -1018,8 +1001,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         if self.cfg.audio_loss_weight > 0 and is_frozen(self.speech_generation):
             self.speech_generation.eval()
 
-        res = {"learning_rate": torch.as_tensor(
-            self.trainer.optimizers[0].param_groups[0]['lr'] if self._trainer is not None else 0)}
+        res = {"learning_rate": torch.as_tensor(self.trainer.optimizers[0].param_groups[0]['lr'] if self._trainer is not None else 0)}
 
         if batch["audio_data"] is not None:
             inputs = self.prepare_inputs(batch["audio_data"])
@@ -1050,13 +1032,13 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     text_logits = text_logits * inputs["seq_mask"][:, :, 0].unsqueeze(-1)
 
                 text_loss = (
-                                    torch.nn.functional.cross_entropy(
-                                        text_logits.flatten(0, 1),
-                                        inputs["text_labels"].flatten(0, 1),
-                                        reduction="none",
-                                    )
-                                    * inputs["loss_scale"][:, :, 0].flatten(0, 1)
-                            ).sum(-1) / num_frames
+                    torch.nn.functional.cross_entropy(
+                        text_logits.flatten(0, 1),
+                        inputs["text_labels"].flatten(0, 1),
+                        reduction="none",
+                    )
+                    * inputs["loss_scale"][:, :, 0].flatten(0, 1)
+                ).sum(-1) / num_frames
 
                 if self.cfg.get("use_separate_asr_head", False):
                     asr_loss = (
@@ -1067,7 +1049,6 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                         )
                         * inputs["asr_loss_scale"][:, :, 0].flatten(0, 1)
                     ).sum(-1) / num_frames
-                    print(f'asr_loss: {asr_loss}')
 
                 with torch.no_grad():
 
@@ -1088,13 +1069,13 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                         audio_logits = audio_logits * inputs["seq_mask"][:, :, -1].unsqueeze(-1).unsqueeze(-1)
 
                     audio_loss = (
-                                         torch.nn.functional.cross_entropy(
-                                             audio_logits.flatten(0, 2),
-                                             inputs["audio_labels"].flatten(0, 2),
-                                             reduction="none",
-                                         )
-                                         * inputs["loss_scale"][:, :, 1:].flatten(0, 2)
-                                 ).sum(-1) / (num_frames * self._num_codebooks)
+                        torch.nn.functional.cross_entropy(
+                            audio_logits.flatten(0, 2),
+                            inputs["audio_labels"].flatten(0, 2),
+                            reduction="none",
+                        )
+                        * inputs["loss_scale"][:, :, 1:].flatten(0, 2)
+                    ).sum(-1) / (num_frames * self._num_codebooks)
 
                     loss = self.cfg.text_loss_weight * text_loss + self.cfg.audio_loss_weight * audio_loss
                 else:
@@ -1139,7 +1120,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             )
 
         res["loss"] = (1. - self.cfg.text_to_text_loss_weight) * res.get("audio_loss", 0.0) + \
-                      self.cfg.text_to_text_loss_weight * res.get("text_to_text_loss", 0.0)
+            self.cfg.text_to_text_loss_weight * res.get("text_to_text_loss", 0.0)
         self.log_dict(res, on_step=True)
 
         return res
@@ -1883,11 +1864,6 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                         last_turn = gen_text_src_b[last_caret_idx+1:].strip()
                         if last_turn and len(last_turn.split()) <= 1 and len(last_turn) and len(last_turn) < 5:
                             gen_text_src_b = gen_text_src_b[:last_caret_idx+1]
-                    if gen_text_src_b.count("^") > 1:
-                        print(f"Batch index with difference: {b}")
-                        print("gen_text:", gen_text_b)
-                        print("gen_text_src:", gen_text_src_b)
-                        # import pdb; pdb.set_trace()
                     src_text_cleaned.append(gen_text_src_b)
             elif self.cfg.get("eval_text_turn_taking", False):
                 src_text_cleaned = [self.tokenizer.ids_to_text(gen_text_src[b]) for b in range(gen_text_src.shape[0])]
