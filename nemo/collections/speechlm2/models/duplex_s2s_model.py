@@ -644,9 +644,6 @@ def tokens_to_str(tokens: torch.Tensor, lengths: torch.Tensor, tokenizer: AutoTo
         # Filter out agent bos/eos
         token_ids = token_ids[token_ids != tokenizer.bos]
         token_ids = token_ids[token_ids != tokenizer.eos]
-        # Filter out user bos if provided
-        if user_bos_id is not None:
-            token_ids = token_ids[token_ids != user_bos_id]
         # Filter out sil if provided
         if sil_id is not None:
             token_ids = token_ids[token_ids != sil_id]

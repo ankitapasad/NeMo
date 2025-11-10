@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import re
-
+import random
 import torch
 import torch.utils.data
 import torchaudio
@@ -24,6 +24,7 @@ from lhotse.utils import ifnone
 
 from nemo.collections.common.tokenizers import TokenizerSpec
 from nemo.collections.speechlm2.data.utils import get_pad_id
+from nemo.collections.speechlm2.data.force_align import ForceAligner
 from nemo.utils import logging
 from nemo.collections.common.data.lhotse.text_adapters import Formattable
 
@@ -58,6 +59,15 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         output_roles (list[str], optional):
             List of speaker roles (cut.supervisions[:].speaker) to consider as outputs. Defaults to ["agent"].
 
+        train_half_duplex_asr (bool, optional):
+            If True, enables half-duplex ASR mode where source tokens (with timestamps removed) 
+            are assigned to target_tokens for ASR prediction. If False, uses original duplex logic.
+            Defaults to False.
+
+        force_align_user_text (bool, optional):
+            If True, performs force alignment on user audio segments to generate word-level timestamps.
+            Only applies to supervision turns where speaker.role is "user". Defaults to False.
+
     Returns:
         A dictionary with the following keys:
             - source_audio: Tensor of source waveform samples [B, T]
@@ -88,18 +98,23 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         - Text tokens from each speaker are placed at frame positions corresponding to their
           timestamp in the original recording, preserving the temporal relationship.
           This is a segment-level alignment only, not word-level alignment.
+        - When force_align_user_text is enabled, user audio segments are
+          force-aligned using wav2vec2 to generate word-level timestamps, which are then
+          converted to frame-level token positions for more precise alignment.
     """
 
     def __init__(
-            self,
-            tokenizer: TokenizerSpec,
-            frame_length: Seconds,
-            source_sample_rate: int,
-            target_sample_rate: int,
-            input_roles: list[str] = None,
-            output_roles: list[str] = None,
-            aug_by_swap_role: bool = False,
-            include_turn_metadata: bool = False,
+        self,
+        tokenizer: TokenizerSpec,
+        frame_length: Seconds,
+        source_sample_rate: int,
+        target_sample_rate: int,
+        input_roles: list[str] = None,
+        output_roles: list[str] = None,
+        aug_by_swap_role: bool = False,
+        include_turn_metadata: bool = False,
+        cfg: dict = None,
+        model_cfg: dict = None,
     ):
         self.tokenizer = tokenizer
         self.frame_length = frame_length
@@ -108,18 +123,72 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         self.input_roles = set(ifnone(input_roles, ["user"]))
         self.output_roles = set(ifnone(output_roles, ["agent"]))
         self.aug_by_swap_role = aug_by_swap_role
+
+        self.word_align_position = cfg.get("word_align_position", "left") if cfg is not None else "left"
+        self.predict_user_text = model_cfg.get("predict_user_text", False) if model_cfg is not None else False
+        self.train_half_duplex_asr = model_cfg.get("train_half_duplex_asr", False) if model_cfg is not None else False
+        self.force_align_user_text = model_cfg.get("force_align_user_text", False) if model_cfg is not None else None
+        # Default to CPU for force alignment to avoid OOM during training/validation when main model is on GPU
+        self.force_align_device = model_cfg.get("force_align_device", "cpu") if model_cfg is not None else "cpu"
+
+        self.cfg = cfg
+        self.model_cfg = model_cfg
+        
+
+        # Initialize force aligner if needed
+        self.force_aligner = None
+        if self.force_align_user_text:
+            self.force_aligner = ForceAligner(device=self.force_align_device, frame_length=self.frame_length)
+        
         self.include_turn_metadata = include_turn_metadata
         assert tokenizer.bos is not None, "BOS support in the tokenizer is required for S2S models."
         assert tokenizer.eos is not None, "EOS support in the tokenizer is required for S2S models."
+
+    def _create_minimal_batch(self) -> dict:
+        """Create a minimal valid batch when all cuts are filtered out."""
+        # Create minimal tensors with batch size 1
+        device = torch.device('cpu')  # Default device
+        
+        return {
+            "sample_id": ["empty_batch"],
+            "source_audio": torch.zeros((1, 1000), dtype=torch.float32),  # 1 second of silence at 16kHz
+            "source_audio_lens": torch.tensor([1000], dtype=torch.long),
+            "agent_bos_vad": None,
+            "target_audio": torch.zeros((1, 22050), dtype=torch.float32),  # 1 second of silence at 22.05kHz
+            "target_audio_lens": torch.tensor([22050], dtype=torch.long),
+            "target_tokens": torch.full((1, 50), self.tokenizer.pad_id, dtype=torch.long),
+            "target_token_lens": torch.tensor([1], dtype=torch.long),
+            "source_tokens": torch.full((1, 50), self.tokenizer.pad_id, dtype=torch.long),
+            "source_token_lens": torch.tensor([1], dtype=torch.long),
+            "source_texts": [""],
+            "target_texts": [""],
+            "all_texts": [""],
+            "target_first_turn_audio": torch.zeros((1, 22050), dtype=torch.float32),
+            "target_first_turn_audio_lens": torch.tensor([22050], dtype=torch.long),
+            "formatter": ["s2s_duplex"],
+        }
 
     def __getitem__(self, all_cuts: CutSet) -> dict:
         # audio mini-batch
         cuts = all_cuts.filter(lambda c: isinstance(c, Cut))
         audio_data = None
 
-        if cuts:
-            cuts = cuts.transform_text(_strip_timestamps)
+        if cuts and hasattr(cuts[0], 'formatter') and cuts[0].formatter == 'nemo_tarred_to_duplex':
+            filtered_cuts = []
+            skipped_cuts = []
+            for cut in cuts:
+                if any(s.text.strip() for s in cut.supervisions if s.speaker in self.input_roles):
+                    filtered_cuts.append(cut)
+                else:
+                    skipped_cuts.append(cut.id)
+            if skipped_cuts:
+                logging.info(f"Skipped {len(skipped_cuts)} cuts with empty input text. Skipped cut ids: {', '.join(skipped_cuts)}")
+            if not filtered_cuts:
+                logging.warning(f"All cuts were filtered out! Original batch size: {len(cuts)}. Returning minimal valid batch to continue training.")
+                return self._create_minimal_batch()
+            cuts = CutSet.from_cuts(filtered_cuts)
 
+        if cuts:
             swapped_cuts = []
 
             if self.aug_by_swap_role:
@@ -143,21 +212,57 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             target_audio, target_audio_lens = collate_audio(
                 all_cuts_combined.resample(self.target_sample_rate), recording_field="target_audio"
             )
-            target_tokens, target_token_lens = collate_token_channel(
-                all_cuts_combined, self.tokenizer, self.frame_length, roles=self.output_roles
-            )
-            source_tokens, source_token_lens = collate_token_channel(
-                all_cuts_combined, self.tokenizer, self.frame_length, roles=self.input_roles
-            )
 
+            if self.train_half_duplex_asr:
+                # For half-duplex ASR mode: remove timestamps and assign source tokens to target_tokens
+                source_tokens, source_token_lens = collate_token_channel(
+                    all_cuts_combined, self.tokenizer, self.frame_length, 
+                    roles=self.output_roles, 
+                    bos_id=self.tokenizer.text_to_ids('^')[0],
+                    eos_id=self.tokenizer.text_to_ids('$')[0],
+                    remove_timestamps=True,
+                    user_bos_id=self.tokenizer.text_to_ids('^')[0], 
+                    agent_bos_id=self.tokenizer.bos, 
+                    train_half_duplex_asr=True
+                )
+                target_tokens, target_token_lens = source_tokens, source_token_lens
+            else:
+                # Original logic for duplex mode
+                target_tokens, target_token_lens = collate_token_channel(
+                    all_cuts_combined, self.tokenizer, self.frame_length, roles=self.output_roles, bos_id=self.tokenizer.bos, eos_id=self.tokenizer.eos, remove_timestamps=True
+                )
+
+                # Only run force alignment during training (when gradients are enabled)
+                if self.force_align_user_text and torch.is_grad_enabled():
+                    logging.info(f"Force aligning user text for {len(all_cuts_combined)} cuts on device {self.force_align_device}")
+                    all_cuts_combined = self.force_aligner.batch_force_align_user_audio(all_cuts_combined, source_sample_rate=self.source_sample_rate)
+                    
+                    # Check if we have any cuts left after filtering
+                    if len(all_cuts_combined) == 0:
+                        logging.warning("All cuts filtered out due to force alignment failures, returning minimal valid batch to continue training.")
+                        return self._create_minimal_batch()
+
+                source_tokens, source_token_lens = collate_token_channel(
+                    all_cuts_combined, self.tokenizer, self.frame_length,
+                    roles=self.input_roles,
+                    bos_id=self.tokenizer.text_to_ids('^')[0], 
+                    eos_id=self.tokenizer.text_to_ids('$')[0], 
+                    word_align_position=self.word_align_position, 
+                    remove_timestamps=not self.predict_user_text, 
+                    user_bos_id=self.tokenizer.text_to_ids('^')[0], 
+                    agent_bos_id=self.tokenizer.bos, 
+                    threshold=self.cfg.get("eou_threshold", None) if self.cfg is not None else None, 
+                    eos_buffer=self.cfg.get("eos_buffer", None) if self.cfg is not None else None
+                )
+                
             try:
                 target_first_turn_audio, target_first_turn_audio_lens = collate_first_turn_audio(
-                    all_cuts_combined.resample(self.target_sample_rate), roles=self.output_roles,
-                    recording_field="target_audio"
+                    all_cuts_combined.resample(self.target_sample_rate), roles=self.output_roles, recording_field="target_audio"
                 )
             except Exception as e:
                 target_first_turn_audio = None
                 target_first_turn_audio_lens = None
+
 
             audio_data = {
                 "sample_id": [str(cut.id) for cut in all_cuts_combined],
@@ -169,9 +274,15 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 "target_token_lens": target_token_lens,
                 "source_tokens": source_tokens,
                 "source_token_lens": source_token_lens,
+                "source_texts": [
+                    " ".join(_strip_timestamps(s.text) for s in cut.supervisions if s.speaker in self.input_roles) for cut in all_cuts_combined
+                ],
                 "target_texts": [
                     " ".join(s.text for s in cut.supervisions if s.speaker in self.output_roles)
                     for cut in all_cuts_combined
+                ],
+                "all_texts": [
+                    " ".join(_strip_timestamps(s.text) for s in cut.supervisions) for cut in all_cuts_combined
                 ],
                 "target_first_turn_audio": target_first_turn_audio,
                 "target_first_turn_audio_lens": target_first_turn_audio_lens,
@@ -392,31 +503,52 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
 
 
 def collate_first_turn_audio(
-        cuts: CutSet,
-        roles: set[str],
-        recording_field: str = "target_audio",
+    cuts: CutSet,
+    roles: set[str],
+    recording_field: str = "target_audio",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     first_turn_audios = []
     first_turn_audios_lens = []
     for cut in cuts:
-        first_supervision = [s for s in cut.supervisions if s.speaker in roles][0]
-        truncated_audio = cut.truncate(offset=max(0, first_supervision.start),
-                                       duration=first_supervision.duration).load_custom(recording_field)
+        # Find supervisions that match the specified roles
+        matching_supervisions = [s for s in cut.supervisions if s.speaker in roles]
+        
+        if not matching_supervisions:
+            # Log warning and skip this cut if no matching supervisions found
+            logging.warning(f"No supervisions found with roles {roles} for cut {cut.id}. Available speakers: {[s.speaker for s in cut.supervisions]}")
+            continue
+            
+        first_supervision = matching_supervisions[0]
+        truncated_audio = cut.truncate(offset=max(0, first_supervision.start), duration=first_supervision.duration).load_custom(recording_field)
         first_turn_audios.append(truncated_audio.squeeze(0))
         first_turn_audios_lens.append(truncated_audio.shape[-1])
+
+    if not first_turn_audios:
+        # If no valid audio was found, return empty tensors
+        logging.error(f"No valid audio found for any cuts with roles {roles}")
+        return torch.empty(0), torch.empty(0)
 
     return collate_vectors(first_turn_audios, padding_value=0), torch.tensor(first_turn_audios_lens)
 
 
 def collate_token_channel(
-        cuts: CutSet,
-        tokenizer: TokenizerSpec,
-        frame_length: Seconds,
-        roles: set[str],
+    cuts: CutSet,
+    tokenizer: TokenizerSpec,
+    frame_length: Seconds,
+    roles: set[str],
+    bos_id: int = None,
+    eos_id: int = None,
+    word_align_position: str = 'left',
+    remove_timestamps: bool = False,
+    user_bos_id: int = None,
+    agent_bos_id: int = None,
+    threshold: int = None,
+    eos_buffer: int = None,
+    train_half_duplex_asr: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     pad_id = get_pad_id(tokenizer)
     tokens = [
-        build_token_channel(c, tokenizer=tokenizer, frame_length=frame_length, roles=roles, pad_id=pad_id)
+        build_token_channel(c, tokenizer=tokenizer, frame_length=frame_length, roles=roles, pad_id=pad_id, bos_id=bos_id, eos_id=eos_id, word_align_position=word_align_position, remove_timestamps=remove_timestamps, user_bos_id=user_bos_id,agent_bos_id=agent_bos_id, threshold=threshold, eos_buffer=eos_buffer, train_half_duplex_asr=train_half_duplex_asr)
         for c in cuts
     ]
     token_lens = torch.tensor([len(tt) for tt in tokens])
@@ -456,6 +588,15 @@ def build_token_channel(
         frame_length: Seconds,
         roles: set[str],
         pad_id: int = -1,
+        bos_id: int = None,
+        eos_id: int = None,
+        word_align_position: str = 'left',
+        remove_timestamps: bool = False,
+        user_bos_id: int = None,
+        agent_bos_id: int = None,
+        threshold: int = None,
+        eos_buffer: int = None,
+        train_half_duplex_asr: bool = False,
 ) -> torch.Tensor:
     diagnostic = f"Extra info: {cut.id=}"
     if getattr(cut, "shard_origin", None) is not None:
@@ -463,10 +604,8 @@ def build_token_channel(
 
     total = compute_num_frames(cut.duration, frame_length, cut.sampling_rate)
     tokens = torch.ones(total, dtype=torch.long) * pad_id
-
     for supervision in cut.supervisions:
         if supervision.speaker in roles:
-            text_ids = torch.as_tensor([tokenizer.bos] + tokenizer.text_to_ids(supervision.text))
 
             pos = compute_num_frames(supervision.start, frame_length, cut.sampling_rate)
             if pos >= len(tokens):  # Changed from > to >= for robustness
@@ -474,10 +613,21 @@ def build_token_channel(
                     f"Ill-constructed example: the beginning offset of a supervision {pos} is larger than or equal to the example's length {len(tokens)}. {diagnostic}"
                 )
                 continue
-
             eospos = compute_num_frames(supervision.end, frame_length, cut.sampling_rate)
-
             available_frames_for_text = eospos - pos
+
+            if train_half_duplex_asr:
+                # Assume the first turn is user text in ASR training
+                text = cut.supervisions[0].text
+                remove_timestamps = True
+            else:
+                text = supervision.text
+
+            # Use different bos_id for user and agent
+            text_ids = torch.as_tensor([bos_id] + _text_to_ids(text, tokenizer, available_frames_for_text=available_frames_for_text, word_align_position=word_align_position, remove_timestamps=remove_timestamps, pad_id=pad_id, user_bos_id=user_bos_id, user_eos_id=agent_bos_id, threshold=threshold, eos_buffer=eos_buffer))
+
+            if train_half_duplex_asr:
+                text_ids = torch.cat([text_ids, torch.tensor([eos_id], dtype=torch.long)])        
 
             if available_frames_for_text > 0 and len(text_ids) > available_frames_for_text:
                 # Truncate text_ids to fit before the eos position.
@@ -501,9 +651,9 @@ def build_token_channel(
                 raise RuntimeError(f"{tokens.shape=} {pos=} {endpos=} {text_ids.shape=} {diagnostic}") from e
 
             # Place EOS token - critical for turn-taking behavior
-            if eospos < len(tokens):
+            if eospos < len(tokens) and eos_id is not None:
                 # Normal case: place EOS at the intended position
-                tokens[eospos] = tokenizer.eos
+                tokens[eospos] = eos_id
             else:
                 # Interruption case: place EOS at the last valid position
                 # This ensures the model learns to stop when interrupted by user
@@ -511,11 +661,11 @@ def build_token_channel(
                     # Case 1: text finished, interrupted during sil/audio generation
                     # Place EOS right after the last text token (or at sequence end if closer)
                     actual_eos_pos = min(endpos, len(tokens) - 1)
-                    tokens[actual_eos_pos] = tokenizer.eos
+                    tokens[actual_eos_pos] = eos_id
                 elif len(tokens) > 0:
                     # Case 2: text truncated due to interruption
                     # Place EOS at the very end of the sequence
-                    tokens[-1] = tokenizer.eos
+                    tokens[-1] = eos_id
                 logging.warning(
                     f"Supervision was likely interrupted: {eospos=} >= {len(tokens)=}. "
                     f"Placed EOS at fallback position to ensure proper turn-taking training. {diagnostic}"
@@ -525,7 +675,7 @@ def build_token_channel(
 
 
 def _strip_timestamps(
-        text: str, _TIMESTAMP_PATTERN=re.compile(r"<\|\d+\|>"), _SPACE_PATTERN=re.compile(r"\s+")
+    text: str, _TIMESTAMP_PATTERN=re.compile(r"<\|\d+\|>"), _SPACE_PATTERN=re.compile(r"\s+")
 ) -> str:
     """
     Strips timestamp tokens from text, e.g. turns:
@@ -536,3 +686,141 @@ def _strip_timestamps(
     # Regexp pattern args are cached compiled patterns (micro-optimization).
     text = _TIMESTAMP_PATTERN.sub("", text)  # strip timestamp tokens if present
     return _SPACE_PATTERN.sub(" ", text).strip()  # strip multi-whitespaces
+
+def _insert_eos_to_long_pad_segments(text_ids, pad_id, user_eos_id, user_bos_id, threshold=12, eos_buffer=12):
+    """
+    In text_ids, for any segment of continuous pad_id longer than threshold,
+    set the last id of that segment to user_eos_id, ignoring beginning and ending paddings.
+    """
+    if user_eos_id is None or pad_id is None or not isinstance(text_ids, list) or len(text_ids) == 0:
+        return text_ids
+
+    # Find the first and last non-pad_id indices
+    first_nonpad = next((i for i, x in enumerate(text_ids) if x != pad_id), None)
+    last_nonpad = next((i for i, x in reversed(list(enumerate(text_ids))) if x != pad_id), None)
+    if first_nonpad is None or last_nonpad is None or last_nonpad <= first_nonpad:
+        return text_ids
+
+    i = first_nonpad
+    while i <= last_nonpad:
+        if text_ids[i] == pad_id:
+            seg_start = i
+            while i <= last_nonpad and text_ids[i] == pad_id:
+                i += 1
+            seg_end = i  # exclusive
+            seg_len = seg_end - seg_start
+            if seg_len > threshold:
+                text_ids[seg_start + eos_buffer] = user_eos_id
+                text_ids[seg_end - 1] = user_bos_id
+        else:
+            i += 1
+    return text_ids
+
+def _text_to_ids(text: str, tokenizer: TokenizerSpec,
+                 _TIMESTAMP_PATTERN_STR=r"<\|(\d+)\|>",
+                 available_frames_for_text=None,
+                 word_align_position='left',
+                 remove_timestamps=False,
+                 pad_id=None,
+                 user_bos_id=None,
+                 user_eos_id=None,
+                 threshold=None,
+                 eos_buffer=None):
+    if not remove_timestamps and re.compile(_TIMESTAMP_PATTERN_STR).search(text):
+        text_ids = _text_with_timestamps_to_ids(text, tokenizer, _TIMESTAMP_PATTERN_STR, available_frames_for_text, word_align_position)
+        if threshold is not None and threshold > 0:
+            text_ids = _insert_eos_to_long_pad_segments(text_ids, pad_id, user_eos_id, user_bos_id, threshold=threshold, eos_buffer=eos_buffer)
+    else:
+        _TIMESTAMP_PATTERN = re.compile(_TIMESTAMP_PATTERN_STR)
+        text = _TIMESTAMP_PATTERN.sub("", text)
+        # Remove extra spaces between words
+        text = " ".join(text.strip().split())
+        text_ids = tokenizer.text_to_ids(text)
+    return text_ids
+
+
+def _text_with_timestamps_to_ids(text: str, tokenizer: TokenizerSpec,
+                                 _TIMESTAMP_PATTERN_STR=r"<\|(\d+)\|>",
+                                 available_frames_for_text=None,
+                                 word_align_position='left') -> list[int]:
+    text_ids = []
+    text_ids, start_times, end_times, word_lens = _extract_text_and_time_tokens(text, tokenizer, _TIMESTAMP_PATTERN_STR)
+    text_ids_with_timestamps = _expand_text_with_timestamps_and_word_lengths(text_ids, word_lens, start_times, end_times, available_frames_for_text, frame_rate=0.08, pad_id=get_pad_id(tokenizer), word_align_position=word_align_position)
+    return text_ids_with_timestamps
+
+
+def _extract_text_and_time_tokens(text, tokenizer: TokenizerSpec,
+                                 _TIMESTAMP_PATTERN_STR=r"<\|(\d+)\|>"):
+    # Find all time tokens
+    time_tokens = re.findall(_TIMESTAMP_PATTERN_STR, text)
+    start_time = [int(time_tokens[i]) for i in range(0, len(time_tokens), 2)]
+    end_time = [int(time_tokens[i]) for i in range(1, len(time_tokens), 2)]
+    # Remove all time tokens to isolate words
+    words = re.sub(_TIMESTAMP_PATTERN_STR, '', text).split()
+    # Process each word, tokenize it, and calculate token lengths
+    text_ids = []
+    word_lens = []
+    for i, word in enumerate(words):
+        word_with_space = word if i == 0 else ' ' + word
+        word_ids = tokenizer.text_to_ids(word_with_space)
+        word_len = len(word_ids)
+        text_ids.extend(word_ids)
+        word_lens.append(word_len)
+    return text_ids, start_time, end_time, word_lens
+
+
+def _expand_text_with_timestamps_and_word_lengths(
+        text_ids, word_lens, start_time, end_time, available_frames_for_text, frame_rate=0.08, pad_id=None, word_align_position='left'
+    ):    
+    """
+    Expand word tokens according to start time tokens and word lengths for a batch of sequences.
+
+    Args:
+    - word_tokens: List of text ids w/o timestamps
+    - word_lens: List of word lengths
+    - start_time: List of start times
+    - end_time: List of end times
+    - available_frames_for_text: Maximum number of frames for text
+    - frame_rate: Frame rate resolution
+    - pad_id: Padding ID to use for empty positions in the tensor
+
+    Returns:
+    - text ids with word-level timestamps
+    """
+
+    def discretize_time(start_token, speech_frame_rate=0.08, timestamp_frame_rate=0.08):
+        return int(start_token * timestamp_frame_rate / speech_frame_rate)
+
+    if pad_id is None:
+        raise ValueError("pad_id must be provided.")
+
+    max_length = available_frames_for_text
+
+    # Create the empty tensor with pad_id as the default value
+    text_ids_with_timestamps = [pad_id] * max_length
+
+    # Populate ids of each word starting at start_idx and ending at end_idx
+    cur_word_idx = 0  # Start frame index of current word
+    for word_idx, word_len in enumerate(word_lens):
+        start_idx = discretize_time(start_time[word_idx], speech_frame_rate=frame_rate)
+        end_idx = discretize_time(end_time[word_idx], speech_frame_rate=frame_rate)
+        if word_align_position == 'left':
+            end_idx = min(start_idx + word_len, end_idx)
+        elif word_align_position == 'right':
+            start_idx = max(start_idx, end_idx - word_len)
+        else:
+            raise ValueError(f"Unknown word_align_position: {word_align_position}")
+
+        # Get ids of a single word
+        word_ids = text_ids[cur_word_idx : cur_word_idx + word_len]
+
+        # Populate a single word
+        for i in range(start_idx, end_idx + 1):  # End inclusive at word level
+            if i - start_idx < len(word_ids) and i < max_length:
+                token_id = word_ids[i - start_idx]
+                text_ids_with_timestamps[i] = token_id
+
+        # Move to the next word in the concatenated word tokens
+        cur_word_idx += word_len
+
+    return text_ids_with_timestamps
