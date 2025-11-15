@@ -1858,7 +1858,6 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         if self.cfg.audio_loss_weight > 0:
             gen_audio = torch.empty(B, T, self._num_codebooks, device=self.device, dtype=torch.long)
         else:
-
             gen_audio = torch.zeros(B, T, self._num_codebooks, device=self.device, dtype=torch.long)
         if self.cfg.get("use_separate_asr_head", False) or self.cfg.get("use_separate_asr_llm", False):
             gen_asr = torch.empty(B, T, device=self.device, dtype=torch.long)
@@ -1884,18 +1883,16 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 dtype=torch.long,
             )
         else:
-
             first_audio = torch.zeros([B, 1, self._num_codebooks], device=self.device, dtype=torch.long)
         
-        # Determine the starting position for generation
-        # If we have prompts, we process all prompt tokens first
-        # to build up the KV cache, then start generating after the prompt
-        start_gen_pos = 0
+        # Pre-compute prompt position mask to teacher force PAD tokens in the prompt region
+        is_prompt_position_mask = torch.zeros(B, T, dtype=torch.bool, device=self.device)
         if prompt_token_lens is not None:
-            # Use the maximum prompt length across the batch
-            max_prompt_len = prompt_token_lens.max().item()
-            start_gen_pos = max_prompt_len
-        
+            for i, prompt_len in enumerate(prompt_token_lens):
+                prompt_len_val = prompt_len.item()
+                if prompt_len_val > 0:
+                    is_prompt_position_mask[i, :prompt_len_val] = True
+
         # First forward pass
         ans = self(
             input_embeds[:, :1],
@@ -1907,14 +1904,12 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             asr_emb=asr_emb[:, :1],
             speaker_encoder_emb=None,  # for inference uses the cached inference_speaker_embedding
         )
-        gen_text[:, 0] = ans["text_logits"][:, -1].argmax(dim=-1)
-
-        # For position 0: use prompt token if available, otherwise generate
-        if start_gen_pos > 0:
-            # Already initialized gen_text[:, 0] with prompt_tokens above
-            pass
-        else:
-            gen_text[:, 0] = ans["text_logits"][:, -1].argmax(dim=-1)
+        
+        generated_tokens = ans["text_logits"][:, -1].argmax(dim=-1)
+        is_prompt_position = is_prompt_position_mask[:, 0]
+        # If system prompt, then agentposition 0 = PAD token
+        # Else agent position 0 = generated token
+        gen_text[:, 0] = torch.where(is_prompt_position, gen_text[:, 0], generated_tokens)
 
         if self.cfg.audio_loss_weight > 0:
             gen_audio[:, 0] = ans["audio_logits"][:, -1].argmax(dim=-1)
@@ -1922,14 +1917,6 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             gen_asr[:, 0] = ans["asr_logits"][:, -1].argmax(dim=-1)
 
         speech_state = torch.zeros(B, device=self.device, dtype=torch.long)
-
-        # Pre-compute prompt position mask to avoid recomputing at every timestep
-        is_prompt_position_mask = torch.zeros(B, T, dtype=torch.bool, device=self.device)
-        if prompt_token_lens is not None:
-            for i, prompt_len in enumerate(prompt_token_lens):
-                prompt_len_val = prompt_len.item()
-                if prompt_len_val > 0:
-                    is_prompt_position_mask[i, :prompt_len_val] = True
 
         # Autoregressive loop
         for t in range(1, T):
@@ -1965,12 +1952,10 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     asr_emb=asr_emb[:, t: t + 1],
                     speaker_encoder_emb=None,  # for inference uses the cached inference_speaker_embedding
                 )
-                # gen_text[:, t] = ans["text_logits"][:, -1].argmax(dim=-1)
-                # Only generate if not in prompt region
-                if not is_prompt_position.all():
-                    generated_tokens = ans["text_logits"][:, -1].argmax(dim=-1)
-                    # For batch items not in prompt, use generated token; for prompt items, keep PAD token
-                    gen_text[:, t] = torch.where(is_prompt_position, gen_text[:, t], generated_tokens)
+                generated_tokens = ans["text_logits"][:, -1].argmax(dim=-1)
+                # For positions in prompt region, keep PAD token
+                # For positions not in prompt region, use generated token
+                gen_text[:, t] = torch.where(is_prompt_position, gen_text[:, t], generated_tokens)
             else:
                 # No-cache mode for Nemotron - pass full history up to current step
                 if self.cfg.audio_loss_weight > 0:
@@ -1993,12 +1978,10 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     asr_emb=asr_emb[:, :t + 1],
                     speaker_encoder_emb=None,  # for inference uses the cached inference_speaker_embedding
                 )
-                # gen_text[:, t] = ans["text_logits"][:, -1].argmax(dim=-1)
-                # Only generate if not in prompt region
-                if not is_prompt_position.all():
-                    generated_tokens = ans["text_logits"][:, -1].argmax(dim=-1)
-                    # For batch items not in prompt, use generated token; for prompt items, keep PAD token
-                    gen_text[:, t] = torch.where(is_prompt_position, gen_text[:, t], generated_tokens)
+                generated_tokens = ans["text_logits"][:, -1].argmax(dim=-1)
+                # For positions in prompt region, keep PAD token
+                # For positions not in prompt region, use generated token
+                gen_text[:, t] = torch.where(is_prompt_position, gen_text[:, t], generated_tokens)
 
             if self.cfg.audio_loss_weight > 0:
                 gen_audio[:, t] = ans["audio_logits"][:, -1].argmax(dim=-1)
