@@ -666,10 +666,7 @@ def build_token_channel(
                     # Case 2: text truncated due to interruption
                     # Place EOS at the very end of the sequence
                     tokens[-1] = eos_id
-                logging.warning(
-                    f"Supervision was likely interrupted: {eospos=} >= {len(tokens)=}. "
-                    f"Placed EOS at fallback position to ensure proper turn-taking training. {diagnostic}"
-                )
+
 
     return tokens
 
