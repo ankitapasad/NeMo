@@ -15,6 +15,7 @@ from .asr_bleu import ASRBLEU
 from .bleu import BLEU
 from .token_accuracy import TurnTakingMetrics
 from .results_logger import ResultsLogger
+from .intelligibility import Intelligibility
 from .perplexity import Perplexity, ValidationLoss
 __all__ = [
     'ASRBLEU',
@@ -23,4 +24,6 @@ __all__ = [
     'ResultsLogger',
     'Perplexity',
     'ValidationLoss',
+    'Intelligibility',
 ]
+

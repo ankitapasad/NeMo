@@ -156,4 +156,3 @@ class TurnTakingMetrics:
         self.latencies.clear()
         
         return corpus_metrics
-
