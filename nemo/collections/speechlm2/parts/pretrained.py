@@ -44,13 +44,19 @@ def load_pretrained_hf(model_path_or_name: str, pretrained_weights: bool = True,
     Load pretrained HuggingFace AutoModelForCausalLM.
 
     Setting ``pretrained_weights=False`` returns a model that has identical architecture with the checkpoint,
-    but is randomly initialized.
+    but is randomly initialized (on CPU to avoid OOM during inference).
     """
     if pretrained_weights:
         return AutoModelForCausalLM.from_pretrained(model_path_or_name, torch_dtype=dtype, trust_remote_code=True)
     else:
         config = AutoConfig.from_pretrained(model_path_or_name,  trust_remote_code=True)
-        return AutoModelForCausalLM.from_config(config, torch_dtype=dtype, trust_remote_code=True)
+        # Create on CPU when pretrained_weights=False (during inference) to avoid OOM
+        # The weights will be loaded from safetensors later
+        with torch.device('meta'):
+            model = AutoModelForCausalLM.from_config(config, torch_dtype=dtype, trust_remote_code=True)
+        # Move empty model to CPU
+        model = model.to_empty(device='cpu')
+        return model
 
 
 @contextmanager
@@ -83,13 +89,17 @@ def setup_audio_codec(model: torch.nn.Module):
     del model.audio_codec.discriminator  # free up some memory
 
 
-def setup_speech_encoder(model: torch.nn.Module):
+def setup_speech_encoder(model: torch.nn.Module, map_location='cpu'):
     """
     Sets up an ``AudioPerceptionModule``, initializing its ``encoder`` and ``preprocessor``
     with a pretrained NeMo ``ASRModel``.
     The result is assigned to ``model.perception`` attribute and is trainable.
     
     If user config specifies encoder parameters, they will override the pretrained model's config.
+    
+    Args:
+        model: The model to setup perception for
+        map_location: Device to load ASR model on (default: 'cpu' to avoid OOM during inference)
     """
     # Save user-specified encoder config before loading pretrained model
     user_encoder_config = {}
@@ -97,7 +107,8 @@ def setup_speech_encoder(model: torch.nn.Module):
     if 'encoder' in model.cfg.perception:
         user_encoder_config = OmegaConf.to_container(model.cfg.perception.encoder, resolve=True)
     
-    asr = load_pretrained_nemo(ASRModel, model.cfg.pretrained_asr).eval()
+    # Load ASR model on specified device (CPU during inference to avoid OOM)
+    asr = ASRModel.restore_from(model.cfg.pretrained_asr, map_location=map_location).eval()
     with open_dict(model.cfg):
         model.cfg.perception.preprocessor = asr.cfg.preprocessor
         model.cfg.perception.encoder = asr.cfg.encoder
@@ -109,6 +120,8 @@ def setup_speech_encoder(model: torch.nn.Module):
                     model.cfg.perception.encoder[key] = value
     model.perception = AudioPerceptionModule(model.cfg.perception).train()
     model.perception.load_state_dict(asr.state_dict(), strict=False)
+    # Delete ASR model to free memory
+    del asr
 
 def set_model_dict_for_partial_init(pretrained_dict, model_dict):
     # 1. filter out different size layers

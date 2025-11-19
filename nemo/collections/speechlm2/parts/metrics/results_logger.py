@@ -160,7 +160,8 @@ class ResultsLogger:
     ):
         rank = get_rank()
 
-        for i in range(len(refs)):
+        # Use samples_id length for iteration (refs/hyps may be None for non-QA datasets)
+        for i in range(len(samples_id)):
             sample_id = samples_id[i][:150]
             # Add rank info to audio filename to avoid conflicts
             if pred_audio is not None:
@@ -169,8 +170,8 @@ class ResultsLogger:
 
             out_dict = {
                 "id": sample_id,
-                "target_text": refs[i],
-                "pred_text": hyps[i],
+                "target_text": refs[i] if refs is not None else None,
+                "pred_text": hyps[i] if hyps is not None else None,
                 "pred_audio": asr_hyps[i] if asr_hyps is not None else None,
                 "src_text": src_refs[i],
                 "pred_src_text": src_hyps[i] if src_hyps is not None and src_hyps[i] is not None else "",

@@ -77,6 +77,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         self.predict_user_text = self.cfg.get("predict_user_text", False)
 
         # Load LLM first
+        # During inference (pretrained_weights=False), model is created on CPU to avoid OOM
+        # safetensors.load_model will load weights directly to the target device
         llm = load_pretrained_hf(self.cfg.pretrained_llm, pretrained_weights=self.cfg.pretrained_weights).train()
 
         # Handle different model types with all their specific configurations
@@ -144,12 +146,16 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         maybe_install_lora(self)
 
         # Load the pretrained streaming ASR model
-        setup_speech_encoder(self)
+        # This sets up the perception module architecture and config
+        # During inference, safetensors.load_model will overwrite the weights with trained values
+        # ASR is loaded on CPU (default in setup_speech_encoder) to avoid OOM
+        setup_speech_encoder(self, map_location='cpu')
 
         if self.cfg.get("pretrained_perception_from_s2s", None):
             self.init_perception_from_another_s2s_checkpoint(self.cfg.pretrained_perception_from_s2s)
 
-        if self.cfg.get("pretrained_s2s_model", None):
+        # Only load pretrained_s2s_model during training initialization, not when loading from HF checkpoint
+        if self.cfg.get("pretrained_s2s_model", None) and self.cfg.get("pretrained_weights", True):
             logging.info(f"Loading pretrained s2s model from {self.cfg.pretrained_s2s_model}")
             self.init_from_model_from_ckpt(self.cfg.pretrained_s2s_model)
 
@@ -170,7 +176,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     checkpoint_state = torch.load(checkpoint_path, map_location='cpu')
             elif os.path.isdir(checkpoint_path):
                 logging.info(f"Loading from HuggingFace format directory: {checkpoint_path}")
-                pretrained_model = self.__class__.from_pretrained(checkpoint_path)
+                pretrained_model = self.__class__.from_pretrained(checkpoint_path, map_location='cpu')
                 checkpoint_state = pretrained_model.state_dict()
                 del pretrained_model
             else:
@@ -191,7 +197,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     checkpoint_state = torch.load(checkpoint_path, map_location='cpu')
             elif os.path.isdir(checkpoint_path):
                 logging.info(f"Loading from HuggingFace format directory: {checkpoint_path}")
-                pretrained_model = self.__class__.from_pretrained(checkpoint_path)
+                pretrained_model = self.__class__.from_pretrained(checkpoint_path, map_location='cpu')
                 checkpoint_state = pretrained_model.state_dict()
                 del pretrained_model
             else:
@@ -768,10 +774,14 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             self.empty_user_text = EmptyTextMetric().reset()
 
     def on_validation_epoch_end(self, prefix="val") -> None:
-        bleu = self.bleu.compute()
-        for k, m in bleu.items():
-            if "qa" not in k and "mmsu" not in k:
-                self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+        # Compute BLEU only if some datasets updated it
+        try:
+            bleu = self.bleu.compute()
+            for k, m in bleu.items():
+                if "qa" not in k and "mmsu" not in k:
+                    self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+        except (RuntimeError, ValueError) as e:
+            logging.info(f"Skipping BLEU logging: no datasets computed BLEU ({e})")
 
         acc_metrics = self.results_logger.compute_and_save()
 
@@ -788,9 +798,14 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
 
         if self.predict_user_text:
-            src_bleu = self.src_bleu.compute()
-            for k, m in src_bleu.items():
-                self.log(f"{prefix}_src_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+            # Compute src_bleu only if some datasets updated it
+            try:
+                src_bleu = self.src_bleu.compute()
+                for k, m in src_bleu.items():
+                    self.log(f"{prefix}_src_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+            except (RuntimeError, ValueError) as e:
+                logging.info(f"Skipping src_bleu logging: no datasets computed src_bleu ({e})")
+            
             src_wer = self.src_wer.compute()
             for k, m in src_wer.items():
                 self.log(f"{prefix}_src_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
@@ -818,41 +833,37 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 prompt_token_lens=prompt_token_lens,
             )
 
-            self.bleu.update(name=name, refs=dataset_batch["target_texts"], hyps=results["text"])
+            # For simple QA datasets, skip BLEU computation (only compute ACC and WER)
+            skip_bleu_datasets = ['llama-qa', 'web-qa', 'openbookqa', 'mmsu']
+            should_compute_bleu = not any(qa_name in name.lower() for qa_name in skip_bleu_datasets)
+            
+            if should_compute_bleu:
+                self.bleu.update(name=name, refs=dataset_batch["target_texts"], hyps=results["text"])
 
-            # Only compute turn taking metrics for datasets with user text
-            should_eval_user_text = any(keyword in name.lower() for keyword in ['system_prompt', 'duplex', 'candor'])
-            if should_eval_user_text and "source_tokens" in dataset_batch and results["tokens_text"] is not None:
+            if "source_tokens" in dataset_batch and results["tokens_text"] is not None:
                 self.turn_taking_metrics.update(
                     name=name,
                     source_tokens=dataset_batch["source_tokens"],
                     pred_tokens=results["tokens_text"]
                 )
 
-            # Only save audio for specific datasets to speed up validation
-            # For most QA datasets, we only need text metrics
-            should_save_audio = any(keyword in name.lower() for keyword in ['system_prompt', 'duplex', 'candor'])
-            
-            if should_save_audio:
-                fake_pred_audio, fake_audio_len = self._generate_fake_audio_from_tokens(results["tokens_text"])
-                pred_turns_list = self._split_agent_tokens_into_turns(results["tokens_text"])
-                pred_audio_arg = fake_pred_audio
-                user_audio_arg = dataset_batch["source_audio"]
-            else:
-                # Skip audio generation and saving for simple QA datasets
-                pred_turns_list = None
-                pred_audio_arg = None
-                user_audio_arg = None
+            fake_pred_audio, fake_audio_len = self._generate_fake_audio_from_tokens(results["tokens_text"])
+            pred_turns_list = self._split_agent_tokens_into_turns(results["tokens_text"])
 
+            # For QA datasets (llama-qa, web-qa, openbookqa, mmsu): compute ACC
+            # For other datasets: skip ACC computation (pass None for refs/hyps)
+            qa_datasets = ['llama-qa', 'web-qa', 'openbookqa', 'mmsu']
+            is_qa_dataset = any(qa_name in name.lower() for qa_name in qa_datasets)
+            
             self.results_logger.update(
                 name=name,
-                refs=dataset_batch["target_texts"],
-                hyps=results["text"],
+                refs=dataset_batch["target_texts"] if is_qa_dataset else None,
+                hyps=results["text"] if is_qa_dataset else None,
                 asr_hyps=None,
                 samples_id=dataset_batch['sample_id'],
-                pred_audio=pred_audio_arg,
+                pred_audio=fake_pred_audio,
                 pred_audio_sr=self.target_sample_rate,
-                user_audio=user_audio_arg,
+                user_audio=dataset_batch["source_audio"],
                 user_audio_sr=self.source_sample_rate,
                 src_refs=dataset_batch["source_texts"],
                 src_hyps=results["src_text"],
@@ -868,13 +879,11 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 import re
                 results["text"] = [re.sub(r"<\|.*?\|>", "", s).strip() for s in results["text"]]
 
-            # Only compute user text metrics for specific datasets (e.g., system_prompt, duplex conversations)
-            # Skip for simple QA datasets to speed up validation
-            should_eval_user_text = any(keyword in name.lower() for keyword in ['system_prompt', 'duplex', 'candor'])
-            
-            if self.predict_user_text and should_eval_user_text:
+            if self.predict_user_text:
                 src_text_clean = [s.replace("^", " ").replace("$", " ") for s in results["src_text"]]
-                self.src_bleu.update(name=name, refs=dataset_batch["source_texts"], hyps=src_text_clean)
+                # For simple QA datasets, skip src_bleu but still compute WER
+                if should_compute_bleu:
+                    self.src_bleu.update(name=name, refs=dataset_batch["source_texts"], hyps=src_text_clean)
                 self.src_wer.update(name=name, refs=dataset_batch["source_texts"], hyps=src_text_clean)
                 self.empty_user_text.update(name=name, hyps=results["src_text"])
 
@@ -1499,12 +1508,24 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             if self.cfg.get("use_separate_asr_head", False) or self.cfg.get("use_separate_asr_llm", False):
                 gen_asr = gen_asr[:, :T_local]
 
+        # Helper function to filter special tokens before ids_to_text
+        def filter_tokens(token_ids, length=None):
+            """Filter out pad tokens and other special tokens"""
+            if length is not None:
+                token_ids = token_ids[:length]
+            # Filter out pad tokens
+            token_ids = token_ids[token_ids != self.text_pad_id]
+            return token_ids
+        
         # Split into source and target texts
         all_text = gen_text.clone()
         if self.predict_user_text and ((self.cfg.get("use_separate_asr_head", False) and not self.cfg.get(
                 "force_use_asr_head_for_user_agent_text", False)) or self.cfg.get("use_separate_asr_llm", False)):
             gen_text_src = gen_asr
-            src_text_cleaned = [self.tokenizer.ids_to_text(gen_text_src[b]) for b in range(gen_text_src.shape[0])]
+            src_text_cleaned = [
+                self.tokenizer.ids_to_text(filter_tokens(gen_text_src[b], lengths[b].item()))
+                for b in range(gen_text_src.shape[0])
+            ]
         elif self.predict_user_text and self.cfg.get("is_asr", False):
             if self.cfg.get("force_use_asr_head_for_user_agent_text", False):
                 gen_text = gen_asr
@@ -1523,7 +1544,10 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             gen_text_tgt[~tgt_mask] = self.text_pad_id
             gen_text = gen_text_tgt
 
-            src_text_cleaned = [self.tokenizer.ids_to_text(gen_text_src[b]) for b in range(gen_text_src.shape[0])]
+            src_text_cleaned = [
+                self.tokenizer.ids_to_text(filter_tokens(gen_text_src[b], lengths[b].item()))
+                for b in range(gen_text_src.shape[0])
+            ]
         elif self.predict_user_text:
             is_asr = self.cfg.get("is_asr", False)
 
@@ -1543,8 +1567,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             if is_asr:
                 src_text_cleaned = []
                 for b in range(gen_text.shape[0]):
-                    gen_text_b = self.tokenizer.ids_to_text(gen_text_tgt[b])
-                    gen_text_src_b = self.tokenizer.ids_to_text(gen_text_src[b])
+                    gen_text_b = self.tokenizer.ids_to_text(filter_tokens(gen_text_tgt[b], lengths[b].item()))
+                    gen_text_src_b = self.tokenizer.ids_to_text(filter_tokens(gen_text_src[b], lengths[b].item()))
                     gen_text_src_b = gen_text_src_b.rstrip("^")
                     import re
                     gen_text_src_b = re.sub(r"\^{2,}", "^", gen_text_src_b)
@@ -1555,7 +1579,10 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                             gen_text_src_b = gen_text_src_b[:last_caret_idx + 1]
                     src_text_cleaned.append(gen_text_src_b)
             elif self.cfg.get("eval_text_turn_taking", False):
-                src_text_cleaned = [self.tokenizer.ids_to_text(gen_text_src[b]) for b in range(gen_text_src.shape[0])]
+                src_text_cleaned = [
+                    self.tokenizer.ids_to_text(filter_tokens(gen_text_src[b], lengths[b].item()))
+                    for b in range(gen_text_src.shape[0])
+                ]
             else:
                 src_text_cleaned = None
                 gen_text_src = None
