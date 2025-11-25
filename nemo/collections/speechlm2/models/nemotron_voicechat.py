@@ -271,7 +271,8 @@ class NemotronVoiceChat(LightningModule, HFHubMixin):
         return None
 
     def on_train_epoch_start(self) -> None:
-        pass
+        self.tts_model.on_train_epoch_start()
+        self.stt_model.on_train_epoch_start()
 
     def on_validation_epoch_start(self) -> None:
         self.on_train_epoch_start()
