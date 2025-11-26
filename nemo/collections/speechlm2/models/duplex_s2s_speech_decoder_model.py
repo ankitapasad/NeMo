@@ -806,9 +806,9 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             except (RuntimeError, ValueError) as e:
                 logging.info(f"Skipping src_bleu logging: no datasets computed src_bleu ({e})")
             
-            src_wer = self.src_wer.compute()
-            for k, m in src_wer.items():
-                self.log(f"{prefix}_src_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+            # src_wer = self.src_wer.compute()
+            # for k, m in src_wer.items():
+            #     self.log(f"{prefix}_src_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
             empty_user_text = self.empty_user_text.compute()
             for k, m in empty_user_text.items():
                 self.log(f"{prefix}_src_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
@@ -853,6 +853,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             # For QA datasets (llama-qa, web-qa, openbookqa, mmsu): compute ACC
             # For other datasets: skip ACC computation (pass None for refs/hyps)
             qa_datasets = ['llama-qa', 'web-qa', 'openbookqa', 'mmsu']
+            qa_datasets += ['sdqa', 'commoneval', 'alpacaeval', 'advbench', 'candor', 'demo', 'servicecontexts']
             is_qa_dataset = any(qa_name in name.lower() for qa_name in qa_datasets)
             
             self.results_logger.update(
@@ -884,7 +885,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 # For simple QA datasets, skip src_bleu but still compute WER
                 if should_compute_bleu:
                     self.src_bleu.update(name=name, refs=dataset_batch["source_texts"], hyps=src_text_clean)
-                self.src_wer.update(name=name, refs=dataset_batch["source_texts"], hyps=src_text_clean)
+                # self.src_wer.update(name=name, refs=dataset_batch["source_texts"], hyps=src_text_clean)
                 self.empty_user_text.update(name=name, hyps=results["src_text"])
 
     def on_test_epoch_start(self) -> None:
