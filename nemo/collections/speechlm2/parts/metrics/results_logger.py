@@ -21,9 +21,14 @@ import torch
 from nemo.collections.audio.parts.utils.resampling import resample
 from nemo.utils import logging
 
+from collections import defaultdict
+from typing import Optional
 
 def safe_remove_path(path):
-    shutil.rmtree(path, ignore_errors=True)
+    try:
+        shutil.rmtree(path)
+    except:
+        pass  # File was already deleted by another thread
 
 
 class ResultsLogger:
@@ -35,6 +40,11 @@ class ResultsLogger:
         self.save_path = save_path
         self.audio_save_path = os.path.join(save_path, "pred_wavs")
         os.makedirs(self.audio_save_path, exist_ok=True)
+        # Separate folders for agent-only and user-only audio
+        self.agent_audio_save_path = os.path.join(save_path, "agent")
+        self.user_audio_save_path = os.path.join(save_path, "user")
+        os.makedirs(self.agent_audio_save_path, exist_ok=True)
+        os.makedirs(self.user_audio_save_path, exist_ok=True)
         self.matadata_save_path = os.path.join(save_path, "metadatas")
         os.makedirs(self.matadata_save_path, exist_ok=True)
 
@@ -63,7 +73,13 @@ class ResultsLogger:
 
     @staticmethod
     def merge_and_save_audio(
-        out_audio_path: str, pred_audio: torch.Tensor, pred_audio_sr: int, user_audio: torch.Tensor, user_audio_sr: int
+        out_audio_path: str,
+        pred_audio: torch.Tensor,
+        pred_audio_sr: int,
+        user_audio: torch.Tensor,
+        user_audio_sr: int,
+        agent_out_audio_path: Optional[str] = None,
+        user_out_audio_path: Optional[str] = None,
     ) -> None:
         # if user_audio is None ignore it
         if user_audio is not None:
@@ -81,9 +97,19 @@ class ResultsLogger:
                 ],
                 dim=0,
             ).squeeze()
-
+            # Optionally save padded single-channel tracks
+            if agent_out_audio_path is not None:
+                # torchaudio.save(agent_out_audio_path, pred_audio_padded.squeeze().unsqueeze(0).detach().cpu(), pred_audio_sr)
+                sf.write(agent_out_audio_path, pred_audio_padded.squeeze().unsqueeze(0).detach().cpu().numpy().astype('float32').T, pred_audio_sr)
+            if user_out_audio_path is not None:
+                # torchaudio.save(user_out_audio_path, user_audio_padded.squeeze().unsqueeze(0).detach().cpu(), pred_audio_sr)
+                sf.write(user_out_audio_path, user_audio_padded.squeeze().unsqueeze(0).detach().cpu().numpy().astype('float32').T, pred_audio_sr)
         else:
             combined_wav = pred_audio.unsqueeze(0).detach().cpu()
+            # Save agent-only if requested even when user is absent
+            if agent_out_audio_path is not None:
+                # torchaudio.save(agent_out_audio_path, pred_audio.squeeze().unsqueeze(0).detach().cpu(), pred_audio_sr)
+                sf.write(agent_out_audio_path, pred_audio.squeeze().unsqueeze(0).detach().cpu().numpy().astype('float32').T, pred_audio_sr)
 
         # save audio
         os.makedirs(os.path.dirname(out_audio_path), exist_ok=True)
@@ -117,12 +143,16 @@ class ResultsLogger:
             # save audio
             sample_id = samples_id[i][:150]  # make sure that sample id is not too big
             out_audio_path = os.path.join(self.audio_save_path, f"{name}_{sample_id}.wav")
+            agent_out_audio_path = os.path.join(self.agent_audio_save_path, f"{name}_{sample_id}.wav")
+            user_out_audio_path = os.path.join(self.user_audio_save_path, f"{name}_{sample_id}.wav")
             self.merge_and_save_audio(
                 out_audio_path,
                 pred_audio[i],
                 pred_audio_sr,
                 user_audio[i] if user_audio is not None else None,
                 user_audio_sr,
+                agent_out_audio_path=agent_out_audio_path,
+                user_out_audio_path=user_out_audio_path,
             )
 
             if pred_audio_tf is not None:
@@ -178,6 +208,7 @@ class ResultsLogger:
 
             # cache metadata
             out_dict = {
+                "sample_id": sample_id,
                 "target_text": refs[i],
                 "pred_text": hyps[i],
                 "speech_pred_transcribed": asr_hyps[i],
