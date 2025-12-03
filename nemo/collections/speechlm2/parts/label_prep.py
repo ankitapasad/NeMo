@@ -137,7 +137,7 @@ def prepare_labels(
         )
         target_tokens = torch.cat([pad, target_tokens[:, :-delay_by]], dim=-1)
         # batch["target_token_lens"] = batch["target_token_lens"] + delay_by
-
+    
     original_target_tokens = target_tokens.clone()
     if cfg.get("delay_text_eos_by", None):
         target_tokens = delay_eos(target_tokens, text_eos_id, text_pad_id, shift=cfg.delay_text_eos_by)
