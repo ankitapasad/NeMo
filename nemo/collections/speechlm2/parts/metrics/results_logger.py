@@ -111,7 +111,7 @@ class ResultsLogger:
         reference_audio: torch.Tensor = None,
     ) -> None:
 
-        out_json_path = os.path.join(self.matadata_save_path, f"{name}.json")
+        out_json_path = os.path.join(self.matadata_save_path, f"{name}.jsonl")
         out_dicts = []
         for i in range(len(refs)):
             # save audio
@@ -192,7 +192,7 @@ class ResultsLogger:
         # uses append here to avoid needs to cache
         with open(out_json_path, 'a+', encoding='utf-8') as fout:
             for out_dict in out_dicts:
-                fout.write(json.dumps(out_dict, ensure_ascii=False, indent=4) + '\n')
+                fout.write(json.dumps(out_dict, ensure_ascii=False) + '\n')
                 # json.dump(out_dict, fout)
 
         logging.info(f"Metadata file for {name} dataset updated at: {out_json_path}")

@@ -271,12 +271,33 @@ class NemotronVoiceChat(LightningModule, HFHubMixin):
         return None
 
     def on_train_epoch_start(self) -> None:
-        pass
+        self.tts_model.on_train_epoch_start()
+        self.stt_model.on_train_epoch_start()
 
     def on_validation_epoch_start(self) -> None:
         self.on_train_epoch_start()
         self.results_logger = ResultsLogger(self.validation_save_path).reset()
-        self.asr_bleu = ASRBLEU(self.cfg.scoring_asr).reset()
+        # Use Parakeet-TDT model for transcription with timestamp support
+        scoring_asr_model = self.cfg.get('scoring_asr', 'nvidia/parakeet-tdt-1.1b')
+        if scoring_asr_model == 'stt_en_fastconformer_transducer_large':
+            # Upgrade to Parakeet-TDT model with timestamp support
+            scoring_asr_model = 'nvidia/parakeet-tdt-1.1b'
+        self.asr_bleu = ASRBLEU(scoring_asr_model).reset()
+
+        # Load separate Parakeet-TDT model for timestamp detection
+        import os
+        from nemo.collections.asr.models import ASRModel
+
+        # Check if it's a local .nemo file or HuggingFace model
+        if os.path.exists(scoring_asr_model) and scoring_asr_model.endswith('.nemo'):
+            # Local .nemo file - use restore_from
+            logging.info(f"Loading local ASR model for timestamps from: {scoring_asr_model}")
+            self.asr_timestamp_model = ASRModel.restore_from(restore_path=scoring_asr_model, map_location=self.device)
+        else:
+            # HuggingFace model - use from_pretrained
+            logging.info(f"Loading HuggingFace ASR model for timestamps: {scoring_asr_model}")
+            self.asr_timestamp_model = ASRModel.from_pretrained(model_name=scoring_asr_model)
+
         self.bleu = BLEU().reset()
 
     def on_validation_epoch_end(self, prefix="val") -> None:
@@ -298,11 +319,16 @@ class NemotronVoiceChat(LightningModule, HFHubMixin):
             prompt_tokens = dataset_batch.get("prompt_tokens", None)
             prompt_token_lens = dataset_batch.get("prompt_token_lens", None)
 
+            # Calculate extra decoding steps by padding input with silence
+            extra_decoding_seconds = self.cfg.get("extra_decoding_seconds", 0.0)
+            input_pad_len = int(extra_decoding_seconds * self.source_sample_rate)
+
             results = self.offline_inference(
                 dataset_batch["source_audio"],
                 dataset_batch["source_audio_lens"],
                 prompt_tokens=prompt_tokens,
                 prompt_token_lens=prompt_token_lens,
+                input_pad_len=input_pad_len,
             )
 
             with fp32_precision():  # resample is fragile to bfloat16 default dtype
@@ -313,11 +339,66 @@ class NemotronVoiceChat(LightningModule, HFHubMixin):
                     pred_audio_lens=(results["audio_len"] / 22050 * 16000).to(torch.long),
                 )
 
+                # Add agent speech start timestamps using ASR model with timestamp detection
+                asr_hyps_with_timestamps = []
+
+                # Check if timestamp detection should be used
+                use_timestamps = self.cfg.get('use_asr_timestamps', True)
+
+                if use_timestamps and hasattr(self, 'asr_timestamp_model'):
+                    try:
+                        # Prepare audio batch for timestamp detection
+                        resampled_audio = resample(results["audio"], 22050, 16000)
+                        audio_list = []
+                        for i in range(len(asr_hyps)):
+                            audio_len = int((results["audio_len"][i] / 22050 * 16000).item())
+                            audio_list.append(resampled_audio[i, :audio_len].cpu())
+
+                        # Transcribe with timestamps
+                        timestamp_outputs = self.asr_timestamp_model.transcribe(
+                            audio_list,
+                            batch_size=len(audio_list),
+                            timestamps=True,
+                            verbose=False,
+                        )
+
+                        for i, asr_text in enumerate(asr_hyps):
+                            # Extract first word timestamp (speech onset)
+                            try:
+                                if hasattr(timestamp_outputs[i], 'timestamp') and timestamp_outputs[i].timestamp:
+                                    word_timestamps = timestamp_outputs[i].timestamp.get('word', [])
+                                    if word_timestamps and len(word_timestamps) > 0:
+                                        # First word's start time is the speech onset
+                                        # word_timestamps is a list of dicts: [{'word': 'one', 'start': 6.32, 'end': 6.4}, ...]
+                                        start_time = word_timestamps[0]['start']
+                                        # Add timestamp marker to beginning of ASR text
+                                        asr_text_with_ts = f"<|{start_time:.2f}|> {asr_text}" if asr_text else f"<|{start_time:.2f}|>"
+                                    else:
+                                        # No words detected (silence/empty)
+                                        asr_text_with_ts = asr_text
+                                else:
+                                    # Model doesn't support timestamps
+                                    asr_text_with_ts = asr_text
+                            except (AttributeError, IndexError, KeyError, TypeError) as e:
+                                # Fallback if timestamp extraction fails
+                                logging.debug(f"Timestamp extraction failed: {e}")
+                                asr_text_with_ts = asr_text
+
+                            asr_hyps_with_timestamps.append(asr_text_with_ts)
+
+                    except Exception as e:
+                        # If timestamp detection fails entirely, fall back to no timestamps
+                        logging.warning(f"Timestamp detection failed, using transcriptions without timestamps: {e}")
+                        asr_hyps_with_timestamps = asr_hyps
+                else:
+                    # Timestamp detection disabled or model not available
+                    asr_hyps_with_timestamps = asr_hyps
+
                 self.results_logger.update(
                     name=name,
                     refs=dataset_batch["target_texts"],
                     hyps=results["text"],
-                    asr_hyps=asr_hyps,
+                    asr_hyps=asr_hyps_with_timestamps,
                     samples_id=dataset_batch['sample_id'],
                     pred_audio=results["audio"],
                     pred_audio_sr=self.target_sample_rate,
