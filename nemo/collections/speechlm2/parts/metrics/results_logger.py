@@ -97,12 +97,9 @@ class ResultsLogger:
                 ],
                 dim=0,
             ).squeeze()
-            # Optionally save padded single-channel tracks
             if agent_out_audio_path is not None:
-                # torchaudio.save(agent_out_audio_path, pred_audio_padded.squeeze().unsqueeze(0).detach().cpu(), pred_audio_sr)
                 sf.write(agent_out_audio_path, pred_audio_padded.squeeze().unsqueeze(0).detach().cpu().numpy().astype('float32').T, pred_audio_sr)
             if user_out_audio_path is not None:
-                # torchaudio.save(user_out_audio_path, user_audio_padded.squeeze().unsqueeze(0).detach().cpu(), pred_audio_sr)
                 sf.write(user_out_audio_path, user_audio_padded.squeeze().unsqueeze(0).detach().cpu().numpy().astype('float32').T, pred_audio_sr)
         else:
             combined_wav = pred_audio.unsqueeze(0).detach().cpu()
