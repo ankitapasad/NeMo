@@ -210,7 +210,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             self.early_interruption_prob = cfg.get("early_interruption_prob", 0.0) if cfg is not None else 0.0
         self.fix_last_turn_eos = cfg.get("fix_last_turn_eos", False) if cfg is not None else False
         self.fix_eos_placements = cfg.get("fix_eos_placements", False) if cfg is not None else False
-        
+        self.add_asr_sysprompt = cfg.get("add_asr_sysprompt", False) if cfg is not None else False
         self.cfg = cfg
         self.model_cfg = model_cfg
         self.use_numbers_norm = model_cfg.get("use_numbers_norm", False)
@@ -491,7 +491,9 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         cuts = all_cuts.filter(lambda c: isinstance(c, Cut))
         audio_data = None
         early_interruption_stats = None
-
+        mcq_delay_stats = None
+        force_add_prompt = None
+        
         if cuts and hasattr(cuts[0], 'formatter') and cuts[0].formatter == 'nemo_tarred_to_duplex':
             filtered_cuts = []
             skipped_cuts = []
@@ -506,6 +508,9 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 logging.warning(f"All cuts were filtered out! Original batch size: {len(cuts)}. Returning minimal valid batch to continue training.")
                 return self._create_minimal_batch()
             cuts = CutSet.from_cuts(filtered_cuts)
+
+            if self.add_asr_sysprompt:
+                force_add_prompt = "Transcribe the following speech to text."
 
         if cuts:
             swapped_cuts = []
@@ -524,15 +529,23 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             else:
                 all_cuts_combined = cuts
             
+            # Get MCQ agent text delay from config (default 0)
+            # Subtract delay_text_channel_by since that delay is applied globally in label_prep
+            mcq_agent_text_delay_cfg = self.cfg.get("mcq_agent_text_delay", 0) if self.cfg is not None else 0
+            delay_text_channel_by = self.model_cfg.get("delay_text_channel_by", 0) if self.model_cfg is not None else 0
+            mcq_agent_text_delay = max(0, mcq_agent_text_delay_cfg - delay_text_channel_by)
+            
             prompt_tokens, prompt_token_lens = collate_system_prompt(
-                all_cuts_combined, self.tokenizer, self.pad_id
+                all_cuts_combined, self.tokenizer, self.pad_id, 
+                force_add_prompt=force_add_prompt,
+                mcq_agent_text_delay=mcq_agent_text_delay,
             )
             source_audio, source_audio_lens = collate_audio(all_cuts_combined.resample(self.source_sample_rate))
             target_audio, target_audio_lens = collate_audio(
                 all_cuts_combined.resample(self.target_sample_rate), recording_field="target_audio"
             )
-
-            target_tokens, target_token_lens, ei_flags = collate_token_channel(
+            
+            target_tokens, target_token_lens, ei_flags, mcq_delay_stats = collate_token_channel(
                 all_cuts_combined,
                 self.tokenizer,
                 self.pad_id,
@@ -544,6 +557,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 use_numbers_norm=self.use_numbers_norm,
                 early_interruption_flag_from_cfg=self.early_interruption_prob > 0,
                 skip_eos=self.fix_eos_placements,
+                mcq_agent_text_delay=mcq_agent_text_delay,
             )
 
             # Run force alignment if enabled
@@ -562,7 +576,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                     logging.warning("All cuts filtered out due to force alignment failures, returning minimal valid batch to continue training.")
                     return self._create_minimal_batch()
 
-            source_tokens, source_token_lens, _ = collate_token_channel(
+            source_tokens, source_token_lens, _, _ = collate_token_channel(
                 all_cuts_combined, self.tokenizer, self.pad_id, self.frame_length,
                 roles=self.input_roles,
                 bos_id=self.user_bos_id, 
@@ -712,6 +726,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             "audio_data": audio_data,
             "text_data": text_data,
             "early_interruption_stats": early_interruption_stats,
+            "mcq_delay_stats": mcq_delay_stats,
         }
 
     def _create_role_swapped_cut(self, cut):
@@ -868,6 +883,14 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         return swapped_cut
 
 
+def _is_mcq_cut(cut) -> bool:
+    """Check if a cut is from MCQ data based on shard_origin."""
+    shard_origin = getattr(cut, 'shard_origin', None)
+    if shard_origin is None:
+        return False
+    return "MCQ_training" in str(shard_origin)
+
+
 def collate_first_turn_audio(
         cuts: CutSet,
         roles: set[str],
@@ -897,6 +920,58 @@ def collate_first_turn_audio(
     return collate_vectors(first_turn_audios, padding_value=0), torch.tensor(first_turn_audios_lens)
 
 
+def _apply_mcq_delay(
+    token_seq: torch.Tensor,
+    pad_id: int,
+    mcq_agent_text_delay: int,
+    mcq_delay_stats: dict,
+    cut_id: str = "unknown",
+) -> torch.Tensor:
+    """
+    Apply MCQ agent text delay by shifting tokens right.
+    
+    Uses the minimum of requested delay and available trailing PADs to avoid
+    truncating actual content.
+    
+    Args:
+        token_seq: Token sequence to delay
+        pad_id: PAD token ID
+        mcq_agent_text_delay: Requested delay in frames
+        mcq_delay_stats: Dict to accumulate stats (modified in-place)
+        cut_id: Cut ID for logging
+        
+    Returns:
+        Delayed token sequence (same length as input)
+    """
+    # Count trailing PAD tokens to determine safe delay amount
+    non_pad_indices = torch.where(token_seq != pad_id)[0]
+    if len(non_pad_indices) > 0:
+        last_non_pad_idx = non_pad_indices[-1].item()
+        trailing_pads = len(token_seq) - last_non_pad_idx - 1
+    else:
+        trailing_pads = len(token_seq)  # all PADs
+    
+    # Use minimum of requested delay and available trailing PADs (safer)
+    actual_delay = min(mcq_agent_text_delay, trailing_pads)
+    
+    # Track stats
+    mcq_delay_stats["total_mcq_cuts"] += 1
+    mcq_delay_stats["total_actual_delay"] += actual_delay
+    
+    if actual_delay < mcq_agent_text_delay:
+        logging.debug(
+            f"MCQ delay reduced from {mcq_agent_text_delay} to {actual_delay} "
+            f"(only {trailing_pads} trailing PADs available, cut: {cut_id})"
+        )
+    
+    # Apply the delay if there's room
+    if actual_delay > 0:
+        pad_prefix = torch.full((actual_delay,), pad_id, dtype=token_seq.dtype, device=token_seq.device)
+        token_seq = torch.cat([pad_prefix, token_seq[:-actual_delay]], dim=0)
+    
+    return token_seq
+
+
 def collate_token_channel(
     cuts: CutSet,
     tokenizer: TokenizerSpec,
@@ -915,9 +990,18 @@ def collate_token_channel(
     agent_token_channel: torch.Tensor = None,
     agent_token_channel_lengths: torch.Tensor = None,
     agent_eos_id: int = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    tokens = [
-        build_token_channel(
+    mcq_agent_text_delay: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, list, dict]:
+    tokens = []
+    
+    # MCQ delay stats tracking
+    mcq_delay_stats = {
+        "total_mcq_cuts": 0,
+        "total_actual_delay": 0,
+    }
+    
+    for cut_idx, c in enumerate(cuts):
+        token_seq = build_token_channel(
             c,
             tokenizer=tokenizer,
             pad_id=pad_id,
@@ -935,13 +1019,26 @@ def collate_token_channel(
             cut_agent_token_channel_length=agent_token_channel_lengths[cut_idx] if agent_token_channel_lengths is not None else None,
             agent_eos_id=agent_eos_id,
         )
-        for cut_idx, c in enumerate(cuts)
-    ]
+        
+        # Apply MCQ agent text delay: shift tokens right by mcq_agent_text_delay frames
+        # Note: EOS is placed later during source token collation (fix_eos_placements),
+        # so we just shift the content here and EOS will be placed correctly afterward
+        if mcq_agent_text_delay > 0 and _is_mcq_cut(c):
+            token_seq = _apply_mcq_delay(
+                token_seq=token_seq,
+                pad_id=pad_id,
+                mcq_agent_text_delay=mcq_agent_text_delay,
+                mcq_delay_stats=mcq_delay_stats,
+                cut_id=getattr(c, 'id', 'unknown'),
+            )
+        
+        tokens.append(token_seq)
+    
     ei_flags = [getattr(c, 'otf_interruption', early_interruption_flag_from_cfg) for c in cuts]
 
     token_lens = torch.tensor([len(tt) for tt in tokens])
     tokens = collate_vectors(tokens, padding_value=pad_id)
-    return tokens, token_lens, ei_flags
+    return tokens, token_lens, ei_flags, mcq_delay_stats
 
 def fix_last_turn_eos(target_tokens: torch.Tensor, source_tokens: torch.Tensor, src_eos_id: int, tgt_eos_id: int, pad_id: int):
     """
@@ -983,19 +1080,38 @@ def fix_last_turn_eos(target_tokens: torch.Tensor, source_tokens: torch.Tensor, 
     else:
         logging.info(f"No EOS found in last turn of target tokens for {batch_size} samples.")
 
+MCQ_SYSTEM_PROMPT = "Think longer to give a more accurate answer"
+
 def collate_system_prompt(
     cuts: CutSet,
     tokenizer: TokenizerSpec,
     pad_id: int,
+    force_add_prompt: str | None = None,  # If not None, add this prompt to all cuts
+    mcq_agent_text_delay: int = 0,  # Only add MCQ prompt if delay > 0
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Collate system prompts from cuts.
     System prompts should be stored in cut.custom['system_prompt'].
+    MCQ cuts automatically get the system prompt defined in MCQ_SYSTEM_PROMPT
+    (only when mcq_agent_text_delay > 0).
     """
     tokens = []
     for c in cuts:
-        # Check if system prompt exists in custom field
-        if c.custom and c.custom.get("system_prompt", None):
+        # Check if MCQ cut with delay enabled - add MCQ system prompt
+        if mcq_agent_text_delay > 0 and _is_mcq_cut(c):
+            prompt_text = MCQ_SYSTEM_PROMPT
+            tokens.append(torch.as_tensor(
+                [tokenizer.bos] + tokenizer.text_to_ids(prompt_text) + [tokenizer.eos],
+                dtype=torch.long
+            ))
+        # Check if force_add_prompt is set (e.g., for ASR data)
+        elif force_add_prompt is not None and force_add_prompt != "":
+            prompt_text = force_add_prompt
+            tokens.append(torch.as_tensor(
+                [tokenizer.bos] + tokenizer.text_to_ids(prompt_text) + [tokenizer.eos],
+                dtype=torch.long
+            ))
+        elif c.custom and c.custom.get("system_prompt", None):
             prompt_text = c.custom["system_prompt"]
             tokens.append(torch.as_tensor(
                 [tokenizer.bos] + tokenizer.text_to_ids(prompt_text) + [tokenizer.eos],
