@@ -888,7 +888,7 @@ def _is_mcq_cut(cut) -> bool:
     shard_origin = getattr(cut, 'shard_origin', None)
     if shard_origin is None:
         return False
-    return "MCQ_training" in str(shard_origin)
+    return any(pattern in str(shard_origin) for pattern in ("MCQ_training", "openbookqa", "mmsu"))
 
 
 def collate_first_turn_audio(
