@@ -637,14 +637,9 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
         asr_inputs_embeds = None
         if compute_asr_for_batch:
             asr_inputs_embeds = self.embed_asr_tokens(asr_inputs) * self.cfg.get("duplex_asr_text_weight", 1.0)
-            
-            # Apply roll for tied embeddings to differentiate from agent text
-            if self.tie_and_roll_embed:
-                asr_inputs_embeds = torch.roll(asr_inputs_embeds, shifts=self.roll_shift, dims=-1)
         
-        # Add channel embeddings if enabled (done via forward() for FSDP compatibility)
-        if self.use_channel_embeds:
-            input_embeds, asr_inputs_embeds = self.channel_embed_module(input_embeds, asr_inputs_embeds)
+        # Apply tie_and_roll and channel_embeds transformations
+        input_embeds, asr_inputs_embeds = self._apply_embedding_transformations(input_embeds, asr_inputs_embeds)
         
         # Add user audio channel
         input_embeds.add_(source_encoded[:, :-1] * self.cfg.get("duplex_user_channel_weight", 1.0))
@@ -1069,6 +1064,37 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
         input_embeds = self.embed_asr_tokens(text_bos)
         return input_embeds
 
+    def _apply_embedding_transformations(
+        self,
+        agent_text_embeds: torch.Tensor,
+        user_text_embeds: torch.Tensor = None,
+    ) -> tuple:
+        """
+        Apply channel differentiation transformations to embeddings.
+        
+        This ensures consistency between training and inference by applying:
+        - tie_and_roll_embed: Roll ASR embeddings to differentiate from agent text
+        - use_channel_embeds: Add learned channel embeddings
+        
+        Args:
+            agent_text_embeds: Agent text embeddings (B, T, D) or (B, 1, D)
+            user_text_embeds: User text/ASR embeddings (B, T, D) or (B, 1, D), or None
+        
+        Returns:
+            Tuple of (agent_text_embeds, user_text_embeds) with transformations applied
+        """
+        # Apply roll for tied embeddings to differentiate from agent text
+        if user_text_embeds is not None and self.tie_and_roll_embed:
+            user_text_embeds = torch.roll(user_text_embeds, shifts=self.roll_shift, dims=-1)
+        
+        # Add channel embeddings if enabled
+        if self.use_channel_embeds:
+            agent_text_embeds, user_text_embeds = self.channel_embed_module(
+                agent_text_embeds, user_text_embeds
+            )
+        
+        return agent_text_embeds, user_text_embeds
+
     def _remove_continuous_agent_bos_id(self, gen_text: torch.Tensor, bos_id: int,
                                         is_asr: bool = False) -> torch.Tensor:
         """Remove continuous appearance of bos_id."""
@@ -1445,9 +1471,19 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                     if self.predict_user_text:
                         gen_asr[i, :prompt_len] = self.text_pad_id    
 
-        input_embeds[:, 0] += self._get_bos_embedding() * self.cfg.get("duplex_text_channel_weight", 1.0)
+        # Get BOS embeddings and apply channel differentiation transformations
+        bos_embed = self._get_bos_embedding() * self.cfg.get("duplex_text_channel_weight", 1.0)
+        asr_bos_embed = None
         if self.predict_user_text:
-            input_embeds[:, 0] += self._get_asr_bos_embedding() * self.cfg.get("duplex_asr_text_weight", 1.0)
+            asr_bos_embed = self._get_asr_bos_embedding() * self.cfg.get("duplex_asr_text_weight", 1.0)
+        
+        # Apply tie_and_roll and channel_embeds transformations for train/inference consistency
+        bos_embed, asr_bos_embed = self._apply_embedding_transformations(bos_embed, asr_bos_embed)
+        
+        # Add transformed embeddings to position 0
+        input_embeds[:, 0] += bos_embed.squeeze(0)
+        if self.predict_user_text and asr_bos_embed is not None:
+            input_embeds[:, 0] += asr_bos_embed.squeeze(0)
 
         start_gen_pos = 0
         if prompt_token_lens is not None:
@@ -1543,16 +1579,29 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
 
     def _step_inference(self, t, inference_state, ans, force_bos_positions):
         """Perform inference for one step t in the autoregressive loop."""
-        last_emb = self.embed_tokens(inference_state["gen_text"][:, t - 1]) * self.cfg.get("duplex_text_channel_weight", 1.0)
+        # Get agent text embedding for the previous token
+        last_agent_emb = self.embed_tokens(inference_state["gen_text"][:, t - 1]) * self.cfg.get("duplex_text_channel_weight", 1.0)
+        
+        # Get user text (ASR) embedding for the previous token
+        last_asr_emb = None
         if self.predict_user_text:
             last_asr_emb = self.embed_asr_tokens(inference_state["gen_asr"][:, t - 1]) * self.cfg.get("duplex_asr_text_weight", 1.0)
-            last_emb += last_asr_emb
+        
+        # Handle force_bos_positions (override agent embedding if needed)
         if force_bos_positions is not None:
-            for batch_idx in range(last_emb.shape[0]):
+            for batch_idx in range(last_agent_emb.shape[0]):
                 if force_bos_positions[batch_idx] == t and not (inference_state["gen_text"][batch_idx, :t] == self.text_bos_id).any():
-                    last_emb[batch_idx] = self.embed_tokens(
+                    last_agent_emb[batch_idx] = self.embed_tokens(
                         torch.full((1,), fill_value=self.text_bos_id, device=self.device)) * self.cfg.get(
                         "duplex_text_channel_weight", 1.0)
+        
+        # Apply tie_and_roll and channel_embeds transformations for train/inference consistency
+        last_agent_emb, last_asr_emb = self._apply_embedding_transformations(last_agent_emb, last_asr_emb)
+        
+        # Combine embeddings and add to input
+        last_emb = last_agent_emb
+        if last_asr_emb is not None:
+            last_emb = last_emb + last_asr_emb
 
         inference_state["input_embeds"][:, t] += last_emb
 
