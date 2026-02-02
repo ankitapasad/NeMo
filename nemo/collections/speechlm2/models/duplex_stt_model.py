@@ -61,6 +61,34 @@ from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, NeuralT
 from nemo.utils import logging
 
 
+class ChannelEmbeddings(nn.Module):
+    """
+    Module for adding channel-specific embeddings to differentiate agent vs user text.
+    The addition is done INSIDE forward() so FSDP can properly handle the computation.
+    """
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        # Zero-initialized learnable embeddings for each channel
+        self.agent_embed = nn.Parameter(torch.zeros(hidden_dim))
+        self.user_embed = nn.Parameter(torch.zeros(hidden_dim))
+    
+    def forward(self, agent_embeds: torch.Tensor, user_embeds: torch.Tensor = None):
+        """
+        Add channel embeddings to input embeddings.
+        
+        Args:
+            agent_embeds: Agent/LLM text embeddings [batch, seq, hidden]
+            user_embeds: User/ASR text embeddings [batch, seq, hidden], optional
+        
+        Returns:
+            Tuple of (agent_embeds + agent_channel, user_embeds + user_channel)
+        """
+        agent_embeds = agent_embeds + self.agent_embed
+        if user_embeds is not None:
+            user_embeds = user_embeds + self.user_embed
+        return agent_embeds, user_embeds
+
+
 class DuplexSTTModel(LightningModule, HFHubMixin):
     def __init__(self, cfg: dict) -> None:
         assert isinstance(cfg, dict), (
@@ -78,6 +106,16 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
 
         self.advance_text_channel_by = self.cfg.get("advance_text_channel_by", None)
         self.predict_user_text = self.cfg.get("predict_user_text", False)
+        self.predict_user_text_prob = self.cfg.get("predict_user_text_prob", 1.0)
+        
+        # Embedding variants for differentiating agent vs user text channels
+        # These are mutually exclusive
+        self.tie_and_roll_embed = self.cfg.get("tie_and_roll_embed", False)
+        self.roll_shift = self.cfg.get("roll_shift", 100)
+        self.use_channel_embeds = self.cfg.get("use_channel_embeds", False)
+        
+        if self.tie_and_roll_embed and self.use_channel_embeds:
+            raise ValueError("tie_and_roll_embed and channel_embeds are mutually exclusive")
 
         # Load LLM first
         llm = load_pretrained_hf(self.cfg.pretrained_llm, pretrained_weights=self.cfg.pretrained_weights).train()
@@ -128,7 +166,22 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
 
         if self.predict_user_text:
             self.asr_head = copy.deepcopy(self.lm_head)
-            self.embed_asr_tokens = copy.deepcopy(self.embed_tokens)
+            
+            if self.tie_and_roll_embed:
+                # Tie ASR embedding to LLM embedding (will apply roll during forward)
+                self.embed_asr_tokens = self.embed_tokens
+                logging.info(f"Tied embed_asr_tokens to embed_tokens with roll_shift={self.roll_shift}")
+            else:
+                # Default: deep copy for separate ASR embeddings
+                self.embed_asr_tokens = copy.deepcopy(self.embed_tokens)
+        
+        # Channel embeddings for differentiating agent vs user text
+        if self.use_channel_embeds:
+            # Get hidden dimension from embed_tokens
+            hidden_dim = self.embed_tokens.weight.shape[1]
+            # Wrap in nn.Module so it can be FSDP-sharded (avoids DTensor/Tensor mixing)
+            self.channel_embed_module = ChannelEmbeddings(hidden_dim)
+            logging.info(f"Created channel embeddings with hidden_dim={hidden_dim}")
 
         maybe_install_lora(self)
 
@@ -189,6 +242,14 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
         self.early_interruption_total = 0
         self.early_interruption_attempted = 0
         self.early_interruption_successful = 0
+
+        # ASR loss inclusion counters for cumulative logging
+        self.asr_loss_batches_total = 0
+        self.asr_loss_batches_included = 0
+
+        # MCQ delay counters for cumulative logging
+        self.mcq_delay_total_cuts = 0
+        self.mcq_delay_total_actual = 0
 
     def init_perception_from_another_s2s_checkpoint(self, checkpoint_path):
         if checkpoint_path is not None:
@@ -267,10 +328,15 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             input_audio_tokens=None,
             seq_mask=None,
             target_text_tokens=None,
+            compute_asr=None,
     ) -> dict[str, Tensor]:
         """
         Text prediction only (audio_loss_weight=0).
         """
+        # Determine whether to compute ASR logits (defaults to self.predict_user_text if not specified)
+        if compute_asr is None:
+            compute_asr = self.predict_user_text
+
         # Handle different cache parameter names for different models
         if 'Nemotron' in self.cfg.pretrained_llm:
             kwargs = {
@@ -290,7 +356,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
         B, T = input_embeds.shape[:2]
         text_logits = self.lm_head(out['last_hidden_state'])
 
-        if self.predict_user_text:
+        if compute_asr:
             asr_in = out['last_hidden_state']
             asr_logits = self.asr_head(asr_in)  # (B, T, asr_vocab_size)
 
@@ -302,7 +368,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             if self.cfg.get("inference_eos_boost", None):
                 text_logits[:, :, self.text_eos_id] += self.cfg.inference_eos_boost
             
-            if self.predict_user_text:
+            if compute_asr:
                 if self.cfg.get("inference_user_pad_boost", None):
                     asr_logits[:, :, self.text_pad_id] += self.cfg.inference_user_pad_boost
                 if self.cfg.get("inference_user_bos_boost", None):
@@ -311,7 +377,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                     asr_logits[:, :, self.text_eos_id] += self.cfg.inference_user_eos_boost
 
         ans = {"text_logits": text_logits}
-        if self.predict_user_text:
+        if compute_asr:
             ans["asr_logits"] = asr_logits
 
         if cache is not None:
@@ -375,19 +441,19 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
 
         return target_tokens, sil_id
 
-    def prepare_inputs(self, batch: dict):     
+    def prepare_inputs(self, batch: dict, include_asr_loss: bool = True):     
 
-        if self.cfg.get('debug', False):
-            import soundfile as sf
-            import os
-            output_dir = "/lustre/fsw/portfolios/llmservice/users/kevinhu/debug"
-            os.makedirs(output_dir, exist_ok=True)
-            wav_path = os.path.join(output_dir, f"{batch['sample_id'][0]}_clean.wav")
-            # Try best to select a valid sampling rate from config or fallback
-            sample_rate = self.cfg.get('source_sample_rate', 16000)
-            src_audio_np = batch["source_audio"][0].detach().cpu().numpy()
-            sf.write(wav_path, src_audio_np, sample_rate)
-            print(f"Wrote batch 0 source_audio to {wav_path}")
+        # if self.cfg.get('debug', False):
+        #     import soundfile as sf
+        #     import os
+        #     output_dir = "/lustre/fsw/portfolios/llmservice/users/kevinhu/debug"
+        #     os.makedirs(output_dir, exist_ok=True)
+        #     wav_path = os.path.join(output_dir, f"{batch['sample_id'][0]}_clean.wav")
+        #     # Try best to select a valid sampling rate from config or fallback
+        #     sample_rate = self.cfg.get('source_sample_rate', 16000)
+        #     src_audio_np = batch["source_audio"][0].detach().cpu().numpy()
+        #     sf.write(wav_path, src_audio_np, sample_rate)
+        #     print(f"Wrote batch 0 source_audio to {wav_path}")
 
         # Apply augmentations in order: noise -> room IR -> mic IR -> codec
         # Each augmentation has its own independent condition and flag
@@ -455,17 +521,17 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                     codec_settings,
                 )
 
-        if self.cfg.get('debug', False):
-            import soundfile as sf
-            import os
-            output_dir = "/lustre/fsw/portfolios/llmservice/users/kevinhu/debug"
-            os.makedirs(output_dir, exist_ok=True)
-            wav_path = os.path.join(output_dir, f"{batch['sample_id'][0]}.wav")
-            sample_rate = self.cfg.get('source_sample_rate', 16000)
-            src_audio_np = batch["source_audio"][0].detach().cpu().numpy()
-            sf.write(wav_path, src_audio_np, sample_rate)
-            print(f"Wrote batch 0 source_audio to {wav_path}")
-            import pdb; pdb.set_trace()
+        # if self.cfg.get('debug', False):
+        #     import soundfile as sf
+        #     import os
+        #     output_dir = "/lustre/fsw/portfolios/llmservice/users/kevinhu/debug"
+        #     os.makedirs(output_dir, exist_ok=True)
+        #     wav_path = os.path.join(output_dir, f"{batch['sample_id'][0]}.wav")
+        #     sample_rate = self.cfg.get('source_sample_rate', 16000)
+        #     src_audio_np = batch["source_audio"][0].detach().cpu().numpy()
+        #     sf.write(wav_path, src_audio_np, sample_rate)
+        #     print(f"Wrote batch 0 source_audio to {wav_path}")
+        #     import pdb; pdb.set_trace()
 
         
         source_encoded, source_encoded_lens, asr_emb = self.perception(
@@ -538,12 +604,15 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
         if self.cfg.get("use_sil_token", False):
             target_tokens, sil_id = self._convert_pad_to_sil(target_tokens)
 
+        # Determine if ASR-related computation should be done for this batch
+        compute_asr_for_batch = self.predict_user_text and include_asr_loss
+
         inputs = prepare_labels(
             batch=batch,
             target_tokens=target_tokens,
             source_encoded=source_encoded,
             cfg=self.cfg,
-            predict_user_text=self.predict_user_text,
+            predict_user_text=compute_asr_for_batch,
             user_bos_id=self.user_bos_id,
             user_eos_id=self.user_eos_id,
             text_pad_id=self.text_pad_id,
@@ -557,14 +626,31 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
         source_encoded = inputs["source_encoded"]
         text_inputs = inputs["text_inputs"]
         text_labels = inputs["text_labels"]
-        if self.predict_user_text:
+        if compute_asr_for_batch:
             asr_inputs = inputs["asr_inputs"]
             asr_labels = inputs["asr_labels"]
 
+        # Embed agent text (LLM output channel)
         input_embeds = self.embed_tokens(text_inputs) * self.cfg.get("duplex_text_channel_weight", 1.0)
-        input_embeds.add_(source_encoded[:, :-1] * self.cfg.get("duplex_user_channel_weight", 1.0))
-        if self.predict_user_text:
+        
+        # Embed user text (ASR channel) if needed
+        asr_inputs_embeds = None
+        if compute_asr_for_batch:
             asr_inputs_embeds = self.embed_asr_tokens(asr_inputs) * self.cfg.get("duplex_asr_text_weight", 1.0)
+            
+            # Apply roll for tied embeddings to differentiate from agent text
+            if self.tie_and_roll_embed:
+                asr_inputs_embeds = torch.roll(asr_inputs_embeds, shifts=self.roll_shift, dims=-1)
+        
+        # Add channel embeddings if enabled (done via forward() for FSDP compatibility)
+        if self.use_channel_embeds:
+            input_embeds, asr_inputs_embeds = self.channel_embed_module(input_embeds, asr_inputs_embeds)
+        
+        # Add user audio channel
+        input_embeds.add_(source_encoded[:, :-1] * self.cfg.get("duplex_user_channel_weight", 1.0))
+        
+        # Add user text embeddings to pooled input
+        if compute_asr_for_batch:
             input_embeds.add_(asr_inputs_embeds)
 
         seq_mask = torch.ones_like(text_labels.unsqueeze(-1), device=self.device, dtype=torch.bool)
@@ -610,7 +696,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                     )
                 )
             loss_scale = self._maybe_zero_out_scale_for_asr(loss_scale, text_labels, batch)
-            if self.predict_user_text:
+            if compute_asr_for_batch:
                 asr_loss_scale = torch.where(
                     asr_labels.unsqueeze(-1) == self.text_pad_id, pad_weight,
                     torch.where(
@@ -629,8 +715,9 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             "text_labels": text_labels,
             "loss_scale": loss_scale,
             "seq_mask": seq_mask,
+            "compute_asr": compute_asr_for_batch,
         }
-        if self.predict_user_text:
+        if compute_asr_for_batch:
             ans["asr_labels"] = asr_labels
             ans["asr_loss_scale"] = asr_loss_scale
         return ans
@@ -644,15 +731,42 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             self.trainer.optimizers[0].param_groups[0]['lr'] if self._trainer is not None else 0)}
 
         if batch["audio_data"] is not None:
-            inputs = self.prepare_inputs(batch["audio_data"])
+            # Determine whether to include ASR loss for this batch
+            # ASR data (nemo_tarred_to_duplex) always includes ASR loss
+            # Other data includes ASR loss with probability predict_user_text_prob
+            # NOTE: The random decision MUST be synchronized across all ranks to avoid
+            # FSDP collective operation misalignment (which causes NCCL timeouts)
+            is_asr_data = batch["audio_data"]["formatter"][0] == 'nemo_tarred_to_duplex'
             
-            forward_outputs = self(inputs["input_embeds"])
+            if is_asr_data:
+                include_asr_loss = True
+            else:
+                # Synchronize random decision across all ranks
+                if dist.is_available() and dist.is_initialized():
+                    # Rank 0 makes the decision and broadcasts to all other ranks
+                    random_val = torch.tensor([random.random()], device=self.device)
+                    dist.broadcast(random_val, src=0)
+                    include_asr_loss = random_val.item() < self.predict_user_text_prob
+                else:
+                    include_asr_loss = random.random() < self.predict_user_text_prob
+            
+            # Track ASR loss inclusion stats
+            if self.predict_user_text:
+                self.asr_loss_batches_total += 1
+                if include_asr_loss:
+                    self.asr_loss_batches_included += 1
+
+            inputs = self.prepare_inputs(batch["audio_data"], include_asr_loss=include_asr_loss)
+            
+            # Pass compute_asr flag to forward
+            forward_outputs = self(inputs["input_embeds"], compute_asr=inputs["compute_asr"])
 
             num_frames = inputs["input_lens"].sum()
+            compute_asr = inputs["compute_asr"]
 
             with loss_parallel():
                 text_logits = forward_outputs["text_logits"]
-                if self.predict_user_text:
+                if compute_asr:
                     asr_logits = forward_outputs["asr_logits"]
 
                 if self.cfg.get("mask_sequence_loss", True):
@@ -666,7 +780,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                                     * inputs["loss_scale"][:, :, 0].flatten(0, 1)
                             ).sum(-1) / num_frames
 
-                if self.predict_user_text:
+                if compute_asr:
                     asr_loss = (
                         torch.nn.functional.cross_entropy(
                             asr_logits.flatten(0, 1),
@@ -698,7 +812,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
 
                 loss = self.cfg.text_loss_weight * text_loss
     
-                if self.predict_user_text:
+                if compute_asr:
                     loss = loss + self.cfg.get('asr_loss_weight', 1.0) * asr_loss
 
                 B, T = inputs["input_embeds"].shape[:2]
@@ -709,7 +823,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                     "length": T,
                     "token_accuracy": token_accuracy,
                 }
-                if self.predict_user_text:
+                if compute_asr:
                     ans["asr_loss"] = asr_loss
 
                 res.update(ans)
@@ -754,6 +868,24 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                 self.log("early_interruption_successful_ratio", 
                          self.early_interruption_successful / self.early_interruption_total,
                          on_step=True, sync_dist=True)
+
+        # Track MCQ delay stats
+        mcq_delay_stats = batch.get("mcq_delay_stats")
+        if mcq_delay_stats is not None:
+            self.mcq_delay_total_cuts += mcq_delay_stats["total_mcq_cuts"]
+            self.mcq_delay_total_actual += mcq_delay_stats["total_actual_delay"]
+            
+            if self.mcq_delay_total_cuts > 0:
+                # Log average actual delay per MCQ cut
+                self.log("mcq_avg_actual_delay", 
+                         self.mcq_delay_total_actual / self.mcq_delay_total_cuts,
+                         on_step=True, sync_dist=True)
+
+        # Track ASR loss inclusion stats
+        if self.predict_user_text and self.asr_loss_batches_total > 0:
+            self.log("asr_loss_inclusion_ratio", 
+                     self.asr_loss_batches_included / self.asr_loss_batches_total,
+                     on_step=True, sync_dist=True)
 
         self.log_dict(res, on_step=True)
 
@@ -1848,7 +1980,13 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             self.perception = fully_shard(self.perception, **fsdp_config)
             if self.predict_user_text:
                 self.asr_head = fully_shard(self.asr_head, **fsdp_config)
-                self.embed_asr_tokens = fully_shard(self.embed_asr_tokens, **fsdp_config)
+                # Skip sharding embed_asr_tokens if tied to embed_tokens (already sharded)
+                if not self.tie_and_roll_embed:
+                    self.embed_asr_tokens = fully_shard(self.embed_asr_tokens, **fsdp_config)
+            
+            # Shard channel embeddings module - computation happens inside forward() for FSDP compatibility
+            if self.use_channel_embeds:
+                self.channel_embed_module = fully_shard(self.channel_embed_module, **fsdp_config)
 
     def load_state_dict(self, state_dict, strict: bool = True):
         try:
