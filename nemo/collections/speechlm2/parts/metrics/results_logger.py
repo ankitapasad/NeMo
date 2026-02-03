@@ -105,7 +105,6 @@ class ResultsLogger:
             combined_wav = pred_audio.unsqueeze(0).detach().cpu()
             # Save agent-only if requested even when user is absent
             if agent_out_audio_path is not None:
-                # torchaudio.save(agent_out_audio_path, pred_audio.squeeze().unsqueeze(0).detach().cpu(), pred_audio_sr)
                 sf.write(agent_out_audio_path, pred_audio.squeeze().unsqueeze(0).detach().cpu().numpy().astype('float32').T, pred_audio_sr)
 
         # save audio
