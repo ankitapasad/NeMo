@@ -28,6 +28,79 @@ from nemo.collections.speechlm2.data.force_align import ForceAligner
 from nemo.collections.speechlm2.data.utils import get_pad_id
 from nemo.utils import logging
 
+import inflect
+import re
+
+_inflect = inflect.engine()
+
+_COMMA_RE    = re.compile(r"([0-9][0-9,]+[0-9])")
+_DECIMAL_RE  = re.compile(r"\b([0-9]+)\.([0-9]+)\b")
+_DOLLARS_RE  = re.compile(r"\$([0-9,]+(?:\.[0-9]+)?)")
+_ORDINAL_RE  = re.compile(r"\b([0-9]+)(st|nd|rd|th)\b", re.IGNORECASE)
+_NUMBER_RE   = re.compile(r"\b[0-9]+\b")
+
+# Roman numerals: only real standalone uppercase numerals
+_ROMAN_RE = re.compile(r"(?<![A-Z])[IVXLCDM]{2,}(?![A-Z])")
+
+_ROMAN = {"I":1,"V":5,"X":10,"L":50,"C":100,"D":500,"M":1000}
+
+
+def _roman_to_int(s):
+    total = 0
+    prev = 0
+    for c in reversed(s):
+        val = _ROMAN[c]
+        total += -val if val < prev else val
+        prev = val
+    return total
+
+def _remove_commas(m):
+    return m.group(1).replace(",", "")
+
+
+def _expand_decimal(m):
+    return f"{_expand_number(int(m.group(1)))} point {_expand_digits(m.group(2))}"
+
+
+def _expand_digits(s):
+    return " ".join(_inflect.number_to_words(int(c)) for c in s)
+
+def _expand_dollars(m):
+    raw = m.group(1).replace(",", "")
+    parts = raw.split(".")
+
+    dollars = int(parts[0])
+    cents = int(parts[1]) if len(parts) > 1 else 0
+
+    out = []
+    if dollars:
+        out.append(f"{_expand_number(dollars)} {'dollar' if dollars == 1 else 'dollars'}")
+    if cents:
+        out.append(f"{_expand_number(cents)} {'cent' if cents == 1 else 'cents'}")
+    return " ".join(out) if out else "zero dollars"
+
+def _expand_ordinal(m):
+    n = int(m.group(1))
+    return _inflect.ordinal(_inflect.number_to_words(n))
+
+def _expand_roman(m):
+    return _inflect.number_to_words(_roman_to_int(m.group()))
+
+def _expand_number(num):
+    return _inflect.number_to_words(num, andword="")
+
+def normalize_numbers(text):
+    try:
+        text = re.sub(_COMMA_RE, _remove_commas, text)
+        text = re.sub(_ROMAN_RE, _expand_roman, text)
+        text = re.sub(_DOLLARS_RE, _expand_dollars, text)
+        text = re.sub(_DECIMAL_RE, _expand_decimal, text)
+        text = re.sub(_ORDINAL_RE, _expand_ordinal, text)
+        text = re.sub(_NUMBER_RE, lambda m: _expand_number(int(m.group())), text)
+        return text
+
+    except Exception:
+        return text   # fallback: return input unchanged
 
 class DuplexS2SDataset(torch.utils.data.Dataset):
     """
@@ -166,6 +239,8 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
 
         self.cfg = cfg
         self.model_cfg = model_cfg
+
+        self.use_numbers_norm = model_cfg.get("use_numbers_norm", True) if model_cfg is not None else True
 
         # Initialize force aligner only when needed during training
         # This avoids loading the wav2vec2 model during validation
@@ -536,6 +611,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 remove_timestamps=True,
                 skip_eos=self.fix_eos_placements,
                 early_interruption_flag_from_cfg=self.early_interruption_prob > 0,
+                use_numbers_norm=self.use_numbers_norm,
             )
 
             # Run force alignment if enabled
@@ -901,6 +977,7 @@ def collate_token_channel(
     agent_token_channel_lengths: torch.Tensor = None,
     agent_eos_id: int = None,
     early_interruption_flag_from_cfg: bool = None,
+    use_numbers_norm: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     tokens = [
         build_token_channel(
@@ -919,6 +996,7 @@ def collate_token_channel(
                 agent_token_channel_lengths[cut_idx] if agent_token_channel_lengths is not None else None
             ),
             agent_eos_id=agent_eos_id,
+            use_numbers_norm=use_numbers_norm,
         )
         for cut_idx, c in enumerate(cuts)
     ]
@@ -973,6 +1051,7 @@ def build_token_channel(
     cut_agent_token_channel_length: torch.Tensor = None,
     eos_offset_frames: int = 8,
     agent_eos_id: int = None,
+    use_numbers_norm: bool = False,
 ) -> torch.Tensor:
     diagnostic = f"Extra info: {cut.id=}"
     if getattr(cut, "shard_origin", None) is not None:
@@ -1001,6 +1080,8 @@ def build_token_channel(
             available_frames_for_text = eospos - pos
 
             text = supervision.text
+            if use_numbers_norm:
+                text = normalize_numbers(text)
 
             # Use different bos_id for user and agent
             text_ids = torch.as_tensor(
