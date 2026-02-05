@@ -41,7 +41,7 @@ from nemo.collections.common.parts.nlp_overrides import NLPSaveRestoreConnector
 from nemo.collections.common.tokenizers import AutoTokenizer
 from nemo.collections.speechlm2.data.utils import get_pad_id
 from nemo.collections.speechlm2.models.duplex_s2s_model import tokens_to_str
-from nemo.collections.speechlm2.parts.augmentation import AudioAugmenter, DEFAULT_CODEC_SETTINGS
+from nemo.collections.speechlm2.parts.augmentation import DEFAULT_CODEC_SETTINGS, AudioAugmenter
 from nemo.collections.speechlm2.parts.hf_hub import HFHubMixin
 from nemo.collections.speechlm2.parts.label_prep import prepare_text_and_asr_labels
 from nemo.collections.speechlm2.parts.lora import maybe_install_lora
@@ -179,10 +179,12 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
         self._use_tp = False
 
         # Initialize audio augmenter if any augmentation is enabled
-        if (self.cfg.get('use_old_noise_aug', None) or 
-            self.cfg.get('use_room_ir_aug', None) or 
-            self.cfg.get('use_mic_ir_aug', None) or 
-            self.cfg.get('use_codec_aug', None)):
+        if (
+            self.cfg.get('use_old_noise_aug', None)
+            or self.cfg.get('use_room_ir_aug', None)
+            or self.cfg.get('use_mic_ir_aug', None)
+            or self.cfg.get('use_codec_aug', None)
+        ):
             self.audio_augmenter = AudioAugmenter(sample_rate=self.source_sample_rate)
 
         # Early interruption augmentation counters for cumulative logging
@@ -339,15 +341,19 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
     def prepare_inputs(self, batch: dict):
         # Apply augmentations in order: noise -> room IR -> mic IR -> codec
         # Each augmentation has its own independent condition and flag
-        
+
         # 1. Noise augmentation (controlled by use_old_noise_aug flag)
-        if self.cfg.get('use_old_noise_aug', None) and self.training and self._is_noise_augmentation_dataset(batch["formatter"][0]):
+        if (
+            self.cfg.get('use_old_noise_aug', None)
+            and self.training
+            and self._is_noise_augmentation_dataset(batch["formatter"][0])
+        ):
             noise_prob = self.cfg.get('old_noise_prob', 0.99)
             noise_min_snr = self.cfg.get('old_noise_min_snr', 20)
             noise_max_snr = self.cfg.get('old_noise_max_snr', 50)
             noise_path = self.cfg.get('old_noise_aug_path', None)
             noise_path_name = "*"
-            
+
             if noise_prob and random.random() < noise_prob and noise_path:
                 batch["source_audio"] = self.audio_augmenter.add_noise_to_batch(
                     batch["source_audio"],
@@ -360,12 +366,16 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                     noise_resample=self.cfg.get('noise_resample', True),
                     noise_prob_low_pass=self.cfg.get('noise_prob_low_pass', 0.1),
                 )
-        
+
         # 2. Room impulse response augmentation
-        if self.cfg.get('use_room_ir_aug', None) and self.training and self._is_noise_augmentation_dataset(batch["formatter"][0]):
+        if (
+            self.cfg.get('use_room_ir_aug', None)
+            and self.training
+            and self._is_noise_augmentation_dataset(batch["formatter"][0])
+        ):
             roomir_prob = self.cfg.get('roomir_prob', 0.0)
             roomir_path = self.cfg.get('roomir_aug_path', None)
-            
+
             if roomir_prob > 0 and roomir_path and random.random() < roomir_prob:
                 batch["source_audio"] = self.audio_augmenter.add_room_ir_to_batch(
                     batch["source_audio"],
@@ -373,12 +383,16 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                     roomir_path,
                     use_loudness_norm=self.cfg.get('roomir_use_loudness_norm', True),
                 )
-        
+
         # 3. Microphone impulse response augmentation
-        if self.cfg.get('use_mic_ir_aug', None) and self.training and self._is_noise_augmentation_dataset(batch["formatter"][0]):
+        if (
+            self.cfg.get('use_mic_ir_aug', None)
+            and self.training
+            and self._is_noise_augmentation_dataset(batch["formatter"][0])
+        ):
             micir_prob = self.cfg.get('micir_prob', 0.0)
             micir_path = self.cfg.get('micir_aug_path', None)
-            
+
             if micir_prob > 0 and micir_path and random.random() < micir_prob:
                 batch["source_audio"] = self.audio_augmenter.add_mic_ir_to_batch(
                     batch["source_audio"],
@@ -386,12 +400,16 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                     micir_path,
                     use_loudness_norm=self.cfg.get('micir_use_loudness_norm', True),
                 )
-        
+
         # 4. Codec augmentation
-        if self.cfg.get('use_codec_aug', None) and self.training and self._is_noise_augmentation_dataset(batch["formatter"][0]):
+        if (
+            self.cfg.get('use_codec_aug', None)
+            and self.training
+            and self._is_noise_augmentation_dataset(batch["formatter"][0])
+        ):
             codec_prob = self.cfg.get('codec_prob', 0.0)
             codec_settings = self.cfg.get('codec_settings', None)
-            
+
             if codec_prob > 0 and random.random() < codec_prob:
                 # Use custom codec settings if provided, otherwise use defaults
                 if codec_settings is None:

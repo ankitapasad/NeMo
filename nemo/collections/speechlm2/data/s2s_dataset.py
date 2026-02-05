@@ -14,6 +14,7 @@
 import random
 import re
 
+import inflect
 import torch
 import torch.utils.data
 import torchaudio
@@ -28,21 +29,18 @@ from nemo.collections.speechlm2.data.force_align import ForceAligner
 from nemo.collections.speechlm2.data.utils import get_pad_id
 from nemo.utils import logging
 
-import inflect
-import re
-
 _inflect = inflect.engine()
 
-_COMMA_RE    = re.compile(r"([0-9][0-9,]+[0-9])")
-_DECIMAL_RE  = re.compile(r"\b([0-9]+)\.([0-9]+)\b")
-_DOLLARS_RE  = re.compile(r"\$([0-9,]+(?:\.[0-9]+)?)")
-_ORDINAL_RE  = re.compile(r"\b([0-9]+)(st|nd|rd|th)\b", re.IGNORECASE)
-_NUMBER_RE   = re.compile(r"\b[0-9]+\b")
+_COMMA_RE = re.compile(r"([0-9][0-9,]+[0-9])")
+_DECIMAL_RE = re.compile(r"\b([0-9]+)\.([0-9]+)\b")
+_DOLLARS_RE = re.compile(r"\$([0-9,]+(?:\.[0-9]+)?)")
+_ORDINAL_RE = re.compile(r"\b([0-9]+)(st|nd|rd|th)\b", re.IGNORECASE)
+_NUMBER_RE = re.compile(r"\b[0-9]+\b")
 
 # Roman numerals: only real standalone uppercase numerals
 _ROMAN_RE = re.compile(r"(?<![A-Z])[IVXLCDM]{2,}(?![A-Z])")
 
-_ROMAN = {"I":1,"V":5,"X":10,"L":50,"C":100,"D":500,"M":1000}
+_ROMAN = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100, "D": 500, "M": 1000}
 
 
 def _roman_to_int(s):
@@ -54,6 +52,7 @@ def _roman_to_int(s):
         prev = val
     return total
 
+
 def _remove_commas(m):
     return m.group(1).replace(",", "")
 
@@ -64,6 +63,7 @@ def _expand_decimal(m):
 
 def _expand_digits(s):
     return " ".join(_inflect.number_to_words(int(c)) for c in s)
+
 
 def _expand_dollars(m):
     raw = m.group(1).replace(",", "")
@@ -79,15 +79,19 @@ def _expand_dollars(m):
         out.append(f"{_expand_number(cents)} {'cent' if cents == 1 else 'cents'}")
     return " ".join(out) if out else "zero dollars"
 
+
 def _expand_ordinal(m):
     n = int(m.group(1))
     return _inflect.ordinal(_inflect.number_to_words(n))
 
+
 def _expand_roman(m):
     return _inflect.number_to_words(_roman_to_int(m.group()))
 
+
 def _expand_number(num):
     return _inflect.number_to_words(num, andword="")
+
 
 def normalize_numbers(text):
     try:
@@ -100,7 +104,8 @@ def normalize_numbers(text):
         return text
 
     except Exception:
-        return text   # fallback: return input unchanged
+        return text  # fallback: return input unchanged
+
 
 class DuplexS2SDataset(torch.utils.data.Dataset):
     """
