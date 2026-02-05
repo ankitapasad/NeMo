@@ -74,6 +74,7 @@ def train(cfg):
         cfg=cfg.data,
         model_cfg=cfg.model,
         force_align_user_text=False,
+        early_interruption_prob=0.0,
     )
     datamodule = DataModule(cfg.data, tokenizer=model.tokenizer, dataset=train_dataset, val_dataset=val_dataset)
 

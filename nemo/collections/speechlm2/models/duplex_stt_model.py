@@ -181,6 +181,11 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
         if self.cfg.get('use_old_noise_aug', None):
             self._noise_files_cache = {}
             self._lowpass_filter_cache = {}  # Cache for lowpass filter coefficients
+        
+        # Early interruption augmentation counters for cumulative logging
+        self.early_interruption_total = 0
+        self.early_interruption_attempted = 0
+        self.early_interruption_successful = 0
 
     def init_perception_from_another_s2s_checkpoint(self, checkpoint_path):
         if checkpoint_path is not None:
@@ -713,6 +718,18 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             "audio_loss", 0.0
         ) + self.cfg.get('text_to_text_loss_weight', 0.0) * res.get("text_to_text_loss", 0.0)
         self.log_dict(res, on_step=True)
+        
+        # Track early interruption augmentation stats
+        early_interruption_stats = batch.get("early_interruption_stats")
+        if early_interruption_stats is not None:
+            self.early_interruption_total += early_interruption_stats["batch_total"]
+            self.early_interruption_attempted += early_interruption_stats["batch_attempted"]
+            self.early_interruption_successful += early_interruption_stats["batch_successful"]
+            
+            if self.early_interruption_total > 0:
+                self.log("early_interruption_successful_ratio", 
+                         self.early_interruption_successful / self.early_interruption_total,
+                         on_step=True, sync_dist=True)
 
         return res
 
