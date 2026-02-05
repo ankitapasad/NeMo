@@ -153,7 +153,8 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             self.force_align_user_text = model_cfg.get("force_align_user_text", False) if model_cfg is not None else False
         # Default to CPU for force alignment to avoid OOM during training/validation when main model is on GPU
         self.force_align_device = model_cfg.get("force_align_device", "cpu") if model_cfg is not None else "cpu"
-
+        self.fix_eos_placements = model_cfg.get("fix_eos_placements", True) if model_cfg is not None else True
+        
         self.cfg = cfg
         self.model_cfg = model_cfg
 
@@ -164,6 +165,15 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
 
         assert tokenizer.bos is not None, "BOS support in the tokenizer is required for S2S models."
         assert tokenizer.eos is not None, "EOS support in the tokenizer is required for S2S models."
+
+        user_bos_token = '^'
+        user_eos_token = '$'
+        
+        self.user_bos_id = self.tokenizer.text_to_ids(user_bos_token)[0]
+        self.user_eos_id = self.tokenizer.text_to_ids(user_eos_token)[0]
+        self.agent_bos_id = self.tokenizer.bos
+        self.agent_eos_id = self.tokenizer.eos
+        self.pad_id = get_pad_id(self.tokenizer)
 
     def _create_minimal_batch(self) -> dict:
         """Create a minimal valid batch when all cuts are filtered out."""
@@ -177,9 +187,9 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             "agent_bos_vad": None,
             "target_audio": torch.zeros((1, 22050), dtype=torch.float32),  # 1 second of silence at 22.05kHz
             "target_audio_lens": torch.tensor([22050], dtype=torch.long),
-            "target_tokens": torch.full((1, 50), self.tokenizer.pad_id, dtype=torch.long),
+            "target_tokens": torch.full((1, 50), self.pad_id, dtype=torch.long),
             "target_token_lens": torch.tensor([1], dtype=torch.long),
-            "source_tokens": torch.full((1, 50), self.tokenizer.pad_id, dtype=torch.long),
+            "source_tokens": torch.full((1, 50), self.pad_id, dtype=torch.long),
             "source_token_lens": torch.tensor([1], dtype=torch.long),
             "source_texts": [""],
             "target_texts": [""],
@@ -235,7 +245,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             else:
                 all_cuts_combined = cuts
 
-            prompt_tokens, prompt_token_lens = collate_system_prompt(all_cuts_combined, self.tokenizer)
+            prompt_tokens, prompt_token_lens = collate_system_prompt(all_cuts_combined, self.tokenizer, self.pad_id)
             source_audio, source_audio_lens = collate_audio(all_cuts_combined.resample(self.source_sample_rate))
             target_audio, target_audio_lens = collate_audio(
                 all_cuts_combined.resample(self.target_sample_rate), recording_field="target_audio"
@@ -244,11 +254,13 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             target_tokens, target_token_lens = collate_token_channel(
                 all_cuts_combined,
                 self.tokenizer,
+                self.pad_id,
                 self.frame_length,
                 roles=self.output_roles,
-                bos_id=self.tokenizer.bos,
-                eos_id=self.tokenizer.eos,
+                bos_id=self.agent_bos_id,
+                eos_id=self.agent_eos_id,
                 remove_timestamps=True,
+                skip_eos=self.fix_eos_placements,
             )
 
             # Run force alignment if enabled
@@ -276,12 +288,16 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             source_tokens, source_token_lens = collate_token_channel(
                 all_cuts_combined,
                 self.tokenizer,
+                self.pad_id,
                 self.frame_length,
                 roles=self.input_roles,
-                bos_id=self.tokenizer.text_to_ids('^')[0],
-                eos_id=self.tokenizer.text_to_ids('$')[0],
+                bos_id=self.user_bos_id,
+                eos_id=self.user_eos_id,
                 word_align_position=self.word_align_position,
                 remove_timestamps=not self.predict_user_text,
+                agent_token_channel=target_tokens if self.fix_eos_placements else None,
+                agent_token_channel_lengths=target_token_lens if self.fix_eos_placements else None,
+                agent_eos_id=self.agent_eos_id if self.fix_eos_placements else None,
             )
 
             try:
@@ -365,7 +381,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 text_tokens.append(text_ids)
                 text_token_lens.append(text_ids.shape[0])
 
-            text_tokens = collate_vectors(text_tokens, padding_value=get_pad_id(self.tokenizer))
+            text_tokens = collate_vectors(text_tokens, padding_value=self.pad_id)
             text_token_lens = torch.tensor(text_token_lens, dtype=torch.long)
             text_data = {
                 "text_tokens": text_tokens,
@@ -559,14 +575,18 @@ def collate_first_turn_audio(
 def collate_token_channel(
     cuts: CutSet,
     tokenizer: TokenizerSpec,
+    pad_id: int,
     frame_length: Seconds,
     roles: set[str],
     bos_id: int = None,
     eos_id: int = None,
     word_align_position: str = 'left',
     remove_timestamps: bool = False,
+    skip_eos: bool = False,
+    agent_token_channel: torch.Tensor = None,
+    agent_token_channel_lengths: torch.Tensor = None,
+    agent_eos_id: int = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    pad_id = get_pad_id(tokenizer)
     tokens = [
         build_token_channel(
             c,
@@ -578,8 +598,12 @@ def collate_token_channel(
             eos_id=eos_id,
             word_align_position=word_align_position,
             remove_timestamps=remove_timestamps,
+            skip_eos=skip_eos,
+            cut_agent_token_channel=agent_token_channel[cut_idx] if agent_token_channel is not None else None,
+            cut_agent_token_channel_length=agent_token_channel_lengths[cut_idx] if agent_token_channel_lengths is not None else None,
+            agent_eos_id=agent_eos_id,
         )
-        for c in cuts
+        for cut_idx, c in enumerate(cuts)
     ]
     token_lens = torch.tensor([len(tt) for tt in tokens])
     tokens = collate_vectors(tokens, padding_value=pad_id)
@@ -589,12 +613,12 @@ def collate_token_channel(
 def collate_system_prompt(
     cuts: CutSet,
     tokenizer: TokenizerSpec,
+    pad_id: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Collate system prompts from cuts.
     System prompts should be stored in cut.custom['system_prompt'].
     """
-    pad_id = get_pad_id(tokenizer)
     tokens = []
     for c in cuts:
         # Check if system prompt exists in custom field
@@ -624,6 +648,11 @@ def build_token_channel(
     eos_id: int = None,
     word_align_position: str = 'left',
     remove_timestamps: bool = False,
+    skip_eos: bool = False,
+    cut_agent_token_channel: torch.Tensor = None,
+    cut_agent_token_channel_length: torch.Tensor = None,
+    eos_offset_frames: int = 8,
+    agent_eos_id: int = None,
 ) -> torch.Tensor:
     diagnostic = f"Extra info: {cut.id=}"
     if getattr(cut, "shard_origin", None) is not None:
@@ -631,6 +660,12 @@ def build_token_channel(
 
     total = compute_num_frames(cut.duration, frame_length, cut.sampling_rate)
     tokens = torch.ones(total, dtype=torch.long) * pad_id
+    
+    if cut_agent_token_channel is not None:
+        if cut_agent_token_channel_length is None or cut_agent_token_channel_length.item() != total:
+            logging.error(f"Mismatch between agent token and source token lengths: {cut_agent_token_channel_length.item() if cut_agent_token_channel_length is not None else 'None'} != {total}")
+            return None
+
     for supervision in cut.supervisions:
         if supervision.speaker in roles:
 
@@ -677,11 +712,23 @@ def build_token_channel(
                 tokens[pos:endpos] = text_ids
             except Exception as e:
                 raise RuntimeError(f"{tokens.shape=} {pos=} {endpos=} {text_ids.shape=} {diagnostic}") from e
+            
+            if not skip_eos:
+                # Place EOS token - critical for turn-taking behavior
+                if cut_agent_token_channel is not None:
+                    # Place agent EOS as a function of user start time
+                    assert agent_eos_id is not None, "Agent EOS ID is not set"
+                    user_bospos = compute_num_frames(supervision.start, frame_length, cut.sampling_rate)
+                    agent_eospos = user_bospos + eos_offset_frames
+                    if agent_eospos < cut_agent_token_channel_length.item():
+                        cut_agent_token_channel[agent_eospos] = agent_eos_id
+                    else:
+                        logging.warning(f"Agent EOS position {agent_eospos} is out of bounds for agent token channel {cut_agent_token_channel.shape}")
 
-            # Place EOS token - critical for turn-taking behavior
-            if eospos < len(tokens) and eos_id is not None:
-                # Normal case: place EOS at the intended position
-                tokens[eospos] = eos_id
+                if eospos < len(tokens) and eos_id is not None:
+                    # Place user EOS
+                    # Normal case: place EOS at the intended position
+                    tokens[eospos] = eos_id
 
     return tokens
 
