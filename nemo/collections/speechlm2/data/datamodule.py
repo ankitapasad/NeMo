@@ -58,7 +58,13 @@ class DataModule(LightningDataModule):
             The data sampling is controlled by Lhotse samplers rather than the dataset.
     """
 
-    def __init__(self, cfg, tokenizer: TokenizerSpec, dataset: torch.utils.data.Dataset, val_dataset: torch.utils.data.Dataset = None) -> None:
+    def __init__(
+        self,
+        cfg,
+        tokenizer: TokenizerSpec,
+        dataset: torch.utils.data.Dataset,
+        val_dataset: torch.utils.data.Dataset = None,
+    ) -> None:
         super().__init__()
         self.cfg = cfg
         with open_dict(self.cfg):

@@ -151,12 +151,14 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         if force_align_user_text is not None:
             self.force_align_user_text = force_align_user_text
         else:
-            self.force_align_user_text = model_cfg.get("force_align_user_text", False) if model_cfg is not None else False
+            self.force_align_user_text = (
+                model_cfg.get("force_align_user_text", False) if model_cfg is not None else False
+            )
         # Default to CPU for force alignment to avoid OOM during training/validation when main model is on GPU
         self.force_align_device = model_cfg.get("force_align_device", "cpu") if model_cfg is not None else "cpu"
-        
+
         self.fix_eos_placements = model_cfg.get("fix_eos_placements", True) if model_cfg is not None else True
-        
+
         if early_interruption_prob is not None:
             self.early_interruption_prob = early_interruption_prob
         else:
@@ -175,7 +177,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
 
         user_bos_token = '^'
         user_eos_token = '$'
-        
+
         self.user_bos_id = self.tokenizer.text_to_ids(user_bos_token)[0]
         self.user_eos_id = self.tokenizer.text_to_ids(user_eos_token)[0]
         self.agent_bos_id = self.tokenizer.bos
@@ -213,18 +215,19 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
 
     def _save_audacity_labels(self, target_tokens, batch_idx, suffix, debug_dir, frame_length, bos_id, eos_id, pad_id):
         """Save tokens as Audacity label track (.txt format).
-        
+
         To use in Audacity:
         1. Open the corresponding .wav file
         2. File -> Import -> Labels
         3. Select the _labels.txt file
         """
         import os
+
         os.makedirs(debug_dir, exist_ok=True)
-        
+
         tokens = target_tokens[batch_idx].cpu().tolist()
         label_path = f"{debug_dir}/batch{batch_idx}_{suffix}_labels.txt"
-        
+
         with open(label_path, 'w') as f:
             for i, tok in enumerate(tokens):
                 if tok == pad_id:
@@ -233,18 +236,18 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                     continue
                 start_time = i * frame_length
                 end_time = (i + 1) * frame_length
-                
+
                 if tok == bos_id:
                     label = "BOS"
                 elif tok == eos_id:
                     label = "EOS"
                 else:
                     label = f"{tok}"
-                
+
                 f.write(f"{start_time:.4f}\t{end_time:.4f}\t{label}\n")
-        
+
         print(f"Saved Audacity labels: {label_path}")
-        
+
     def _apply_early_interruption_augmentation(
         self,
         target_tokens: torch.Tensor,
@@ -259,14 +262,14 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         identifier: str,
     ) -> bool:
         """Simulate early interruption by randomly truncating an agent turn with overlap.
-        
+
         Creates a realistic interruption scenario where:
         1. User starts interrupting at cutoff_pos (user BOS inserted in source_tokens)
-        2. Agent continues speaking for overlap_tokens (640 milliseconds) 
+        2. Agent continues speaking for overlap_tokens (640 milliseconds)
         3. Agent stops at cutoff_pos + overlap_tokens (agent EOS placed here)
-        
+
         This creates an overlap period where both speakers are talking simultaneously.
-        
+
         Returns:
             bool: True if augmentation was successfully applied, False otherwise.
         """
@@ -276,73 +279,89 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
 
         # Save 2-channel audio before modification
         if self.model_cfg is not None and self.model_cfg.get("debug", False):
-            import torchaudio
             import os
-            debug_dir = self.model_cfg.get("debug_dir", "/tmp/ei_debug") if self.model_cfg is not None else "/tmp/ei_debug"
+
+            import torchaudio
+
+            debug_dir = (
+                self.model_cfg.get("debug_dir", "/tmp/ei_debug") if self.model_cfg is not None else "/tmp/ei_debug"
+            )
             os.makedirs(debug_dir, exist_ok=True)
             if identifier is not None:
                 audio_identity = identifier
             else:
                 audio_identity = random.randint(1, 1000)
-            
+
             # Get actual lengths
             src_len = source_audio_lens[batch_idx].item()
             tgt_len = target_audio_lens[batch_idx].item()
             max_len = max(src_len, tgt_len)
-            
+
             # Create 2-channel audio: [source, target]
             src_audio_before = source_audio[batch_idx, :max_len].clone().cpu()
             tgt_audio_before = target_audio[batch_idx, :max_len].clone().cpu()
             stereo_before = torch.stack([src_audio_before, tgt_audio_before], dim=0)  # (2, T)
-            
+
             # Normalize to prevent clipping
             if stereo_before.abs().max() > 0:
                 stereo_before = stereo_before / stereo_before.abs().max() * 0.9
-            
+
             sample_rate = int(self.source_sample_rate)  # Assuming same for both
-            torchaudio.save(
-                f"{debug_dir}/batch{batch_idx}_BEFORE_{audio_identity}.wav",
-                stereo_before,
-                sample_rate
+            torchaudio.save(f"{debug_dir}/batch{batch_idx}_BEFORE_{audio_identity}.wav", stereo_before, sample_rate)
+            self._save_audacity_labels(
+                target_tokens,
+                batch_idx,
+                f"BEFORE_target_{audio_identity}",
+                debug_dir,
+                self.frame_length,
+                bos_id,
+                eos_id,
+                pad_id,
             )
-            self._save_audacity_labels(target_tokens, batch_idx, f"BEFORE_target_{audio_identity}", debug_dir, self.frame_length, bos_id, eos_id, pad_id)
-            self._save_audacity_labels(source_tokens, batch_idx, f"BEFORE_source_{audio_identity}", debug_dir, self.frame_length, self.user_bos_id, self.user_eos_id, pad_id)
+            self._save_audacity_labels(
+                source_tokens,
+                batch_idx,
+                f"BEFORE_source_{audio_identity}",
+                debug_dir,
+                self.frame_length,
+                self.user_bos_id,
+                self.user_eos_id,
+                pad_id,
+            )
 
         target_seq = target_tokens[batch_idx]
 
         # Overlap period: 640 milliseconds = 8 tokens (80ms per token)
         overlap_tokens = self.cfg.get("early_interruption_overlap_tokens", 8) if self.cfg is not None else 8
-        
+
         bos_positions = (target_seq == bos_id).nonzero(as_tuple=True)[0]
         eos_positions = (target_seq == eos_id).nonzero(as_tuple=True)[0]
-        
+
         if len(bos_positions) == 0 or len(eos_positions) == 0:
             return False
-        
+
         # Find all complete turns
         turns = []
         for bos_pos in bos_positions:
             matching_eos = eos_positions[eos_positions > bos_pos]
             if len(matching_eos) > 0:
                 eos_pos = matching_eos[0]
-                turn_tokens = target_seq[bos_pos+1:eos_pos]
+                turn_tokens = target_seq[bos_pos + 1 : eos_pos]
                 non_pad_mask = turn_tokens != pad_id
                 all_non_pad_positions = (bos_pos + 1 + non_pad_mask.nonzero(as_tuple=True)[0]).tolist()
-                
+
                 # Filter out positions in the last overlap_tokens before eos to ensure overlap
                 # Only keep positions where there's at least overlap_tokens of content remaining
                 non_pad_positions = [pos for pos in all_non_pad_positions if (eos_pos - pos) > overlap_tokens]
-                
+
                 if len(non_pad_positions) > 0:
-                    turns.append({
-                        'bos_pos': bos_pos.item(),
-                        'eos_pos': eos_pos.item(),
-                        'non_pad_positions': non_pad_positions
-                    })
-        
+                    turns.append(
+                        {'bos_pos': bos_pos.item(), 'eos_pos': eos_pos.item(), 'non_pad_positions': non_pad_positions}
+                    )
+
         if len(turns) == 0:
             return False
-        
+
         # Randomly select one turn and cutoff position
         selected_turn = random.choice(turns)
         cutoff_pos = random.choice(selected_turn['non_pad_positions'])
@@ -352,21 +371,25 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             print(f"batch_idx {batch_idx}, selected_turn: {selected_turn}")
             print(f"original_eos_pos: {original_eos_pos}")
             print(f"cutoff_pos: {cutoff_pos}")
-            print(f"tokens from cutoff_pos to original_eos_pos: {target_tokens[batch_idx][cutoff_pos:original_eos_pos]}")
-        
+            print(
+                f"tokens from cutoff_pos to original_eos_pos: {target_tokens[batch_idx][cutoff_pos:original_eos_pos]}"
+            )
+
         # Agent stops at cutoff_pos + overlap_tokens to create overlap period
         new_eos_pos = min(cutoff_pos + overlap_tokens, original_eos_pos)
         frames_to_remove = original_eos_pos - cutoff_pos
         if frames_to_remove <= 0:
             return False
-        
+
         # Update target_tokens: place eos at new_eos_pos, shift tail, pad at end
         target_tokens[batch_idx, new_eos_pos] = eos_id
         seq_len = target_tokens.shape[1]
         cont_start_pos = original_eos_pos + overlap_tokens
         tail_length = seq_len - (cont_start_pos + 1)
         if tail_length > 0:
-            target_tokens[batch_idx, new_eos_pos+1:new_eos_pos+1+tail_length] = target_tokens[batch_idx, cont_start_pos+1:cont_start_pos+1+tail_length].clone()
+            target_tokens[batch_idx, new_eos_pos + 1 : new_eos_pos + 1 + tail_length] = target_tokens[
+                batch_idx, cont_start_pos + 1 : cont_start_pos + 1 + tail_length
+            ].clone()
         target_tokens[batch_idx, -frames_to_remove:] = pad_id
         target_token_lens[batch_idx] -= frames_to_remove
 
@@ -374,59 +397,84 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         source_seq_len = source_tokens.shape[1]
         source_tail_length = source_seq_len - (original_eos_pos + 1)
         if source_tail_length > 0:
-            source_tokens[batch_idx, cutoff_pos+1:cutoff_pos+1+source_tail_length] = source_tokens[batch_idx, original_eos_pos+1:original_eos_pos+1+source_tail_length].clone()
+            source_tokens[batch_idx, cutoff_pos + 1 : cutoff_pos + 1 + source_tail_length] = source_tokens[
+                batch_idx, original_eos_pos + 1 : original_eos_pos + 1 + source_tail_length
+            ].clone()
         source_tokens[batch_idx, -frames_to_remove:] = pad_id
         source_token_lens[batch_idx] -= frames_to_remove
-        
+
         # Update audio: shift and pad with silence
         old_target_len = target_audio_lens[batch_idx].item()
         old_source_len = source_audio_lens[batch_idx].item()
         if old_target_len != old_source_len:
             logging.warning(f"old_target_len != old_source_len: {old_target_len} != {old_source_len}")
-        assert self.target_sample_rate == self.source_sample_rate, "This function assumes target and source sample rates are the same"
+        assert (
+            self.target_sample_rate == self.source_sample_rate
+        ), "This function assumes target and source sample rates are the same"
         old_conv_audio_len = min(old_target_len, old_source_len)
 
-        new_eos_sample = min(int((new_eos_pos+1) * self.frame_length * self.target_sample_rate), old_conv_audio_len)
-        original_eos_sample = min(int((original_eos_pos+1) * self.frame_length * self.target_sample_rate), old_conv_audio_len)
-        cont_start_sample = min(int((cont_start_pos+1) * self.frame_length * self.target_sample_rate), old_conv_audio_len)
-        cutoff_sample = min(int((cutoff_pos+1) * self.frame_length * self.source_sample_rate), old_conv_audio_len)
-        
+        new_eos_sample = min(int((new_eos_pos + 1) * self.frame_length * self.target_sample_rate), old_conv_audio_len)
+        original_eos_sample = min(
+            int((original_eos_pos + 1) * self.frame_length * self.target_sample_rate), old_conv_audio_len
+        )
+        cont_start_sample = min(
+            int((cont_start_pos + 1) * self.frame_length * self.target_sample_rate), old_conv_audio_len
+        )
+        cutoff_sample = min(int((cutoff_pos + 1) * self.frame_length * self.source_sample_rate), old_conv_audio_len)
+
         samples_to_remove = original_eos_sample - cutoff_sample
-        
+
         # Update target audio: shift and pad with silence
         tail_audio_length = old_conv_audio_len - cont_start_sample
         if tail_audio_length > 0:
-            target_audio[batch_idx, new_eos_sample:new_eos_sample+tail_audio_length] = target_audio[batch_idx, cont_start_sample:old_conv_audio_len].clone()
-        
+            target_audio[batch_idx, new_eos_sample : new_eos_sample + tail_audio_length] = target_audio[
+                batch_idx, cont_start_sample:old_conv_audio_len
+            ].clone()
+
         if new_eos_sample + tail_audio_length < target_audio.shape[1]:
-            target_audio[batch_idx, new_eos_sample+tail_audio_length:new_eos_sample+tail_audio_length+samples_to_remove] = 0
+            target_audio[
+                batch_idx, new_eos_sample + tail_audio_length : new_eos_sample + tail_audio_length + samples_to_remove
+            ] = 0
         target_audio_lens[batch_idx] = old_conv_audio_len - samples_to_remove
-        
+
         # Update source_audio: shift and pad with silence
         source_tail_audio_length = old_conv_audio_len - original_eos_sample
         if source_tail_audio_length > 0:
-            source_audio[batch_idx, cutoff_sample:cutoff_sample+source_tail_audio_length] = source_audio[batch_idx, original_eos_sample:old_conv_audio_len].clone()
-        
+            source_audio[batch_idx, cutoff_sample : cutoff_sample + source_tail_audio_length] = source_audio[
+                batch_idx, original_eos_sample:old_conv_audio_len
+            ].clone()
+
         if cutoff_sample + source_tail_audio_length < source_audio.shape[1]:
-            source_audio[batch_idx, cutoff_sample+source_tail_audio_length:cutoff_sample+source_tail_audio_length+samples_to_remove] = 0
+            source_audio[
+                batch_idx,
+                cutoff_sample
+                + source_tail_audio_length : cutoff_sample
+                + source_tail_audio_length
+                + samples_to_remove,
+            ] = 0
         source_audio_lens[batch_idx] = old_conv_audio_len - samples_to_remove
-        
+
         # Save 2-channel audio and target_tokens after modification
         if self.model_cfg is not None and self.model_cfg.get("debug", False):
-            src_audio_after = source_audio[batch_idx, :source_audio_lens[batch_idx].item()].clone().cpu()
-            tgt_audio_after = target_audio[batch_idx, :target_audio_lens[batch_idx].item()].clone().cpu()
+            src_audio_after = source_audio[batch_idx, : source_audio_lens[batch_idx].item()].clone().cpu()
+            tgt_audio_after = target_audio[batch_idx, : target_audio_lens[batch_idx].item()].clone().cpu()
             stereo_after = torch.stack([src_audio_after, tgt_audio_after], dim=0)  # (2, T)
-            
+
             if stereo_after.abs().max() > 0:
                 stereo_after = stereo_after / stereo_after.abs().max() * 0.9
-            
-            torchaudio.save(
-                f"{debug_dir}/batch{batch_idx}_AFTER_{audio_identity}.wav",
-                stereo_after,
-                sample_rate
-            )
+
+            torchaudio.save(f"{debug_dir}/batch{batch_idx}_AFTER_{audio_identity}.wav", stereo_after, sample_rate)
             print(f"Saved debug audio to {debug_dir}/batch{batch_idx}_*.wav")
-            self._save_audacity_labels(target_tokens[:target_token_lens[batch_idx].item()], batch_idx, f"AFTER_target_{audio_identity}", debug_dir, self.frame_length, bos_id, eos_id, pad_id)
+            self._save_audacity_labels(
+                target_tokens[: target_token_lens[batch_idx].item()],
+                batch_idx,
+                f"AFTER_target_{audio_identity}",
+                debug_dir,
+                self.frame_length,
+                bos_id,
+                eos_id,
+                pad_id,
+            )
         return True
 
     def __getitem__(self, all_cuts: CutSet) -> dict:
@@ -526,7 +574,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 agent_token_channel_lengths=target_token_lens if self.fix_eos_placements else None,
                 agent_eos_id=self.agent_eos_id if self.fix_eos_placements else None,
             )
-            
+
             # Early interruption augmentation
             batch_early_interruption_total = 0
             batch_early_interruption_attempted = 0
@@ -544,9 +592,16 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                             else:
                                 identifier = None
                             success = self._apply_early_interruption_augmentation(
-                                target_tokens, target_audio, target_token_lens, target_audio_lens,
-                                source_tokens, source_audio, source_token_lens, source_audio_lens,
-                                batch_idx, identifier
+                                target_tokens,
+                                target_audio,
+                                target_token_lens,
+                                target_audio_lens,
+                                source_tokens,
+                                source_audio,
+                                source_token_lens,
+                                source_audio_lens,
+                                batch_idx,
+                                identifier,
                             )
                             if success:
                                 batch_early_interruption_successful += 1
@@ -587,7 +642,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 "formatter": [getattr(cut, "formatter", "s2s_duplex") for cut in all_cuts_combined],
                 "aug_by_noise": [getattr(cut, "aug_by_noise", True) for cut in all_cuts_combined],
             }
-            
+
             # Per-batch early interruption stats for logging (model accumulates for cumulative)
             early_interruption_stats = {
                 "batch_total": batch_early_interruption_total,
@@ -860,7 +915,9 @@ def collate_token_channel(
             remove_timestamps=remove_timestamps,
             skip_eos=skip_eos,
             cut_agent_token_channel=agent_token_channel[cut_idx] if agent_token_channel is not None else None,
-            cut_agent_token_channel_length=agent_token_channel_lengths[cut_idx] if agent_token_channel_lengths is not None else None,
+            cut_agent_token_channel_length=(
+                agent_token_channel_lengths[cut_idx] if agent_token_channel_lengths is not None else None
+            ),
             agent_eos_id=agent_eos_id,
         )
         for cut_idx, c in enumerate(cuts)
@@ -923,10 +980,12 @@ def build_token_channel(
 
     total = compute_num_frames(cut.duration, frame_length, cut.sampling_rate)
     tokens = torch.ones(total, dtype=torch.long) * pad_id
-    
+
     if cut_agent_token_channel is not None:
         if cut_agent_token_channel_length is None or cut_agent_token_channel_length.item() != total:
-            logging.error(f"Mismatch between agent token and source token lengths: {cut_agent_token_channel_length.item() if cut_agent_token_channel_length is not None else 'None'} != {total}")
+            logging.error(
+                f"Mismatch between agent token and source token lengths: {cut_agent_token_channel_length.item() if cut_agent_token_channel_length is not None else 'None'} != {total}"
+            )
             return None
 
     for supervision in cut.supervisions:
@@ -975,7 +1034,7 @@ def build_token_channel(
                 tokens[pos:endpos] = text_ids
             except Exception as e:
                 raise RuntimeError(f"{tokens.shape=} {pos=} {endpos=} {text_ids.shape=} {diagnostic}") from e
-            
+
             if not skip_eos:
                 # Place EOS token - critical for turn-taking behavior
                 if cut_agent_token_channel is not None:
@@ -986,7 +1045,9 @@ def build_token_channel(
                     if agent_eospos < cut_agent_token_channel_length.item():
                         cut_agent_token_channel[agent_eospos] = agent_eos_id
                     else:
-                        logging.warning(f"Agent EOS position {agent_eospos} is out of bounds for agent token channel {cut_agent_token_channel.shape}")
+                        logging.warning(
+                            f"Agent EOS position {agent_eospos} is out of bounds for agent token channel {cut_agent_token_channel.shape}"
+                        )
 
                 if eospos < len(tokens) and eos_id is not None:
                     # Place user EOS
