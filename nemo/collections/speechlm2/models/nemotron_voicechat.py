@@ -404,6 +404,7 @@ class NemotronVoiceChat(LightningModule, HFHubMixin):
                     pred_audio_sr=self.target_sample_rate,
                     user_audio=dataset_batch["source_audio"],
                     user_audio_sr=self.source_sample_rate,
+                    audio_lens=dataset_batch["source_audio_lens"] + input_pad_len,
                     eou_pred=(
                         results["gen_eou"]
                         if "gen_eou" in results

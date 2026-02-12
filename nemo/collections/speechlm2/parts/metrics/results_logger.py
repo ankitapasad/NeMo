@@ -123,6 +123,7 @@ class ResultsLogger:
         pred_audio_sr: int,
         user_audio: torch.Tensor,
         user_audio_sr: int,
+        audio_lens: torch.Tensor = None,
         target_audio: torch.Tensor = None,
         pred_audio_tf: torch.Tensor = None,
         pre_audio_trimmed: torch.Tensor = None,
@@ -141,11 +142,23 @@ class ResultsLogger:
             out_audio_path = os.path.join(self.audio_save_path, f"{name}_{sample_id}.wav")
             agent_out_audio_path = os.path.join(self.agent_audio_save_path, f"{name}_{sample_id}.wav")
             user_out_audio_path = os.path.join(self.user_audio_save_path, f"{name}_{sample_id}.wav")
+
+            # Trim batch-padded audio to per-sample actual length to remove
+            # trailing silence introduced by batching samples of different lengths.
+            cur_user_audio = user_audio[i] if user_audio is not None else None
+            cur_pred_audio = pred_audio[i]
+            if audio_lens is not None and cur_user_audio is not None:
+                actual_user_len = int(audio_lens[i].item())
+                cur_user_audio = cur_user_audio[:actual_user_len]
+                # Trim pred_audio to the equivalent duration (resampled to pred SR)
+                actual_pred_len = int(actual_user_len / user_audio_sr * pred_audio_sr)
+                cur_pred_audio = cur_pred_audio[:actual_pred_len]
+
             self.merge_and_save_audio(
                 out_audio_path,
-                pred_audio[i],
+                cur_pred_audio,
                 pred_audio_sr,
-                user_audio[i] if user_audio is not None else None,
+                cur_user_audio,
                 user_audio_sr,
                 agent_out_audio_path=agent_out_audio_path,
                 user_out_audio_path=user_out_audio_path,
