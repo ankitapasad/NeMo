@@ -43,6 +43,7 @@ from nemo.collections.nlp.parts.nlp_overrides import NLPSaveRestoreConnector
 from nemo.collections.speechlm2.data.utils import get_pad_id
 from nemo.collections.speechlm2.models.duplex_s2s_model import tokens_to_str
 from nemo.collections.speechlm2.parts.augmentation import AudioAugmenter, DEFAULT_CODEC_SETTINGS
+from nemo.collections.speechlm2.parts.fusion import create_fusion_module
 from nemo.collections.speechlm2.parts.hf_hub import HFHubMixin
 from nemo.collections.speechlm2.parts.label_prep import prepare_labels
 from nemo.collections.speechlm2.parts.lora import maybe_install_lora
@@ -109,10 +110,26 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
         self.predict_user_text_prob = self.cfg.get("predict_user_text_prob", 1.0)
         
         # Embedding variants for differentiating agent vs user text channels
-        # These are mutually exclusive
+        # These are mutually exclusive with each other, and are bypassed for gated fusion methods
         self.tie_and_roll_embed = self.cfg.get("tie_and_roll_embed", False)
         self.roll_shift = self.cfg.get("roll_shift", 100)
         self.use_channel_embeds = self.cfg.get("use_channel_embeds", False)
+        
+        # Fusion method for combining multi-modal embeddings
+        # Options: "add", "concat", "gated_simple", "gated_gmu"
+        self.fuse_method = self.cfg.get("fuse_method", "add")
+        
+        # For gated methods, bypass channel embeddings and tie_and_roll
+        self._use_learned_gating = self.fuse_method in ("gated_simple", "gated_gmu")
+        if self._use_learned_gating:
+            if self.tie_and_roll_embed:
+                logging.warning("fuse_method='%s' overrides tie_and_roll_embed. "
+                                "Gating mechanism will handle channel differentiation.", self.fuse_method)
+                self.tie_and_roll_embed = False
+            if self.use_channel_embeds:
+                logging.warning("fuse_method='%s' overrides use_channel_embeds. "
+                                "Gating mechanism will handle channel differentiation.", self.fuse_method)
+                self.use_channel_embeds = False
         
         if self.tie_and_roll_embed and self.use_channel_embeds:
             raise ValueError("tie_and_roll_embed and channel_embeds are mutually exclusive")
@@ -182,6 +199,16 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             # Wrap in nn.Module so it can be FSDP-sharded (avoids DTensor/Tensor mixing)
             self.channel_embed_module = ChannelEmbeddings(hidden_dim)
             logging.info(f"Created channel embeddings with hidden_dim={hidden_dim}")
+
+        # Create fusion module for combining multi-modal embeddings
+        hidden_dim = self.embed_tokens.weight.shape[1]
+        self.fusion_module = create_fusion_module(
+            fuse_method=self.fuse_method,
+            hidden_dim=hidden_dim,
+            agent_text_weight=self.cfg.get("duplex_text_channel_weight", 1.0),
+            user_audio_weight=self.cfg.get("duplex_user_channel_weight", 1.0),
+            user_text_weight=self.cfg.get("duplex_asr_text_weight", 1.0),
+        )
 
         maybe_install_lora(self)
 
@@ -398,8 +425,12 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                                       batch: dict) -> torch.Tensor:
         """
         Zero out the loss scale after text_bos_id token for ASR datasets.
+        When filler responses have been injected, skip zeroing so that
+        the normal token-level loss weights apply (only pad regions masked).
         """
         if batch['formatter'][0] == 'nemo_tarred_to_duplex':
+            if batch.get('has_filler_response', False):
+                return loss_scale
             for i in range(text_labels.shape[0]):
                 bos_indices = (text_labels[i] == self.text_bos_id).nonzero(as_tuple=True)
                 if bos_indices[0].numel() > 0:
@@ -631,22 +662,26 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             asr_labels = inputs["asr_labels"]
 
         # Embed agent text (LLM output channel)
-        input_embeds = self.embed_tokens(text_inputs) * self.cfg.get("duplex_text_channel_weight", 1.0)
+        # Note: For gated fusion, weights are handled by the fusion module
+        agent_text_embeds = self.embed_tokens(text_inputs)
         
         # Embed user text (ASR channel) if needed
-        asr_inputs_embeds = None
+        user_text_embeds = None
         if compute_asr_for_batch:
-            asr_inputs_embeds = self.embed_asr_tokens(asr_inputs) * self.cfg.get("duplex_asr_text_weight", 1.0)
+            user_text_embeds = self.embed_asr_tokens(asr_inputs)
         
-        # Apply tie_and_roll and channel_embeds transformations
-        input_embeds, asr_inputs_embeds = self._apply_embedding_transformations(input_embeds, asr_inputs_embeds)
+        # Apply tie_and_roll and channel_embeds transformations (skipped for gated fusion)
+        agent_text_embeds, user_text_embeds = self._apply_embedding_transformations(agent_text_embeds, user_text_embeds)
         
-        # Add user audio channel
-        input_embeds.add_(source_encoded[:, :-1] * self.cfg.get("duplex_user_channel_weight", 1.0))
+        # User audio channel (note: source_encoded[:, :-1] to align with text inputs)
+        user_audio_embeds = source_encoded[:, :-1]
         
-        # Add user text embeddings to pooled input
-        if compute_asr_for_batch:
-            input_embeds.add_(asr_inputs_embeds)
+        # Fuse all modalities using the configured fusion method
+        input_embeds = self.fusion_module(
+            agent_text_embeds=agent_text_embeds,
+            user_audio_embeds=user_audio_embeds,
+            user_text_embeds=user_text_embeds,
+        )
 
         seq_mask = torch.ones_like(text_labels.unsqueeze(-1), device=self.device, dtype=torch.bool)
 
@@ -691,6 +726,9 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                     )
                 )
             loss_scale = self._maybe_zero_out_scale_for_asr(loss_scale, text_labels, batch)
+            # Re-apply seq_mask to ensure positions beyond target_token_lens are zeroed
+            # (token_loss_weight torch.where overwrites the original seq_mask zeroing)
+            loss_scale = loss_scale * seq_mask.float()
             if compute_asr_for_batch:
                 asr_loss_scale = torch.where(
                     asr_labels.unsqueeze(-1) == self.text_pad_id, pad_weight,
@@ -764,8 +802,8 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                 if compute_asr:
                     asr_logits = forward_outputs["asr_logits"]
 
-                if self.cfg.get("mask_sequence_loss", True):
-                    text_logits = text_logits * inputs["seq_mask"][:, :, 0].unsqueeze(-1)
+                # if self.cfg.get("mask_sequence_loss", True):
+                #     text_logits = text_logits * inputs["seq_mask"][:, :, 0].unsqueeze(-1)
 
                 text_loss = (torch.nn.functional.cross_entropy(
                                         text_logits.flatten(0, 1),
@@ -1445,8 +1483,11 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
         else:
             T = T_local
 
-        input_embeds = source_encoded.clone()
-        input_embeds *= self.cfg.get("duplex_user_channel_weight", 1.0)
+        # Store audio embeddings separately for use with fusion module
+        audio_embeds = source_encoded.clone()
+        
+        # Initialize input_embeds - will be populated using fusion
+        input_embeds = torch.zeros_like(audio_embeds)
 
         use_cache = True
         if 'Nemotron' in self.cfg.pretrained_llm:
@@ -1471,19 +1512,21 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                     if self.predict_user_text:
                         gen_asr[i, :prompt_len] = self.text_pad_id    
 
-        # Get BOS embeddings and apply channel differentiation transformations
-        bos_embed = self._get_bos_embedding() * self.cfg.get("duplex_text_channel_weight", 1.0)
+        # Get BOS embeddings
+        bos_embed = self._get_bos_embedding()  # (1, D)
         asr_bos_embed = None
         if self.predict_user_text:
-            asr_bos_embed = self._get_asr_bos_embedding() * self.cfg.get("duplex_asr_text_weight", 1.0)
+            asr_bos_embed = self._get_asr_bos_embedding()  # (1, D)
         
-        # Apply tie_and_roll and channel_embeds transformations for train/inference consistency
+        # Apply tie_and_roll and channel_embeds transformations (skipped for gated fusion)
         bos_embed, asr_bos_embed = self._apply_embedding_transformations(bos_embed, asr_bos_embed)
         
-        # Add transformed embeddings to position 0
-        input_embeds[:, 0] += bos_embed.squeeze(0)
-        if self.predict_user_text and asr_bos_embed is not None:
-            input_embeds[:, 0] += asr_bos_embed.squeeze(0)
+        # Apply fusion at position 0
+        input_embeds[:, 0:1] = self.fusion_module(
+            agent_text_embeds=bos_embed.unsqueeze(0).expand(B, 1, -1),
+            user_audio_embeds=audio_embeds[:, 0:1],
+            user_text_embeds=asr_bos_embed.unsqueeze(0).expand(B, 1, -1) if asr_bos_embed is not None else None,
+        )
 
         start_gen_pos = 0
         if prompt_token_lens is not None:
@@ -1502,6 +1545,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             "input_signal": input_signal,
             "input_signal_lens": input_signal_lens,
             "asr_emb": asr_emb,
+            "audio_embeds": audio_embeds,  # Store audio separately for fusion
             "lengths": lengths,
             "B": B,
             "T": T,
@@ -1579,31 +1623,37 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
 
     def _step_inference(self, t, inference_state, ans, force_bos_positions):
         """Perform inference for one step t in the autoregressive loop."""
-        # Get agent text embedding for the previous token
-        last_agent_emb = self.embed_tokens(inference_state["gen_text"][:, t - 1]) * self.cfg.get("duplex_text_channel_weight", 1.0)
+        B = inference_state["B"]
         
-        # Get user text (ASR) embedding for the previous token
-        last_asr_emb = None
-        if self.predict_user_text:
-            last_asr_emb = self.embed_asr_tokens(inference_state["gen_asr"][:, t - 1]) * self.cfg.get("duplex_asr_text_weight", 1.0)
+        # Get agent text embedding for the previous token
+        agent_text_emb = self.embed_tokens(inference_state["gen_text"][:, t - 1]).unsqueeze(1)  # (B, 1, D)
         
         # Handle force_bos_positions (override agent embedding if needed)
         if force_bos_positions is not None:
-            for batch_idx in range(last_agent_emb.shape[0]):
+            for batch_idx in range(B):
                 if force_bos_positions[batch_idx] == t and not (inference_state["gen_text"][batch_idx, :t] == self.text_bos_id).any():
-                    last_agent_emb[batch_idx] = self.embed_tokens(
-                        torch.full((1,), fill_value=self.text_bos_id, device=self.device)) * self.cfg.get(
-                        "duplex_text_channel_weight", 1.0)
+                    agent_text_emb[batch_idx] = self.embed_tokens(
+                        torch.full((1,), fill_value=self.text_bos_id, device=self.device))
         
-        # Apply tie_and_roll and channel_embeds transformations for train/inference consistency
-        last_agent_emb, last_asr_emb = self._apply_embedding_transformations(last_agent_emb, last_asr_emb)
+        # Get user text (ASR) embedding for the previous token
+        user_text_emb = None
+        if self.predict_user_text:
+            user_text_emb = self.embed_asr_tokens(inference_state["gen_asr"][:, t - 1]).unsqueeze(1)  # (B, 1, D)
         
-        # Combine embeddings and add to input
-        last_emb = last_agent_emb
-        if last_asr_emb is not None:
-            last_emb = last_emb + last_asr_emb
-
-        inference_state["input_embeds"][:, t] += last_emb
+        # Apply tie_and_roll and channel_embeds transformations (skipped for gated fusion)
+        agent_text_emb, user_text_emb = self._apply_embedding_transformations(agent_text_emb, user_text_emb)
+        
+        # Get user audio embedding for current position
+        user_audio_emb = inference_state["audio_embeds"][:, t:t+1]  # (B, 1, D)
+        
+        # Apply fusion
+        fused_emb = self.fusion_module(
+            agent_text_embeds=agent_text_emb,
+            user_audio_embeds=user_audio_emb,
+            user_text_embeds=user_text_emb,
+        )
+        
+        inference_state["input_embeds"][:, t:t+1] = fused_emb
 
         is_prompt_position = inference_state["is_prompt_position_mask"][:, t]
 
@@ -2036,6 +2086,10 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             # Shard channel embeddings module - computation happens inside forward() for FSDP compatibility
             if self.use_channel_embeds:
                 self.channel_embed_module = fully_shard(self.channel_embed_module, **fsdp_config)
+            
+            # Shard fusion module (if it has learnable parameters)
+            if hasattr(self.fusion_module, 'parameters') and any(p.requires_grad for p in self.fusion_module.parameters()):
+                self.fusion_module = fully_shard(self.fusion_module, **fsdp_config)
 
     def load_state_dict(self, state_dict, strict: bool = True):
         try:

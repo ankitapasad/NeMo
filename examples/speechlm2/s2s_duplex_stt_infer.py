@@ -51,6 +51,7 @@ def inference(cfg):
         model_cfg=model_config,
         force_align_user_text=False,
         early_interruption_prob=0.0,
+        cfg=cfg.data
     )
     datamodule = DataModule(cfg.data, tokenizer=model.tokenizer, dataset=dataset)
 
