@@ -1247,7 +1247,14 @@ def collate_system_prompt(
             if _is_asr_cut_val(c):
                 prompt_text = ASR_SYSTEM_PROMPT
             elif _is_mcq_cut_val(c):
-                prompt_text = MCQ_SYSTEM_PROMPT_DELAY
+                if mcq_agent_text_delay > 0:
+                    prompt_text = MCQ_SYSTEM_PROMPT_DELAY
+                elif add_mcq_prompt is not None and add_mcq_prompt == 1:
+                    prompt_text = MCQ_SYSTEM_PROMPT_MCQ
+                elif add_mcq_prompt is not None and add_mcq_prompt == 2:
+                    prompt_text = MCQ_SYSTEM_PROMPT_THINK
+                else:
+                    no_prompt = True
         else:
             # No system prompt for this cut
             no_prompt = True
