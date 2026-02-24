@@ -200,7 +200,8 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 all_cuts_combined = cuts
             
             prompt_tokens, prompt_token_lens = collate_system_prompt(
-                all_cuts_combined, self.tokenizer
+                all_cuts_combined, self.tokenizer,
+                add_val_prompt=self.cfg.get("add_val_prompt", False),
             )
             source_audio, source_audio_lens = collate_audio(all_cuts_combined.resample(self.source_sample_rate))
             target_audio, target_audio_lens = collate_audio(
@@ -540,10 +541,19 @@ def collate_token_channel(
     tokens = collate_vectors(tokens, padding_value=pad_id)
     return tokens, token_lens
 
+def _is_mcq_cut_val(cut) -> bool:
+    """Check if a cut is from MCQ data based on shard_origin."""
+    shard_origin = getattr(cut, 'shard_origin', None)
+    if shard_origin is None:
+        return False
+    # MCQ eval sets from voicebench
+    return any(pattern in str(shard_origin) for pattern in ("openbookqa", "mmsu", "bbh"))
 
+MCQ_SYSTEM_PROMPT_THINK = "Answer the following multiple choice question with an explanation for the answer."
 def collate_system_prompt(
     cuts: CutSet,
     tokenizer: TokenizerSpec,
+    add_val_prompt: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Collate system prompts from cuts.
@@ -552,17 +562,25 @@ def collate_system_prompt(
     pad_id = get_pad_id(tokenizer)
     tokens = []
     for c in cuts:
+        no_prompt = False
         # Check if system prompt exists in custom field
         if c.custom and c.custom.get("system_prompt", None):
             prompt_text = c.custom["system_prompt"]
+        elif add_val_prompt:
+            if _is_mcq_cut_val(c):
+                prompt_text = MCQ_SYSTEM_PROMPT_THINK
+            else:
+                no_prompt = True
+        else:
+            # No system prompt for this cut
+            no_prompt = True
+        if no_prompt:
+            tokens.append(torch.as_tensor([], dtype=torch.long))
+        else:
             tokens.append(torch.as_tensor(
                 [tokenizer.bos] + tokenizer.text_to_ids(prompt_text) + [tokenizer.eos],
                 dtype=torch.long
             ))
-        else:
-            # No system prompt for this cut
-            tokens.append(torch.as_tensor([], dtype=torch.long))
-    
     token_lens = torch.tensor([len(tt) for tt in tokens])
     tokens = collate_vectors(tokens, padding_value=pad_id)
     return tokens, token_lens
