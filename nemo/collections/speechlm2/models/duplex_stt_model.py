@@ -108,6 +108,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
         self.advance_text_channel_by = self.cfg.get("advance_text_channel_by", None)
         self.predict_user_text = self.cfg.get("predict_user_text", False)
         self.predict_user_text_prob = self.cfg.get("predict_user_text_prob", 1.0)
+        self.same_user_agent_eos = cfg.data.get("same_user_agent_eos", True)
         
         # Embedding variants for differentiating agent vs user text channels
         # These are mutually exclusive with each other, and are bypassed for gated fusion methods
@@ -273,6 +274,10 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
         # ASR loss inclusion counters for cumulative logging
         self.asr_loss_batches_total = 0
         self.asr_loss_batches_included = 0
+
+        # Force alignment filtering counters for cumulative logging
+        self.tot_asr_samples = 0
+        self.asr_skipped_due_to_failed_fa = 0
 
         # MCQ delay counters for cumulative logging
         self.mcq_delay_total_cuts = 0
@@ -652,6 +657,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             advance_text_channel_by=self.advance_text_channel_by,
             use_tp=self._use_tp,
             device_mesh=self.device_mesh if self._use_tp else None,
+            same_user_agent_eos=self.same_user_agent_eos,
         )
 
         source_encoded = inputs["source_encoded"]
@@ -728,7 +734,8 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             loss_scale = self._maybe_zero_out_scale_for_asr(loss_scale, text_labels, batch)
             # Re-apply seq_mask to ensure positions beyond target_token_lens are zeroed
             # (token_loss_weight torch.where overwrites the original seq_mask zeroing)
-            loss_scale = loss_scale * seq_mask.float()
+            if self.cfg.get("mask_sequence_loss", True):
+                loss_scale = loss_scale * seq_mask.float()
             if compute_asr_for_batch:
                 asr_loss_scale = torch.where(
                     asr_labels.unsqueeze(-1) == self.text_pad_id, pad_weight,
@@ -740,6 +747,10 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                         )
                     )
                 )
+
+        if compute_asr_for_batch and batch.get("force_align_mask") is not None:
+            fa_mask = batch["force_align_mask"].to(asr_loss_scale.device)
+            asr_loss_scale = asr_loss_scale * fa_mask[:, None, None].float()
 
         ans = {
             "input_embeds": input_embeds,
@@ -919,6 +930,16 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             self.log("asr_loss_inclusion_ratio", 
                      self.asr_loss_batches_included / self.asr_loss_batches_total,
                      on_step=True, sync_dist=True)
+
+        # Track force alignment filtering stats
+        fa_mask = batch.get("audio_data", {}).get("force_align_mask") if isinstance(batch.get("audio_data"), dict) else None
+        if fa_mask is not None:
+            self.tot_asr_samples += fa_mask.numel()
+            self.asr_skipped_due_to_failed_fa += (~fa_mask).sum().item()
+            if self.tot_asr_samples > 0:
+                self.log("asr_skipped_due_to_failed_fa_ratio",
+                         self.asr_skipped_due_to_failed_fa / self.tot_asr_samples,
+                         on_step=True, sync_dist=True)
 
         self.log_dict(res, on_step=True)
 

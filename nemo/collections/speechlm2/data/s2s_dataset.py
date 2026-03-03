@@ -215,6 +215,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         else:
             self.early_interruption_prob = cfg.get("early_interruption_prob", 0.0) if cfg is not None else 0.0
         self.fix_eos_placements = cfg.get("fix_eos_placements", False) if cfg is not None else False
+        self.filter_failed_fa = cfg.get("filter_failed_fa", False) if cfg is not None else False
         self.agent_bos_offset_for_asr = cfg.get("agent_bos_offset_for_asr", 0) if cfg is not None else 0
         self.add_filler_response_for_asr = cfg.get("add_filler_response_for_asr", False) if cfg is not None else False
         self.filler_response_delay = cfg.get("filler_response_delay", 0) if cfg is not None else 0
@@ -246,6 +247,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         self.user_eos_id = self.tokenizer.text_to_ids(user_eos_token)[0]
         self.agent_bos_id = self.tokenizer.bos
         self.agent_eos_id = self.tokenizer.eos
+        self.agent_text_eos_id = self.tokenizer.text_to_ids('<SPECIAL_15>')[0]
         self.pad_id = get_pad_id(self.tokenizer)
 
         # Initialize force aligner lazily (only when needed during training)
@@ -635,6 +637,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 early_interruption_flag_from_cfg=self.early_interruption_prob > 0,
                 skip_eos=self.fix_eos_placements,
                 mcq_agent_text_delay=mcq_agent_text_delay,
+                agent_text_eos_id=self.agent_text_eos_id if self.cfg.get("add_agent_text_eos", False) else None,
             )
 
             # Shift agent BOS forward by offset frames for ASR data
@@ -683,6 +686,21 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 if len(all_cuts_combined) == 0:
                     logging.warning("All cuts filtered out due to force alignment failures, returning minimal valid batch to continue training.")
                     return self._create_minimal_batch()
+
+            if self.filter_failed_fa:
+                force_align_mask = torch.ones(len(all_cuts_combined), dtype=torch.bool)
+                fa_filtered_count = 0
+                for i, cut in enumerate(all_cuts_combined):
+                    if cut.custom and cut.custom.get('force_align_failed', False):
+                        force_align_mask[i] = False
+                        fa_filtered_count += 1
+                if fa_filtered_count > 0:
+                    logging.info(
+                        f"Filtered {fa_filtered_count}/{len(all_cuts_combined)} samples "
+                        f"from ASR loss due to failed force alignment"
+                    )
+            else:
+                force_align_mask = None
 
             source_tokens, source_token_lens, _, _ = collate_token_channel(
                 all_cuts_combined, self.tokenizer, self.pad_id, self.frame_length,
@@ -768,6 +786,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 "formatter": [getattr(cut, "formatter", "s2s_duplex") for cut in all_cuts_combined],
                 "aug_by_noise": [getattr(cut, "aug_by_noise", True) for cut in all_cuts_combined],
                 "has_filler_response": has_filler_response,
+                "force_align_mask": force_align_mask,
             }
 
             # Per-batch early interruption stats for logging (model accumulates for cumulative)
@@ -1005,7 +1024,7 @@ def _is_mcq_cut_val(cut) -> bool:
     if shard_origin is None:
         return False
     # MCQ eval sets from voicebench
-    return any(pattern in str(shard_origin) for pattern in ("openbookqa", "mmsu"))
+    return any(pattern in str(shard_origin) for pattern in ("openbookqa", "mmsu", "bbh"))
 
 def _is_asr_cut_val(cut) -> bool:
     """Check if a cut is from ASR data based on shard_origin."""
@@ -1114,6 +1133,7 @@ def collate_token_channel(
     agent_token_channel: torch.Tensor = None,
     agent_token_channel_lengths: torch.Tensor = None,
     agent_eos_id: int = None,
+    agent_text_eos_id: int = None,
     mcq_agent_text_delay: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, list, dict]:
     tokens = []
@@ -1142,6 +1162,7 @@ def collate_token_channel(
             cut_agent_token_channel=agent_token_channel[cut_idx] if agent_token_channel is not None else None,
             cut_agent_token_channel_length=agent_token_channel_lengths[cut_idx] if agent_token_channel_lengths is not None else None,
             agent_eos_id=agent_eos_id,
+            agent_text_eos_id=agent_text_eos_id,
         )
         
         # Apply MCQ agent text delay: shift tokens right by mcq_agent_text_delay frames
@@ -1244,9 +1265,9 @@ def collate_system_prompt(
             prompt_text = force_add_prompt
         elif add_val_prompt:
             # System prompt for validation
-            if _is_asr_cut_val(c):
-                prompt_text = ASR_SYSTEM_PROMPT
-            elif _is_mcq_cut_val(c):
+            # if _is_asr_cut_val(c):
+            #     prompt_text = ASR_SYSTEM_PROMPT
+            if _is_mcq_cut_val(c):
                 if mcq_agent_text_delay > 0:
                     prompt_text = MCQ_SYSTEM_PROMPT_DELAY
                 elif add_mcq_prompt is not None and add_mcq_prompt == 1:
@@ -1255,6 +1276,8 @@ def collate_system_prompt(
                     prompt_text = MCQ_SYSTEM_PROMPT_THINK
                 else:
                     no_prompt = True
+            else:
+                no_prompt = True
         else:
             # No system prompt for this cut
             no_prompt = True
@@ -1289,6 +1312,7 @@ def build_token_channel(
         cut_agent_token_channel_length: torch.Tensor = None,
         eos_offset_frames: int = 8,
         agent_eos_id: int = None,
+        agent_text_eos_id: int = None,
 ) -> torch.Tensor:
     diagnostic = f"Extra info: {cut.id=}"
     if getattr(cut, "shard_origin", None) is not None:
@@ -1320,7 +1344,8 @@ def build_token_channel(
 
             # Use different bos_id for user and agent
             text_ids = torch.as_tensor([bos_id] + _text_to_ids(text, tokenizer, pad_id, available_frames_for_text=available_frames_for_text, word_align_position=word_align_position, remove_timestamps=remove_timestamps))
-
+            if agent_text_eos_id is not None:
+                text_ids = torch.cat([text_ids, torch.tensor([agent_text_eos_id], dtype=torch.long)])
             if available_frames_for_text > 0 and len(text_ids) > available_frames_for_text:
                 # Truncate text_ids to fit before the eos position.
                 text_ids = text_ids[:available_frames_for_text]

@@ -167,6 +167,7 @@ class ForceAligner:
         
         success_count = 0
         failed_count = 0
+        failed_cut_ids = set()
         for i, alignment_result in enumerate(alignments_batch):
             if alignment_result is not None:
                 original_text = user_supervisions[i].text
@@ -178,10 +179,18 @@ class ForceAligner:
                 success_count += 1
             else:
                 failed_count += 1
+                failed_cut_ids.add(user_cuts[i].id)
+        
+        for cut in cuts:
+            if cut.id in failed_cut_ids:
+                if cut.custom is None:
+                    cut.custom = {}
+                cut.custom['force_align_failed'] = True
         
         if failed_count > 0:
             logging.warning(
-                f"Force alignment failed for {failed_count}/{len(user_supervisions)} user segments. "
+                f"Force alignment failed for {failed_count}/{len(user_supervisions)} user segments "
+                f"({len(failed_cut_ids)} cuts affected). "
                 f"Keeping all cuts with original text for failed alignments."
             )
         else:

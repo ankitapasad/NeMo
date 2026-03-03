@@ -74,6 +74,7 @@ def prepare_labels(
     advance_text_channel_by=None,
     use_tp=False,
     device_mesh=None,
+    same_user_agent_eos=True,
 ):
     """
     Prepare text and ASR labels from batch data.
@@ -170,9 +171,10 @@ def prepare_labels(
         source_tokens_flat = source_tokens_delayed.clone()
         target_tokens_flat = target_tokens.clone()
 
-        # To be consistent with the single channel case, replace the user_eos_id with agent_eos_id
         source_tokens_flat = source_tokens_flat.clone()
-        source_tokens_flat[source_tokens_flat == user_eos_id] = text_eos_id
+        if same_user_agent_eos:
+            # To be consistent with the single channel case, replace the user_eos_id with agent_eos_id
+            source_tokens_flat[source_tokens_flat == user_eos_id] = text_eos_id
         asr_inputs = source_tokens_flat[:, :-1]
         asr_labels = source_tokens_flat[:, 1:]
         text_inputs = target_tokens_flat[:, :-1]
