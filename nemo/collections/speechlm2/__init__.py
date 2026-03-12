@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from .data import DataModule, DuplexEARTTSDataset, DuplexS2SDataset, DuplexSTTDataset, SALMDataset
+from .data import DataModule, DuplexEARTTSDataset, DuplexS2SDataset, DuplexSTTDataset, SALMDataset, StreamingSTTDataset
 from .models import (
     SALM,
     DuplexEARTTS,
@@ -20,6 +20,7 @@ from .models import (
     DuplexSTTModel,
     NemotronVoiceChat,
     SALMWithAsrDecoder,
+    StreamingSTTModel,
 )
 
 __all__ = [
@@ -28,6 +29,7 @@ __all__ = [
     'DuplexSTTDataset',
     'DuplexEARTTSDataset',
     'SALMDataset',
+    'StreamingSTTDataset',
     'DuplexEARTTS',
     'DuplexS2SModel',
     'DuplexS2SSpeechDecoderModel',
@@ -35,4 +37,5 @@ __all__ = [
     'SALM',
     'SALMWithAsrDecoder',
     'NemotronVoiceChat',
+    'StreamingSTTModel',
 ]

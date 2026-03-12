@@ -1,0 +1,612 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+Tests for StreamingSTTDataset message generation, token replacement, and
+input/target construction.
+
+The primary reference is the docstring example in get_llm_messages_for_sample:
+
+    alignments = [
+        WordAlignment(text="Hello", start_time=0.16, end_time=0.48),
+        WordAlignment(text="World", start_time=0.60, end_time=0.80),
+    ]
+    audio_duration = 1s, chunk_size = 2, frame_length = 0.08s, delay = 0
+
+    → 13 frames, 7 chunks, assistant responses:
+      [<blank>, <blank>, Hello, <blank>, World, <blank>, <blank>]
+"""
+
+import pytest
+
+from nemo.collections.speechlm2.data.streaming_stt_dataset import (
+    AUDIO_TOKEN_IDX,
+    IGNORE_INDEX,
+    _replace_audio_chunks,
+    _tokenize_with_assistant_mask,
+    get_llm_messages_for_batch,
+    get_llm_messages_for_sample,
+)
+from nemo.collections.speechlm2.parts.alignments import WordAlignment
+
+# ---------------------------------------------------------------------------
+# Shared constants & helpers matching the docstring example
+# ---------------------------------------------------------------------------
+AUDIO_TAG = "<audio>"
+BLANK_TOKEN = "<blank>"
+SYSTEM_ROLE = "system"
+SYSTEM_PROMPT = "Transcribe the audio into text."
+CHUNK_SIZE = 2
+FRAME_LEN = 0.08  # seconds
+DOCSTRING_ALIGNMENTS = [
+    WordAlignment(text="Hello", start_time=0.16, end_time=0.48),
+    WordAlignment(text="World", start_time=0.60, end_time=0.80),
+]
+
+
+def _make_messages(**overrides):
+    """Convenience wrapper around get_llm_messages_for_sample with docstring defaults."""
+    kw = dict(
+        system_role=SYSTEM_ROLE,
+        system_prompt=SYSTEM_PROMPT,
+        audio_tag=AUDIO_TAG,
+        blank_token=BLANK_TOKEN,
+        chunk_size=CHUNK_SIZE,
+        num_delay_frames=0,
+        audio_duration_secs=1.0,
+        frame_length_in_secs=FRAME_LEN,
+        alignments=DOCSTRING_ALIGNMENTS,
+    )
+    kw.update(overrides)
+    return get_llm_messages_for_sample(**kw)
+
+
+# ---------------------------------------------------------------------------
+# Mock tokenizer used by TestTokenPositions
+# ---------------------------------------------------------------------------
+class _MockHFTokenizer:
+    """
+    Deterministic HF tokenizer mock.
+
+    Token layout per message:
+        [HEADER_START, ROLE_ID, HEADER_END, ...content..., FOOTER, NEWLINE]
+
+    Content encoding:
+        system  → [50]
+        user    → [AUDIO_TAG_ID] per <audio> tag in content
+        assistant → [BLANK_ID] for "<blank>", else [200, 201, ...] per word
+    """
+
+    HEADER_START = 1
+    ROLE_IDS = {"system": 10, "user": 11, "assistant": 12}
+    HEADER_END = 2
+    FOOTER = 3
+    NEWLINE = 4
+    AUDIO_TAG_ID = 100
+    BLANK_ID = 101
+    SYSTEM_CONTENT_ID = 50
+
+    HEADER = [HEADER_START, None, HEADER_END]  # None → filled per role
+    N_HEADER = 3
+    N_FOOTER = 2
+
+    def __init__(self, audio_tag=AUDIO_TAG, blank_token=BLANK_TOKEN):
+        self.audio_tag = audio_tag
+        self.blank_token = blank_token
+        self.unk_token_id = 0
+        self._next_word_id = 200
+        # Cache for content → token IDs mapping so encode() and apply_chat_template() agree.
+        self._content_cache: dict[str, list[int]] = {}
+
+    def _content_to_ids(self, content: str, role: str) -> list[int]:
+        """Deterministic content → token IDs, consistent between encode() and apply_chat_template()."""
+        if role == "user":
+            return [self.AUDIO_TAG_ID] * content.count(self.audio_tag)
+        if role == "assistant":
+            if content == self.blank_token:
+                return [self.BLANK_ID]
+            # Assign stable IDs per unique content string
+            if content not in self._content_cache:
+                ids = []
+                for _ in content.split():
+                    ids.append(self._next_word_id)
+                    self._next_word_id += 1
+                self._content_cache[content] = ids
+            return list(self._content_cache[content])
+        # system
+        return [self.SYSTEM_CONTENT_ID]
+
+    def encode(self, text, add_special_tokens=False):
+        if text == self.audio_tag:
+            return [self.AUDIO_TAG_ID]
+        if text == self.blank_token:
+            return [self.BLANK_ID]
+        # Handle repeated audio tags (chunk encoding)
+        if self.audio_tag in text and text == self.audio_tag * text.count(self.audio_tag):
+            return [self.AUDIO_TAG_ID] * text.count(self.audio_tag)
+        # For assistant word content, use the cache
+        if text in self._content_cache:
+            return list(self._content_cache[text])
+        # Unknown text — assign stable IDs
+        ids = []
+        for _ in text.split():
+            ids.append(self._next_word_id)
+            self._next_word_id += 1
+        self._content_cache[text] = ids
+        return list(ids)
+
+    def apply_chat_template(self, messages, **kwargs):
+        input_ids = []
+        assistant_masks = []
+
+        for msg in messages:
+            role = msg["role"]
+            content = msg["content"]
+
+            header = [self.HEADER_START, self.ROLE_IDS[role], self.HEADER_END]
+            input_ids.extend(header)
+            assistant_masks.extend([0] * len(header))
+
+            ids = self._content_to_ids(content, role)
+
+            input_ids.extend(ids)
+            assistant_masks.extend([1 if role == "assistant" else 0] * len(ids))
+
+            footer = [self.FOOTER, self.NEWLINE]
+            input_ids.extend(footer)
+            assistant_masks.extend([0] * len(footer))
+
+        return {"input_ids": input_ids, "assistant_masks": assistant_masks}
+
+
+class _MockHFTokenizerMultiToken(_MockHFTokenizer):
+    """Mock where <audio> tokenizes into 3 tokens: [60, 61, 62].
+
+    Simulates BPE merging across adjacent tags: ``<audio><audio>`` tokenizes as
+    [60, 61, 70, 61, 62] (5 tokens) instead of [60, 61, 62, 60, 61, 62] (6 tokens),
+    because ``62`` (``>``) and ``60`` (``<``) merge into ``70`` (``><``).
+    """
+
+    MULTI_AUDIO_TAG_IDS = [60, 61, 62]
+    MERGED_BOUNDARY = 70  # simulates BPE merge of > + <
+
+    def encode(self, text, add_special_tokens=False):
+        if text == self.audio_tag:
+            return list(self.MULTI_AUDIO_TAG_IDS)
+        # Simulate BPE merging across adjacent audio tags
+        n = text.count(self.audio_tag)
+        if n > 0 and text == self.audio_tag * n:
+            # First tag: [60, 61, 62], subsequent: [70, 61, 62] (merged boundary)
+            ids = list(self.MULTI_AUDIO_TAG_IDS)
+            for _ in range(n - 1):
+                ids.append(self.MERGED_BOUNDARY)
+                ids.extend(self.MULTI_AUDIO_TAG_IDS[1:])  # skip first token, use merged
+            return ids
+        return super().encode(text, add_special_tokens=add_special_tokens)
+
+    def _content_to_ids(self, content: str, role: str) -> list[int]:
+        if role == "user":
+            return self.encode(content, add_special_tokens=False)
+        return super()._content_to_ids(content, role)
+
+
+class _MockHFTokenizerNoGeneration(_MockHFTokenizer):
+    """Mock that simulates a tokenizer without {% generation %} — returns all-zero masks."""
+
+    def apply_chat_template(self, messages, **kwargs):
+        result = super().apply_chat_template(messages, **kwargs)
+        # Zero out the masks to simulate missing {% generation %} support
+        result["assistant_masks"] = [0] * len(result["assistant_masks"])
+        return result
+
+
+class _MockNemoTokenizer:
+    """Wraps a mock HF tokenizer to mimic NeMo AutoTokenizer interface."""
+
+    def __init__(self, hf_tok):
+        self.tokenizer = hf_tok
+
+
+def _run_pipeline(messages, mock_hf_tok, chunk_size=CHUNK_SIZE):
+    """Simulate the __getitem__ tokenization pipeline: tokenize → replace → build targets."""
+    audio_chunk_ids = mock_hf_tok.encode(AUDIO_TAG * chunk_size, add_special_tokens=False)
+    nemo_tok = _MockNemoTokenizer(mock_hf_tok)
+
+    input_ids, assistant_mask = _tokenize_with_assistant_mask(messages, nemo_tok)
+
+    input_ids, assistant_mask = _replace_audio_chunks(
+        input_ids,
+        audio_chunk_ids,
+        chunk_size,
+        mask=assistant_mask,
+    )
+
+    target_ids = input_ids[1:] + [IGNORE_INDEX]
+    target_mask = assistant_mask[1:] + [0]
+    target_ids = [tid if m else IGNORE_INDEX for tid, m in zip(target_ids, target_mask)]
+
+    return input_ids, target_ids, assistant_mask
+
+
+# ===========================================================================
+# Tests: get_llm_messages_for_sample
+# ===========================================================================
+class TestGetLlmMessagesForSample:
+
+    def test_docstring_example_structure(self):
+        """Total messages: 1 system + 7*(user + assistant) = 15."""
+        msgs = _make_messages()
+        assert len(msgs) == 15
+        assert msgs[0] == {"role": SYSTEM_ROLE, "content": SYSTEM_PROMPT}
+
+    def test_docstring_example_roles_alternate(self):
+        msgs = _make_messages()
+        roles = [m["role"] for m in msgs]
+        assert roles[0] == "system"
+        for i in range(1, len(roles), 2):
+            assert roles[i] == "user"
+            assert roles[i + 1] == "assistant"
+
+    def test_docstring_example_user_turns(self):
+        msgs = _make_messages()
+        user_msgs = [m for m in msgs if m["role"] == "user"]
+        assert len(user_msgs) == 7
+        assert all(m["content"] == AUDIO_TAG * CHUNK_SIZE for m in user_msgs)
+
+    def test_docstring_example_assistant_responses(self):
+        msgs = _make_messages()
+        asst = [m["content"] for m in msgs if m["role"] == "assistant"]
+        assert asst == [BLANK_TOKEN, BLANK_TOKEN, "Hello", BLANK_TOKEN, "World", BLANK_TOKEN, BLANK_TOKEN]
+
+    def test_num_chunks(self):
+        """ceil(13 frames / 2) = 7 chunks."""
+        msgs = _make_messages()
+        assert sum(1 for m in msgs if m["role"] == "user") == 7
+
+    def test_total_audio_tags_equals_chunks_times_chunk_size(self):
+        msgs = _make_messages()
+        user_msgs = [m for m in msgs if m["role"] == "user"]
+        total = sum(m["content"].count(AUDIO_TAG) for m in user_msgs)
+        assert total == len(user_msgs) * CHUNK_SIZE
+
+    def test_delay_shifts_emission(self):
+        """With delay=2, Hello (end_frame=6) → ready_frame=8 → chunk 3 (end=8)."""
+        msgs = _make_messages(
+            num_delay_frames=2,
+            alignments=[WordAlignment(text="Hello", start_time=0.16, end_time=0.48)],
+        )
+        asst = [m["content"] for m in msgs if m["role"] == "assistant"]
+        assert asst[:3] == [BLANK_TOKEN, BLANK_TOKEN, BLANK_TOKEN]
+        assert asst[3] == "Hello"
+
+    def test_empty_alignments_all_blank(self):
+        msgs = _make_messages(alignments=[])
+        for m in msgs:
+            if m["role"] == "assistant":
+                assert m["content"] == BLANK_TOKEN
+
+    def test_none_alignments_all_blank(self):
+        msgs = _make_messages(alignments=None)
+        for m in msgs:
+            if m["role"] == "assistant":
+                assert m["content"] == BLANK_TOKEN
+
+    def test_multiple_words_in_same_chunk(self):
+        alignments = [
+            WordAlignment(text="A", start_time=0.0, end_time=0.04),
+            WordAlignment(text="B", start_time=0.05, end_time=0.08),
+        ]
+        msgs = _make_messages(alignments=alignments, audio_duration_secs=0.16)
+        # A: end_frame=round(0.04/0.08)=0, B: end_frame=1. Both ≤ chunk 0 end=2.
+        asst = [m["content"] for m in msgs if m["role"] == "assistant"]
+        assert asst[0] == "A B"
+
+    def test_zero_duration_only_system(self):
+        msgs = _make_messages(audio_duration_secs=0.0, alignments=[])
+        assert len(msgs) == 1
+        assert msgs[0]["role"] == "system"
+
+    def test_chunk_size_1(self):
+        msgs = _make_messages(chunk_size=1, alignments=[])
+        # 13 frames → 13 chunks
+        assert sum(1 for m in msgs if m["role"] == "user") == 13
+        user_msgs = [m for m in msgs if m["role"] == "user"]
+        assert all(m["content"] == AUDIO_TAG for m in user_msgs)
+
+
+# ===========================================================================
+# Tests: get_llm_messages_for_batch
+# ===========================================================================
+class TestGetLlmMessagesForBatch:
+
+    def test_per_sample_duration(self):
+        """Each sample gets messages based on its own duration, not a shared max."""
+        alignments = [[], []]
+        durations = [0.16, 0.32]  # 2 frames → 1 chunk, 4 frames → 2 chunks
+        batch = get_llm_messages_for_batch(
+            system_role=SYSTEM_ROLE,
+            system_prompt=[SYSTEM_PROMPT, SYSTEM_PROMPT],
+            audio_tag=AUDIO_TAG,
+            blank_token=BLANK_TOKEN,
+            chunk_size=CHUNK_SIZE,
+            num_delay_frames=0,
+            audio_durations_secs=durations,
+            frame_length_in_secs=FRAME_LEN,
+            alignments=alignments,
+        )
+        assert len(batch) == 2
+        chunks_0 = sum(1 for m in batch[0] if m["role"] == "user")
+        chunks_1 = sum(1 for m in batch[1] if m["role"] == "user")
+        assert chunks_0 == 1
+        assert chunks_1 == 2
+
+    def test_per_sample_system_prompt(self):
+        """Each sample gets its own system prompt from the list."""
+        prompts = ["Transcribe in English.", "Transcribe in French."]
+        alignments = [[], []]
+        durations = [0.16, 0.16]
+        batch = get_llm_messages_for_batch(
+            system_role=SYSTEM_ROLE,
+            system_prompt=prompts,
+            audio_tag=AUDIO_TAG,
+            blank_token=BLANK_TOKEN,
+            chunk_size=CHUNK_SIZE,
+            num_delay_frames=0,
+            audio_durations_secs=durations,
+            frame_length_in_secs=FRAME_LEN,
+            alignments=alignments,
+        )
+        assert batch[0][0] == {"role": SYSTEM_ROLE, "content": "Transcribe in English."}
+        assert batch[1][0] == {"role": SYSTEM_ROLE, "content": "Transcribe in French."}
+
+
+# ===========================================================================
+# Tests: _replace_audio_chunks
+# ===========================================================================
+class TestReplaceAudioChunks:
+
+    AUD = AUDIO_TOKEN_IDX
+
+    def test_single_token_chunk(self):
+        """Single-token audio tag, chunk_size=2 → 2 AUDIO_TOKEN_IDX per chunk."""
+        ids = [1, 100, 100, 2]
+        result = _replace_audio_chunks(ids, [100, 100], chunk_size=2)
+        assert result == [1, self.AUD, self.AUD, 2]
+
+    def test_multi_token_chunk_with_bpe_merge(self):
+        """Simulates BPE merge: <audio><audio> → [60, 61, 70, 61, 62] (5 tokens, not 6)."""
+        chunk_ids = [60, 61, 70, 61, 62]
+        ids = [1, 2, 3] + chunk_ids + [4, 5]
+        result = _replace_audio_chunks(ids, chunk_ids, chunk_size=2)
+        assert result == [1, 2, 3, self.AUD, self.AUD, 4, 5]
+
+    def test_multiple_chunks(self):
+        chunk_ids = [60, 61, 70, 61, 62]
+        ids = chunk_ids + [99] + chunk_ids + [88]
+        result = _replace_audio_chunks(ids, chunk_ids, chunk_size=2)
+        assert result == [self.AUD, self.AUD, 99, self.AUD, self.AUD, 88]
+        assert result.count(self.AUD) == 4  # 2 chunks × 2
+
+    def test_chunk_size_1(self):
+        """chunk_size=1: each chunk token sequence replaced with 1 AUDIO_TOKEN_IDX."""
+        chunk_ids = [60, 61, 62]  # single <audio> as 3 BPE tokens
+        ids = [1] + chunk_ids + [2] + chunk_ids + [3]
+        result = _replace_audio_chunks(ids, chunk_ids, chunk_size=1)
+        assert result == [1, self.AUD, 2, self.AUD, 3]
+
+    def test_chunk_size_4(self):
+        """chunk_size=4: each chunk replaced with 4 AUDIO_TOKEN_IDX."""
+        chunk_ids = [10, 11, 12, 13]
+        ids = [1] + chunk_ids + [2]
+        result = _replace_audio_chunks(ids, chunk_ids, chunk_size=4)
+        assert result == [1, self.AUD, self.AUD, self.AUD, self.AUD, 2]
+
+    def test_mask_sync(self):
+        chunk_ids = [60, 61, 70, 61, 62]
+        ids = [1] + chunk_ids + [2]
+        mask = [0] + [0, 0, 0, 0, 0] + [1]
+        new_ids, new_mask = _replace_audio_chunks(ids, chunk_ids, chunk_size=2, mask=mask)
+        assert new_ids == [1, self.AUD, self.AUD, 2]
+        assert new_mask == [0, 0, 0, 1]
+        assert len(new_ids) == len(new_mask)
+
+    def test_mask_length_with_different_chunk_size(self):
+        """Mask length must match ids length after chunk replacement."""
+        chunk_ids = [10, 11, 12, 13, 14]  # 5 BPE tokens
+        ids = [1] + chunk_ids + [2] + chunk_ids + [3]
+        mask = [0] + [0] * 5 + [1] + [0] * 5 + [1]
+        new_ids, new_mask = _replace_audio_chunks(ids, chunk_ids, chunk_size=3, mask=mask)
+        # 5 tokens → 3 AUDIO_TOKEN_IDX per chunk, 2 chunks
+        assert new_ids.count(self.AUD) == 6
+        assert len(new_ids) == len(new_mask)
+
+    def test_no_match(self):
+        result = _replace_audio_chunks([1, 2, 3], [100, 100], chunk_size=2)
+        assert result == [1, 2, 3]
+
+
+# ===========================================================================
+# Tests: token positions (full pipeline through mock tokenizer)
+# ===========================================================================
+class TestTokenPositions:
+    """
+    Verify audio/text token counts and positions in input_ids and target_ids
+    using the docstring example.
+    """
+
+    def test_audio_token_count_single_token_tag(self):
+        """AUDIO_TOKEN_IDX count == num_chunks * chunk_size (single-token tag)."""
+        msgs = _make_messages()
+        (
+            input_ids,
+            _,
+            _,
+        ) = _run_pipeline(msgs, _MockHFTokenizer())
+        num_chunks = 7
+        assert input_ids.count(AUDIO_TOKEN_IDX) == num_chunks * CHUNK_SIZE
+
+    def test_audio_token_count_multi_token_tag(self):
+        """Same count even when the audio tag tokenizes into 3 tokens."""
+        msgs = _make_messages()
+        input_ids, _, _ = _run_pipeline(msgs, _MockHFTokenizerMultiToken())
+        num_chunks = 7
+        assert input_ids.count(AUDIO_TOKEN_IDX) == num_chunks * CHUNK_SIZE
+
+    def test_no_audio_token_at_assistant_position(self):
+        msgs = _make_messages()
+        input_ids, _, assistant_mask = _run_pipeline(msgs, _MockHFTokenizer())
+        for i, (tid, m) in enumerate(zip(input_ids, assistant_mask)):
+            if m:
+                assert tid != AUDIO_TOKEN_IDX, f"Audio token at assistant position {i}"
+
+    def test_no_audio_token_at_assistant_position_multi(self):
+        msgs = _make_messages()
+        input_ids, _, assistant_mask = _run_pipeline(msgs, _MockHFTokenizerMultiToken())
+        for i, (tid, m) in enumerate(zip(input_ids, assistant_mask)):
+            if m:
+                assert tid != AUDIO_TOKEN_IDX, f"Audio token at assistant position {i}"
+
+    def test_target_ignore_at_non_assistant(self):
+        """Every non-assistant position in target must be IGNORE_INDEX."""
+        msgs = _make_messages()
+        input_ids, target_ids, assistant_mask = _run_pipeline(msgs, _MockHFTokenizer())
+        shifted_mask = assistant_mask[1:] + [0]
+        for i, (tid, m) in enumerate(zip(target_ids, shifted_mask)):
+            if not m:
+                assert tid == IGNORE_INDEX, f"target[{i}]={tid} should be IGNORE_INDEX"
+
+    def test_target_real_at_assistant(self):
+        """Every assistant position in target must hold a real token ID."""
+        msgs = _make_messages()
+        input_ids, target_ids, assistant_mask = _run_pipeline(msgs, _MockHFTokenizer())
+        shifted_mask = assistant_mask[1:] + [0]
+        for i, (tid, m) in enumerate(zip(target_ids, shifted_mask)):
+            if m:
+                assert tid != IGNORE_INDEX, f"target[{i}] should be a real token"
+
+    def test_target_equals_next_input_at_assistant(self):
+        """target[i] must equal input[i+1] at trainable positions (next-token prediction)."""
+        msgs = _make_messages()
+        input_ids, target_ids, assistant_mask = _run_pipeline(msgs, _MockHFTokenizer())
+        shifted = input_ids[1:] + [IGNORE_INDEX]
+        shifted_mask = assistant_mask[1:] + [0]
+        for i, m in enumerate(shifted_mask):
+            if m:
+                assert target_ids[i] == shifted[i], f"target[{i}]={target_ids[i]} != next input {shifted[i]}"
+
+    def test_input_target_same_length(self):
+        msgs = _make_messages()
+        input_ids, target_ids, _ = _run_pipeline(msgs, _MockHFTokenizer())
+        assert len(input_ids) == len(target_ids)
+
+    def test_input_target_same_length_multi_token(self):
+        msgs = _make_messages()
+        input_ids, target_ids, _ = _run_pipeline(msgs, _MockHFTokenizerMultiToken())
+        assert len(input_ids) == len(target_ids)
+
+    def test_mask_length_matches_input_after_replace(self):
+        """After multi-token collapse, mask and input_ids must have the same length."""
+        msgs = _make_messages()
+        input_ids, _, assistant_mask = _run_pipeline(msgs, _MockHFTokenizerMultiToken())
+        assert len(input_ids) == len(assistant_mask)
+
+    def test_all_blank_targets_with_no_alignments(self):
+        """With no alignments, every assistant content token in input should be BLANK_ID."""
+        msgs = _make_messages(alignments=[])
+        input_ids, _, assistant_mask = _run_pipeline(msgs, _MockHFTokenizer())
+        blank_id = _MockHFTokenizer.BLANK_ID
+        for i, (tid, m) in enumerate(zip(input_ids, assistant_mask)):
+            if m:
+                assert tid == blank_id, f"Expected blank at position {i}, got {tid}"
+
+    def test_hello_appears_at_chunk_2(self):
+        """'Hello' (end_time=0.48s, end_frame=6) is emitted at chunk 2 (end_frame=6)."""
+        msgs = _make_messages(
+            alignments=[WordAlignment(text="Hello", start_time=0.16, end_time=0.48)],
+        )
+        input_ids, _, assistant_mask = _run_pipeline(msgs, _MockHFTokenizer())
+        blank_id = _MockHFTokenizer.BLANK_ID
+
+        # Collect assistant content token values in order
+        asst_tokens = [tid for tid, m in zip(input_ids, assistant_mask) if m]
+        # Chunks: 0=blank, 1=blank, 2=Hello (non-blank), 3..6=blank
+        assert asst_tokens[0] == blank_id
+        assert asst_tokens[1] == blank_id
+        assert asst_tokens[2] != blank_id  # Hello word token
+        assert all(t == blank_id for t in asst_tokens[3:])
+
+    def test_trainable_token_count(self):
+        """Number of trainable positions in target == number of assistant content tokens."""
+        msgs = _make_messages()
+        _, target_ids, assistant_mask = _run_pipeline(msgs, _MockHFTokenizer())
+        n_trainable = sum(1 for t in target_ids if t != IGNORE_INDEX)
+        n_assistant = sum(assistant_mask)
+        # The shifted mask loses the first assistant token's prediction target
+        # when it's preceded by a non-assistant token, but gains/loses nothing
+        # else.  The exact count: sum(shifted_mask).
+        shifted_mask = assistant_mask[1:] + [0]
+        assert n_trainable == sum(shifted_mask)
+
+
+# ===========================================================================
+# Tests: _tokenize_with_assistant_mask fallback
+# ===========================================================================
+class TestTokenizeWithAssistantMaskFallback:
+    """
+    Verify the sequential-search fallback produces the same mask as the
+    primary path when the tokenizer doesn't support {% generation %}.
+    """
+
+    def test_fallback_matches_primary(self):
+        """Fallback mask should equal the primary mask for the docstring example."""
+        msgs = _make_messages()
+        primary_tok = _MockHFTokenizer()
+        fallback_tok = _MockHFTokenizerNoGeneration()
+
+        nemo_primary = _MockNemoTokenizer(primary_tok)
+        nemo_fallback = _MockNemoTokenizer(fallback_tok)
+
+        ids_p, mask_p = _tokenize_with_assistant_mask(msgs, nemo_primary)
+        ids_f, mask_f = _tokenize_with_assistant_mask(msgs, nemo_fallback)
+
+        assert ids_p == ids_f, "Token IDs should be identical"
+        assert mask_p == mask_f, "Masks should be identical"
+
+    def test_fallback_has_nonzero_mask(self):
+        """Fallback should produce assistant-masked tokens, not all zeros."""
+        msgs = _make_messages()
+        tok = _MockHFTokenizerNoGeneration()
+        nemo_tok = _MockNemoTokenizer(tok)
+
+        _, mask = _tokenize_with_assistant_mask(msgs, nemo_tok)
+        assert any(mask), "Fallback mask should have at least one assistant token"
+
+    def test_fallback_mask_count_equals_assistant_content(self):
+        """Number of masked tokens should equal total assistant content tokens."""
+        msgs = _make_messages()
+        tok = _MockHFTokenizerNoGeneration()
+        nemo_tok = _MockNemoTokenizer(tok)
+
+        _, mask = _tokenize_with_assistant_mask(msgs, nemo_tok)
+        # 7 assistant turns: 5 blanks (1 token each) + 2 words (1 token each) = 7
+        assert sum(mask) == 7
+
+    def test_fallback_pipeline_produces_trainable_targets(self):
+        """Full pipeline with fallback tokenizer should have non-zero trainable targets."""
+        msgs = _make_messages()
+        tok = _MockHFTokenizerNoGeneration()
+        input_ids, target_ids, assistant_mask = _run_pipeline(msgs, tok)
+
+        n_trainable = sum(1 for t in target_ids if t != IGNORE_INDEX)
+        assert n_trainable > 0, "Should have trainable targets with fallback mask"

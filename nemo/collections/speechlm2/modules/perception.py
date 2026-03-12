@@ -49,8 +49,18 @@ class AudioPerceptionModule(NeuralModule, Exportable):
         else:
             self.spec_augmentation = None
         self.modality_adapter = self.from_config_dict(cfg.modality_adapter)
-        if 'output_dim' not in cfg.modality_adapter and "d_model" in cfg.modality_adapter:  # e.g., conformer encoder
-            self.proj = nn.Linear(cfg.modality_adapter.d_model, cfg.output_dim)
+        d_model = cfg.modality_adapter.get("d_model", cfg.encoder.get("d_model", None))
+
+        if 'output_dim' not in cfg.modality_adapter:  # e.g., conformer encoder
+            if d_model is None:
+                raise ValueError(
+                    "when `output_dim` is not set in cfg.modality_adapter, `d_model` is required in the `modality_adapter` or `encoder` to be used for projection."
+                )
+            if cfg.get("output_dim", None) is None:
+                raise ValueError(
+                    "when `output_dim` is not set in cfg.modality_adapter, `output_dim` is required in the cfg to be used for projection."
+                )
+            self.proj = nn.Linear(d_model, cfg.output_dim)
         else:
             self.proj = nn.Identity()
 

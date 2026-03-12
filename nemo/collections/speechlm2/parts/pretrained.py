@@ -13,10 +13,10 @@
 # limitations under the License.
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List, Optional
 
 import torch
-from omegaconf import OmegaConf, open_dict
+from omegaconf import DictConfig, OmegaConf, open_dict
 from peft import PeftModel
 from safetensors.torch import load_file
 from transformers import AutoConfig, AutoModelForCausalLM
@@ -58,11 +58,11 @@ def load_pretrained_hf(
     """
     if pretrained_weights:
         return AutoModelForCausalLM.from_pretrained(
-            model_path_or_name, torch_dtype=dtype, trust_remote_code=trust_remote_code
+            model_path_or_name, dtype=dtype, trust_remote_code=trust_remote_code
         )
     else:
         config = AutoConfig.from_pretrained(model_path_or_name, trust_remote_code=trust_remote_code)
-        return AutoModelForCausalLM.from_config(config, torch_dtype=dtype, trust_remote_code=trust_remote_code)
+        return AutoModelForCausalLM.from_config(config, dtype=dtype, trust_remote_code=trust_remote_code)
 
 
 @contextmanager
@@ -124,6 +124,56 @@ def setup_speech_encoder(model: torch.nn.Module, pretrained_weights: bool = True
         model.perception.load_state_dict(asr.state_dict(), strict=False)
     else:
         model.perception = AudioPerceptionModule(model.cfg.perception).train()
+
+
+def setup_perception(
+    cfg: DictConfig,
+    output_dim: int,
+    pretrained_asr: str,
+    pretrained_weights: bool = True,
+    audio_pad_to: Optional[int] = None,
+    att_context_size: Optional[List[int]] = None,
+):
+    """
+    Sets up an ``AudioPerceptionModule``, initializing its ``encoder`` and ``preprocessor``
+    with a pretrained NeMo ``ASRModel``.
+    If user config specifies encoder parameters, they will override the pretrained model's config.
+
+    Args:
+        cfg: The SpeechLM's model config
+        output_dim: The output dimension of the perception module
+        pretrained_asr: The pretrained ASR model to use
+        pretrained_weights: Whether to load pretrained weights
+        audio_pad_to: If not None, the audio will be padded to length divisible by this value.
+        att_context_size: If not None, the attention context for the encoder will be set to this value.
+    """
+    if pretrained_weights:
+        # Save user-specified encoder config before loading pretrained model
+        user_encoder_config = {}
+
+        if 'encoder' in cfg.perception:
+            user_encoder_config = OmegaConf.to_container(cfg.perception.encoder, resolve=True)
+
+        asr = load_pretrained_nemo(ASRModel, pretrained_asr).eval()
+        with open_dict(cfg):
+            cfg.perception.preprocessor = asr.cfg.preprocessor
+            if audio_pad_to is not None:
+                cfg.perception.preprocessor.pad_to = cfg.audio_pad_to
+            cfg.perception.encoder = asr.cfg.encoder
+            if att_context_size is not None:
+                cfg.perception.encoder.att_context_size = att_context_size
+            cfg.perception.output_dim = output_dim
+            # Override with user-specified encoder parameters, e.g. initializiing a non-causal encoder for causal setup.
+            if user_encoder_config:
+                for key, value in user_encoder_config.items():
+                    if value is not None:  # Only override if user explicitly set a value
+                        cfg.perception.encoder[key] = value
+        perception = AudioPerceptionModule(cfg.perception).train()
+        perception.load_state_dict(asr.state_dict(), strict=False)
+    else:
+        perception = AudioPerceptionModule(cfg.perception).train()
+
+    return perception
 
 
 def set_model_dict_for_partial_init(
@@ -266,6 +316,7 @@ def load_pretrained_model(model: torch.nn.Module, checkpoint_path: str):
 
     import gc
     import os
+
     from nemo.utils import logging
 
     logging.info(f"Loading pretrained s2s model from {checkpoint_path}")
