@@ -49,10 +49,10 @@ class StreamingSTTBatch:
         cuts: Optional[CutSet] containing the cuts for the batch.
     """
 
-    audios: torch.Tensor
-    audio_lens: torch.Tensor
-    input_tokens: torch.Tensor
-    input_token_lens: torch.Tensor
+    audios: Optional[torch.Tensor] = None
+    audio_lens: Optional[torch.Tensor] = None
+    input_tokens: Optional[torch.Tensor] = None
+    input_token_lens: Optional[torch.Tensor] = None
     target_tokens: Optional[torch.Tensor] = None
     target_token_lens: Optional[torch.Tensor] = None
     text: Optional[List[str]] = None
@@ -480,24 +480,31 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             logging.warning("No cuts found in the batch")
             return None
 
+        text = [cut.supervisions[0].text for cut in cuts]
+
         if self.defer_get_batch:
             return StreamingSTTBatch(
                 cuts=cuts,
                 audios=audios,
                 audio_lens=audio_lens,
+                text=text,
             )
 
         alignments = get_word_alignments_for_batch(cuts)
 
-        return self.get_batch_data(cuts, audios, audio_lens, alignments)
+        return self.get_batch_data(cuts, audios, audio_lens, alignments, text)
 
     def get_batch_data(
-        self, cuts: CutSet, audios: torch.Tensor, audio_lens: torch.Tensor, alignments: List[List[WordAlignment]]
+        self,
+        cuts: CutSet,
+        audios: torch.Tensor,
+        audio_lens: torch.Tensor,
+        alignments: List[List[WordAlignment]],
+        text: List[str],
     ) -> StreamingSTTBatch:
         audio_durations_secs = (audio_lens.float() / self.cfg.sample_rate).tolist()
 
         system_prompts = [cut.custom.get(self.cfg.prompt_field, self.cfg.system_prompt) for cut in cuts]
-        transcripts = [cut.supervisions[0].text for cut in cuts]
 
         batch_messages = get_llm_messages_for_batch(
             system_role=self.cfg.system_role,
@@ -509,7 +516,7 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             audio_durations_secs=audio_durations_secs,
             frame_length_in_secs=self.cfg.frame_length_in_secs,
             alignments=alignments,
-            transcripts=transcripts,
+            transcripts=text,
         )
 
         all_input_ids = []
@@ -542,8 +549,6 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
         input_token_lens = torch.tensor([len(ids) for ids in all_input_ids], dtype=torch.long)
         target_token_lens = input_token_lens.clone()
 
-        texts = [" ".join(s.text for s in cut.supervisions) for cut in cuts]
-
         return StreamingSTTBatch(
             audios=audios,
             audio_lens=audio_lens,
@@ -551,5 +556,5 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             input_token_lens=input_token_lens,
             target_tokens=target_tokens,
             target_token_lens=target_token_lens,
-            text=texts,
+            text=text,
         )

@@ -18,7 +18,9 @@ from lightning.pytorch import Trainer
 from omegaconf import OmegaConf
 
 from nemo.collections.speechlm2 import DataModule, StreamingSTTDataset, StreamingSTTModel
+from nemo.core.classes.common import Serialization
 from nemo.core.config import hydra_runner
+from nemo.utils import logging
 from nemo.utils.exp_manager import exp_manager
 from nemo.utils.trainer_utils import resolve_trainer_cfg
 
@@ -34,10 +36,25 @@ def train(cfg):
     log_dir = exp_manager(trainer, cfg.get("exp_manager", None))
     OmegaConf.save(cfg, log_dir / "exp_config.yaml")
 
-    with trainer.init_module():
-        model = StreamingSTTModel(OmegaConf.to_container(cfg.model, resolve=True))
+    dataset_cfg = cfg.data.dataset
+    forced_aligner_cfg = cfg.get("forced_aligner", None)
+    if forced_aligner_cfg is not None:
+        forced_aligner = Serialization.from_config_dict(forced_aligner_cfg)
+        defer_get_batch = True
+        logging.info(f"Using online forced alignment: {forced_aligner_cfg}")
+    else:
+        forced_aligner = None
+        defer_get_batch = False
 
-    dataset = StreamingSTTDataset(cfg=cfg.data.dataset, tokenizer=model.tokenizer)
+    with trainer.init_module():
+        model = StreamingSTTModel(
+            OmegaConf.to_container(cfg.model, resolve=True),
+            forced_aligner=forced_aligner,
+            data_cfg=dataset_cfg,
+            dataset_cls=StreamingSTTDataset,
+        )
+
+    dataset = StreamingSTTDataset(cfg=dataset_cfg, tokenizer=model.tokenizer, defer_get_batch=defer_get_batch)
     datamodule = DataModule(cfg.data, tokenizer=model.tokenizer, dataset=dataset)
 
     trainer.fit(model, datamodule)

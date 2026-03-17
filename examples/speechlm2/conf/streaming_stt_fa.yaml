@@ -1,3 +1,8 @@
+forced_aligner:
+  _target_: nemo.collections.speechlm2.modules.qwen_forced_aligner.QwenForcedAligner
+  pretrained_model: "Qwen/Qwen3-ForcedAligner-0.6B"
+  language: "English"
+
 model:
   pretrained_llm: Qwen/Qwen3-1.7B
   pretrained_asr: nvidia/nemotron-speech-streaming-en-0.6b
@@ -108,7 +113,7 @@ trainer:
 exp_manager:
   exp_dir: null
   explicit_log_dir: null
-  name: streaming_stt
+  name: streaming_stt_fa
   create_tensorboard_logger: false
   create_checkpoint_callback: true
   use_datetime_version: true

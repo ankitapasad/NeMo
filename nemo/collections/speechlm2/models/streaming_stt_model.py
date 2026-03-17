@@ -26,13 +26,16 @@ from torch import Tensor
 from torch.distributed.tensor.parallel import loss_parallel
 from transformers import GenerationConfig
 
+from nemo.collections.common.data.utils import move_data_to_device
 from nemo.collections.common.tokenizers import AutoTokenizer
 from nemo.collections.speechlm2.data.streaming_stt_dataset import (
     AUDIO_TOKEN_IDX,
     IGNORE_INDEX,
     StreamingSTTBatch,
+    StreamingSTTDataset,
     decode_with_blank,
 )
+from nemo.collections.speechlm2.parts.alignments import ForcedAligner
 from nemo.collections.speechlm2.parts.hf_hub import HFHubMixin
 from nemo.collections.speechlm2.parts.lora import maybe_install_lora
 from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers, is_frozen
@@ -128,7 +131,13 @@ class StreamingSTTModelConfig:
 
 class StreamingSTTModel(LightningModule, HFHubMixin):
 
-    def __init__(self, cfg: dict) -> None:
+    def __init__(
+        self,
+        cfg: dict,
+        forced_aligner: Optional[ForcedAligner] = None,
+        data_cfg: Optional[DictConfig] = None,
+        dataset_cls=StreamingSTTDataset,
+    ) -> None:
         assert isinstance(cfg, dict), (
             "You must pass the config to StreamingSTTModel as a Python dict to support hyperparameter "
             f"serialization in PTL checkpoints (we got: '{type(cfg)=}')."
@@ -169,6 +178,15 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         )
 
         self._apply_freeze_config()
+
+        if forced_aligner is not None:
+            assert data_cfg is not None, "Dataset config is required for online forced alignment"
+            assert dataset_cls is not None, "Dataset class is required for online forced alignment"
+            self.forced_aligner = forced_aligner
+            self.dataset = dataset_cls(cfg=data_cfg, tokenizer=self.tokenizer)
+        else:
+            self.forced_aligner = None
+            self.dataset = None
 
         logging.info("\n" + str(ModelSummary(self, max_depth=2)))
 
@@ -323,6 +341,17 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             if is_frozen(m):
                 m.eval()
 
+        if self.forced_aligner is not None:
+            alignments = self.forced_aligner.align(batch.audios, batch.audio_lens, batch.text)
+            batch = self.dataset.get_batch_data(
+                cuts=batch.cuts,
+                audios=batch.audios,
+                audio_lens=batch.audio_lens,
+                alignments=alignments,
+                text=batch.text,
+            )
+            batch = move_data_to_device(batch, self.device)
+
         inputs = self._build_input_embeds(batch.input_tokens, batch.audios, batch.audio_lens)
         outputs = self.forward(inputs["input_embeds"], attention_mask=inputs["attention_mask"])
 
@@ -408,6 +437,17 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             self._eval_step(batch, "val", batch_idx)
 
     def _eval_step(self, batch: StreamingSTTBatch, name: str, batch_idx: int = 0) -> None:
+        if self.forced_aligner is not None:
+            alignments = self.forced_aligner.align(batch.audios, batch.audio_lens, batch.text)
+            batch = self.dataset.get_batch_data(
+                cuts=batch.cuts,
+                audios=batch.audios,
+                audio_lens=batch.audio_lens,
+                alignments=alignments,
+                text=batch.text,
+            )
+            batch = move_data_to_device(batch, self.device)
+
         inputs = self._build_input_embeds(batch.input_tokens, batch.audios, batch.audio_lens)
         outputs = self.forward(inputs["input_embeds"], attention_mask=inputs["attention_mask"])
 
@@ -468,6 +508,30 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
     def test_step(self, *args: Any, **kwargs: Any):
         return self.validation_step(*args, **kwargs)
+
+    # ------------------------------------------------------------------
+    # Backward + OOMptimizer
+    # ------------------------------------------------------------------
+
+    def backward(self, *args, **kwargs):
+        with loss_parallel():
+            super().backward(*args, **kwargs)
+
+    @property
+    def oomptimizer_schema(self) -> dict:
+        from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, NeuralType
+
+        return {
+            "cls": StreamingSTTBatch,
+            "inputs": [
+                {"name": "input_tokens", "type": NeuralType(("B", "L"), LabelsType()), "seq_length": "input"},
+                {"name": "input_token_lens", "type": NeuralType(("B",), LengthsType()), "seq_length": "input"},
+                {"name": "target_tokens", "type": NeuralType(("B", "L"), LabelsType()), "seq_length": "input"},
+                {"name": "target_token_lens", "type": NeuralType(("B",), LengthsType()), "seq_length": "input"},
+                {"name": "audios", "type": NeuralType(("B", "T"), AudioSignal()), "seq_length": "input"},
+                {"name": "audio_lens", "type": NeuralType(("B",), LengthsType()), "seq_length": "input"},
+            ],
+        }
 
     # ------------------------------------------------------------------
     # Inference
