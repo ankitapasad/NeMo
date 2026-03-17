@@ -14,6 +14,7 @@
 
 import logging
 import math
+import re
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -45,6 +46,7 @@ class StreamingSTTBatch:
         target_tokens: (B, L) target token IDs for the LLM. Non-trainable positions are IGNORE_INDEX.
         target_token_lens: (B,) lengths of the target token sequences.
         text: list of ground-truth transcription strings.
+        cuts: Optional[CutSet] containing the cuts for the batch.
     """
 
     audios: torch.Tensor
@@ -54,6 +56,7 @@ class StreamingSTTBatch:
     target_tokens: Optional[torch.Tensor] = None
     target_token_lens: Optional[torch.Tensor] = None
     text: Optional[List[str]] = None
+    cuts: Optional[CutSet] = None
 
 
 @dataclass
@@ -69,6 +72,105 @@ class StreamingSTTDataConfig:
     prompt_field: str = "system_prompt"
 
 
+def decode_with_blank(
+    ids: list[int],
+    blank_token: str,
+    tokenizer: AutoTokenizer,
+    replace_blank: Optional[str] = None,
+    strip_whitespace: bool = False,
+    collapse_whitespace: bool = False,
+    join_with: Optional[str] = None,
+) -> str:
+    """Decode token IDs, treating blank tokens as segment boundaries.
+
+    Splits the token sequence at ``blank_token`` boundaries, decodes each
+    segment separately (preserving BPE within each turn), then joins with
+    spaces.
+
+    Args:
+        ids: Token IDs to decode.
+        blank_token: The blank token string (e.g., ``"<blank>"``).
+        tokenizer: NeMo AutoTokenizer.
+        replace_blank: If provided, blank tokens are replaced with this string
+            in the output instead of being skipped.  For example,
+            ``replace_blank=""`` keeps the spacing, ``replace_blank="..."``
+            inserts an ellipsis.
+        strip_whitespace: If True, strip whitespace from the output.
+        collapse_whitespace: If True, collapse multiple consecutive whitespace characters into a single space.
+        join_with: If provided, join the segments divided by blank tokens with this string, else join with empty string.
+    """
+    blank_id = tokenizer.tokenizer.convert_tokens_to_ids(blank_token)
+    segments = []
+    current = []
+    for tid in ids:
+        if tid == blank_id:
+            if current:
+                segments.append(tokenizer.ids_to_tokens(current))
+                current = []
+            if replace_blank is not None:
+                segments.append(replace_blank)
+        else:
+            current.append(tid)
+    if current:
+        segments.append(tokenizer.ids_to_tokens(current))
+
+    text_segments = []
+    for seg in segments:
+        if isinstance(seg, str):
+            text_segments.append(seg)
+        else:
+            text_segments.append(tokenizer.tokens_to_text(seg, remove_special_tokens=False))
+    text = join_with.join(text_segments) if join_with else "".join(text_segments)
+    if strip_whitespace:
+        text = text.strip()
+    if collapse_whitespace:
+        text = re.sub(r'\s+', ' ', text)
+    return text
+
+
+def compute_word_spans(
+    alignments: List[WordAlignment],
+    transcript: str,
+    preserve_whitespace: bool = False,
+) -> List[tuple[int, int]]:
+    """Find (start, end) character positions for each alignment word in the transcript.
+
+    Trailing punctuation (non-alphanumeric, non-whitespace characters) that
+    immediately follows a word is always included in the span so that commas,
+    periods, quotes, etc. are preserved.
+
+    Args:
+        alignments: Word-level alignment results.
+        transcript: Original transcription string.
+        preserve_whitespace: When True, each span extends through trailing
+            whitespace up to (but not including) the next alphanumeric
+            character.  This is useful when extracting multi-word spans so
+            that ``transcript[first_span[0]:last_span[1]]`` includes the
+            inter-word spaces.
+
+    Returns a list parallel to *alignments*.  If a word cannot be located, its
+    span is ``None``.
+    """
+    spans: List[tuple[int, int] | None] = []
+    search_pos = 0
+    for word in alignments:
+        idx = transcript.lower().find(word.text.lower(), search_pos)
+        if idx == -1:
+            spans.append(None)
+            continue
+        end = idx + len(word.text)
+        # Include trailing punctuation (e.g., comma, period, quotes)
+        while end < len(transcript) and not transcript[end].isalnum() and not transcript[end].isspace():
+            end += 1
+        # Optionally include trailing whitespace up to the next word
+        if preserve_whitespace:
+            while end < len(transcript) and transcript[end].isspace():
+                end += 1
+        spans.append((idx, end))
+        search_pos = end
+    return spans
+
+
 def get_llm_messages_for_sample(
     system_role: str,
     system_prompt: str,
@@ -79,6 +181,7 @@ def get_llm_messages_for_sample(
     audio_duration_secs: float,
     frame_length_in_secs: float,
     alignments: Optional[List[WordAlignment]] = None,
+    transcript: Optional[str] = None,
 ) -> List[dict]:
     """
     Get the LLM messages for a sample, using the alignments to determine the turns for the audio and text.
@@ -133,6 +236,9 @@ def get_llm_messages_for_sample(
     if alignments is None:
         alignments = []
 
+    # Pre-compute word character spans if transcript is provided.
+    word_spans = compute_word_spans(alignments, transcript, preserve_whitespace=True) if transcript else None
+
     word_idx = 0
     for chunk_i in range(num_chunks):
         chunk_end_frame = (chunk_i + 1) * chunk_size
@@ -140,21 +246,32 @@ def get_llm_messages_for_sample(
         # User turn: one audio tag per frame in the chunk
         messages.append({"role": "user", "content": audio_tag * chunk_size})
 
-        # Collect words whose end_time (in frames) + delay <= chunk_end_frame
-        ready_words = []
+        # Collect indices of words whose end_time (in frames) + delay <= chunk_end_frame
+        ready_indices = []
         while word_idx < len(alignments):
             word = alignments[word_idx]
             word_end_frame = round(word.end_time / frame_length_in_secs)
             ready_frame = word_end_frame + num_delay_frames
             if ready_frame <= chunk_end_frame:
-                ready_words.append(word.text)
+                ready_indices.append(word_idx)
                 word_idx += 1
             else:
                 break
 
         # Assistant turn: transcribed words or blank
-        if ready_words:
-            messages.append({"role": "assistant", "content": " ".join(ready_words)})
+        if ready_indices:
+            if word_spans and transcript:
+                # Extract the exact substring from the transcript, preserving
+                # punctuation, casing, and inter-word spacing.
+                first_span = word_spans[ready_indices[0]]
+                last_span = word_spans[ready_indices[-1]]
+                if first_span is not None and last_span is not None:
+                    content = transcript[first_span[0] : last_span[1]]
+                else:
+                    content = " ".join(alignments[i].text for i in ready_indices)
+            else:
+                content = " ".join(alignments[i].text for i in ready_indices)
+            messages.append({"role": "assistant", "content": content})
         else:
             messages.append({"role": "assistant", "content": blank_token})
 
@@ -171,6 +288,7 @@ def get_llm_messages_for_batch(
     audio_durations_secs: List[float],
     frame_length_in_secs: float,
     alignments: Optional[List[List[WordAlignment]]] = None,
+    transcripts: Optional[List[str]] = None,
 ) -> List[List[dict]]:
     """
     Get the LLM messages for a batch of samples.
@@ -185,9 +303,18 @@ def get_llm_messages_for_batch(
         audio_durations_secs: List of audio durations in seconds, one per sample.
         frame_length_in_secs: The length of a single frame in seconds.
         alignments: List of lists of WordAlignment objects for the batch.
+        transcripts: Original transcription strings, one per sample.  When provided,
+            assistant turn content preserves punctuation and spacing from the transcript.
     """
+    if transcripts is None:
+        transcripts = [None] * len(audio_durations_secs)
     batch_messages = []
-    for sample_alignments, duration_secs, prompt in zip(alignments, audio_durations_secs, system_prompt):
+    for sample_alignments, duration_secs, prompt, transcript in zip(
+        alignments,
+        audio_durations_secs,
+        system_prompt,
+        transcripts,
+    ):
         batch_messages.append(
             get_llm_messages_for_sample(
                 system_role=system_role,
@@ -199,6 +326,7 @@ def get_llm_messages_for_batch(
                 audio_duration_secs=duration_secs,
                 frame_length_in_secs=frame_length_in_secs,
                 alignments=sample_alignments,
+                transcript=transcript,
             )
         )
     return batch_messages
@@ -206,7 +334,7 @@ def get_llm_messages_for_batch(
 
 def _tokenize_with_assistant_mask(
     messages: List[dict],
-    tokenizer,
+    tokenizer: AutoTokenizer,
 ) -> tuple[list[int], list[int]]:
     """
     Tokenize chat messages and return (input_ids, assistant_mask).
@@ -310,7 +438,15 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
     Operates directly on Lhotse Cuts (no NeMoMultimodalConversation wrapper).
     """
 
-    def __init__(self, cfg: DictConfig | dict, tokenizer: AutoTokenizer):
+    def __init__(self, cfg: DictConfig | dict, tokenizer: AutoTokenizer, defer_get_batch: bool = False):
+        """
+        Args:
+            cfg: Configuration for the dataset.
+            tokenizer: Tokenizer for the dataset.
+            defer_get_batch: If True, defer the get_batch_data call to the __getitem__ method and let the model do it.
+                This is used in online forced alignment mode.
+        """
+        self.defer_get_batch = defer_get_batch
         self.tokenizer = tokenizer
         self.cfg: StreamingSTTDataConfig = to_dataclass(StreamingSTTDataConfig, cfg)
 
@@ -341,12 +477,27 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             logging.warning(f"Error collating audio from cuts: {e}")
             return None
         if len(cuts) == 0:
+            logging.warning("No cuts found in the batch")
             return None
 
+        if self.defer_get_batch:
+            return StreamingSTTBatch(
+                cuts=cuts,
+                audios=audios,
+                audio_lens=audio_lens,
+            )
+
         alignments = get_word_alignments_for_batch(cuts)
+
+        return self.get_batch_data(cuts, audios, audio_lens, alignments)
+
+    def get_batch_data(
+        self, cuts: CutSet, audios: torch.Tensor, audio_lens: torch.Tensor, alignments: List[List[WordAlignment]]
+    ) -> StreamingSTTBatch:
         audio_durations_secs = (audio_lens.float() / self.cfg.sample_rate).tolist()
 
         system_prompts = [cut.custom.get(self.cfg.prompt_field, self.cfg.system_prompt) for cut in cuts]
+        transcripts = [cut.supervisions[0].text for cut in cuts]
 
         batch_messages = get_llm_messages_for_batch(
             system_role=self.cfg.system_role,
@@ -358,6 +509,7 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             audio_durations_secs=audio_durations_secs,
             frame_length_in_secs=self.cfg.frame_length_in_secs,
             alignments=alignments,
+            transcripts=transcripts,
         )
 
         all_input_ids = []

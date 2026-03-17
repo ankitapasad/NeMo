@@ -259,17 +259,21 @@ class AutoTokenizer(TokenizerSpec):
         tokens = self.tokenizer.tokenize(text)
         return tokens
 
-    def tokens_to_text(self, tokens):
+    def tokens_to_text(self, tokens, remove_special_tokens=False):
         """
         Converts a list of tokens back into text.
 
         Args:
             tokens (List[str]): List of tokens to be converted.
-
+            remove_special_tokens (bool): Whether to remove special tokens (like [PAD], [CLS], etc.) from the output
         Returns:
             str: The reconstructed text.
         """
-        text = self.tokenizer.convert_tokens_to_string(tokens)
+        if remove_special_tokens:
+            tokens_clean = [t for t in tokens if t not in self.tokenizer.all_special_tokens]
+        else:
+            tokens_clean = tokens
+        text = self.tokenizer.convert_tokens_to_string(tokens_clean)
         return text
 
     def token_to_id(self, token):

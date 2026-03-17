@@ -27,7 +27,12 @@ from torch.distributed.tensor.parallel import loss_parallel
 from transformers import GenerationConfig
 
 from nemo.collections.common.tokenizers import AutoTokenizer
-from nemo.collections.speechlm2.data.streaming_stt_dataset import AUDIO_TOKEN_IDX, IGNORE_INDEX, StreamingSTTBatch
+from nemo.collections.speechlm2.data.streaming_stt_dataset import (
+    AUDIO_TOKEN_IDX,
+    IGNORE_INDEX,
+    StreamingSTTBatch,
+    decode_with_blank,
+)
 from nemo.collections.speechlm2.parts.hf_hub import HFHubMixin
 from nemo.collections.speechlm2.parts.lora import maybe_install_lora
 from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers, is_frozen
@@ -431,7 +436,6 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
         # Log decoded predictions vs references periodically (first sample in batch).
         if batch_idx % self.core_cfg.log_every_n_steps == 0:
-            blank_id = self.tokenizer.tokenizer.convert_tokens_to_ids(self.blank_token)
             # Per-sample: decode only the first sample's non-IGNORE tokens.
             sample_target = batch.target_tokens[0]
             sample_logits = outputs["logits"][0]
@@ -440,28 +444,8 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             sample_ref_ids = sample_target[mask].tolist()
             sample_pred_ids = sample_preds[mask].tolist()
 
-            def _decode_skip_blank(ids):
-                # Split at <blank> boundaries, decode each segment separately
-                # (preserves BPE within each turn), then join with spaces.
-                segments = []
-                current = []
-                for tid in ids:
-                    if tid == blank_id:
-                        if current:
-                            segments.append(self.tokenizer.ids_to_tokens(current))
-                            current = []
-                    else:
-                        current.append(tid)
-                if current:
-                    segments.append(self.tokenizer.ids_to_tokens(current))
-
-                text_segments = [
-                    self.tokenizer.tokens_to_text(segment, remove_special_tokens=False) for segment in segments
-                ]
-                return " ".join(text_segments)
-
-            ref_decoded = _decode_skip_blank(sample_ref_ids)
-            pred_decoded = _decode_skip_blank(sample_pred_ids)
+            ref_decoded = decode_with_blank(sample_ref_ids, self.blank_token, self.tokenizer)
+            pred_decoded = decode_with_blank(sample_pred_ids, self.blank_token, self.tokenizer)
             ref_text = batch.text[0] if batch.text else ""
             logging.info(
                 "[%s] batch %d\n  gt:         `%s`\n  ref_tokens: `%s`\n  pred:       `%s`",

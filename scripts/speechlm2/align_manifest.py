@@ -79,7 +79,7 @@ def load_audio(audio_path: str) -> np.ndarray:
 
 def get_output_path(input_path: str) -> str:
     """Derive output path by adding '-aligned' suffix before the extension."""
-    p = Path(input_path)
+    p = Path(input_path).absolute()
     return str(p.with_name(f"{p.stem}-aligned{p.suffix}"))
 
 

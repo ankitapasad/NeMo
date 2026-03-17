@@ -35,6 +35,7 @@ from nemo.collections.speechlm2.data.streaming_stt_dataset import (
     IGNORE_INDEX,
     _replace_audio_chunks,
     _tokenize_with_assistant_mask,
+    compute_word_spans,
     get_llm_messages_for_batch,
     get_llm_messages_for_sample,
 )
@@ -323,6 +324,194 @@ class TestGetLlmMessagesForSample:
         assert sum(1 for m in msgs if m["role"] == "user") == 13
         user_msgs = [m for m in msgs if m["role"] == "user"]
         assert all(m["content"] == AUDIO_TAG for m in user_msgs)
+
+
+# ===========================================================================
+# Tests: compute_word_spans
+# ===========================================================================
+class TestComputeWordSpans:
+
+    def test_simple(self):
+        alignments = [
+            WordAlignment(text="hello", start_time=0.0, end_time=0.3),
+            WordAlignment(text="world", start_time=0.4, end_time=0.6),
+        ]
+        spans = compute_word_spans(alignments, "hello world")
+        assert spans == [(0, 5), (6, 11)]
+
+    def test_trailing_punctuation_included(self):
+        alignments = [
+            WordAlignment(text="hello", start_time=0.0, end_time=0.3),
+            WordAlignment(text="world", start_time=0.4, end_time=0.6),
+        ]
+        spans = compute_word_spans(alignments, "hello, world!")
+        assert spans == [(0, 6), (7, 13)]  # "hello," and "world!"
+
+    def test_quotes_included(self):
+        alignments = [
+            WordAlignment(text="good", start_time=0.0, end_time=0.2),
+            WordAlignment(text="night", start_time=0.3, end_time=0.5),
+        ]
+        spans = compute_word_spans(alignments, "'good night'")
+        # "good" found at idx 1, trailing: nothing (space follows)
+        # "night" found at idx 6, trailing: "'"
+        assert spans == [(1, 5), (6, 12)]
+
+    def test_case_insensitive_match(self):
+        alignments = [WordAlignment(text="Hello", start_time=0.0, end_time=0.3)]
+        spans = compute_word_spans(alignments, "HELLO world")
+        assert spans == [(0, 5)]
+
+    def test_word_not_found(self):
+        alignments = [WordAlignment(text="missing", start_time=0.0, end_time=0.3)]
+        spans = compute_word_spans(alignments, "hello world")
+        assert spans == [None]
+
+    def test_sequential_search(self):
+        """Repeated words match sequentially, not all to the first occurrence."""
+        alignments = [
+            WordAlignment(text="the", start_time=0.0, end_time=0.1),
+            WordAlignment(text="the", start_time=0.5, end_time=0.6),
+        ]
+        spans = compute_word_spans(alignments, "the cat and the dog")
+        assert spans == [(0, 3), (12, 15)]
+
+    def test_empty_alignments(self):
+        assert compute_word_spans([], "hello world") == []
+
+    # --- preserve_whitespace ---
+
+    def test_preserve_whitespace_extends_to_next_word(self):
+        alignments = [
+            WordAlignment(text="hello", start_time=0.0, end_time=0.3),
+            WordAlignment(text="world", start_time=0.4, end_time=0.6),
+        ]
+        spans = compute_word_spans(alignments, "hello world", preserve_whitespace=True)
+        # "hello " (includes trailing space), "world" (no trailing space at end)
+        assert spans == [(0, 6), (6, 11)]
+
+    def test_preserve_whitespace_with_punctuation(self):
+        alignments = [
+            WordAlignment(text="hello", start_time=0.0, end_time=0.3),
+            WordAlignment(text="world", start_time=0.4, end_time=0.6),
+        ]
+        spans = compute_word_spans(alignments, "hello, world!", preserve_whitespace=True)
+        # "hello, " (punct + space), "world!" (punct, no trailing space)
+        assert spans == [(0, 7), (7, 13)]
+
+    def test_preserve_whitespace_multi_space(self):
+        alignments = [
+            WordAlignment(text="a", start_time=0.0, end_time=0.1),
+            WordAlignment(text="b", start_time=0.2, end_time=0.3),
+        ]
+        spans = compute_word_spans(alignments, "a   b", preserve_whitespace=True)
+        # "a   " (3 spaces consumed), "b"
+        assert spans == [(0, 4), (4, 5)]
+
+    def test_preserve_whitespace_last_word_no_trailing(self):
+        """Last word's span should not extend beyond the transcript."""
+        alignments = [WordAlignment(text="end", start_time=0.0, end_time=0.3)]
+        spans = compute_word_spans(alignments, "the end", preserve_whitespace=True)
+        assert spans == [(4, 7)]  # no trailing space to consume
+
+
+# ===========================================================================
+# Tests: get_llm_messages_for_sample with transcript
+# ===========================================================================
+class TestTranscriptPreservation:
+
+    def test_punctuation_preserved(self):
+        """Trailing punctuation from transcript should be in assistant content."""
+        alignments = [
+            WordAlignment(text="hello", start_time=0.0, end_time=0.08),
+            WordAlignment(text="world", start_time=0.10, end_time=0.16),
+        ]
+        msgs = get_llm_messages_for_sample(
+            system_role=SYSTEM_ROLE,
+            system_prompt=SYSTEM_PROMPT,
+            audio_tag=AUDIO_TAG,
+            blank_token=BLANK_TOKEN,
+            chunk_size=2,
+            num_delay_frames=0,
+            audio_duration_secs=0.16,
+            frame_length_in_secs=FRAME_LEN,
+            alignments=alignments,
+            transcript="Hello, World!",
+        )
+        asst = [m["content"] for m in msgs if m["role"] == "assistant"]
+        assert asst[0] == "Hello, World!"
+
+    def test_multi_word_chunk_preserves_spacing(self):
+        """Multiple words in one chunk use the transcript's inter-word text."""
+        alignments = [
+            WordAlignment(text="said", start_time=0.0, end_time=0.06),
+            WordAlignment(text="good", start_time=0.07, end_time=0.10),
+        ]
+        msgs = get_llm_messages_for_sample(
+            system_role=SYSTEM_ROLE,
+            system_prompt=SYSTEM_PROMPT,
+            audio_tag=AUDIO_TAG,
+            blank_token=BLANK_TOKEN,
+            chunk_size=2,
+            num_delay_frames=0,
+            audio_duration_secs=0.16,
+            frame_length_in_secs=FRAME_LEN,
+            alignments=alignments,
+            transcript="she said good night",
+        )
+        asst = [m["content"] for m in msgs if m["role"] == "assistant"]
+        assert asst[0] == "said good"
+
+    def test_without_transcript_falls_back(self):
+        """Without transcript, words are joined with plain space."""
+        alignments = [
+            WordAlignment(text="hello", start_time=0.0, end_time=0.08),
+            WordAlignment(text="world", start_time=0.10, end_time=0.16),
+        ]
+        msgs = get_llm_messages_for_sample(
+            system_role=SYSTEM_ROLE,
+            system_prompt=SYSTEM_PROMPT,
+            audio_tag=AUDIO_TAG,
+            blank_token=BLANK_TOKEN,
+            chunk_size=2,
+            num_delay_frames=0,
+            audio_duration_secs=0.16,
+            frame_length_in_secs=FRAME_LEN,
+            alignments=alignments,
+            transcript=None,
+        )
+        asst = [m["content"] for m in msgs if m["role"] == "assistant"]
+        assert asst[0] == "hello world"
+
+    def test_single_word_with_comma(self):
+        """A single word followed by comma should include the comma."""
+        alignments = [
+            WordAlignment(text="yes", start_time=0.0, end_time=0.08),
+            WordAlignment(text="indeed", start_time=0.20, end_time=0.30),
+        ]
+        msgs = get_llm_messages_for_sample(
+            system_role=SYSTEM_ROLE,
+            system_prompt=SYSTEM_PROMPT,
+            audio_tag=AUDIO_TAG,
+            blank_token=BLANK_TOKEN,
+            chunk_size=2,
+            num_delay_frames=0,
+            audio_duration_secs=0.32,
+            frame_length_in_secs=FRAME_LEN,
+            alignments=alignments,
+            transcript="yes, indeed",
+        )
+        asst = [m["content"] for m in msgs if m["role"] == "assistant"]
+        # "yes" is ready at chunk 0 (end_frame=1 <= 2), alone in its chunk
+        assert asst[0] == "yes,"
+
+    def test_blanks_unchanged_with_transcript(self):
+        """Blank chunks still produce <blank> even when transcript is provided."""
+        msgs = _make_messages(transcript="Hello World")
+        asst = [m["content"] for m in msgs if m["role"] == "assistant"]
+        # First two chunks are blank
+        assert asst[0] == BLANK_TOKEN
+        assert asst[1] == BLANK_TOKEN
 
 
 # ===========================================================================
