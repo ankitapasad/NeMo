@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:24.07-py3
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.02-py3
 
 # build an image that includes only the nemo dependencies, ensures that dependencies
 # are included first for optimal caching, and useful for building a development
@@ -184,3 +184,5 @@ RUN INSTALL_MSG=$(/bin/bash /tmp/nemo/scripts/installers/install_ais_cli_latest.
   exit ${INSTALL_CODE}; \
   else echo "Skipping AIS CLI installation"; fi \
   else echo "AIS CLI installed successfully"; fi
+
+RUN pip install qwen_asr
