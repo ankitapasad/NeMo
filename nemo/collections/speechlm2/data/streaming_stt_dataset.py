@@ -78,7 +78,7 @@ def decode_with_blank(
     tokenizer: AutoTokenizer,
     replace_blank: Optional[str] = None,
     strip_whitespace: bool = False,
-    collapse_whitespace: bool = False,
+    collapse_whitespace: bool = True,
     join_with: Optional[str] = None,
 ) -> str:
     """Decode token IDs, treating blank tokens as segment boundaries.
@@ -119,7 +119,7 @@ def decode_with_blank(
         if isinstance(seg, str):
             text_segments.append(seg)
         else:
-            text_segments.append(tokenizer.tokens_to_text(seg, remove_special_tokens=False))
+            text_segments.append(tokenizer.tokens_to_text(seg, remove_special_tokens=True))
     text = join_with.join(text_segments) if join_with else "".join(text_segments)
     if strip_whitespace:
         text = text.strip()
