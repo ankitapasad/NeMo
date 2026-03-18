@@ -18,6 +18,7 @@ import torch
 from omegaconf import OmegaConf
 
 from nemo.core.config import hydra_runner
+from nemo.utils import logging
 from nemo.utils.model_utils import import_class_by_path
 
 
@@ -38,8 +39,10 @@ class HfExportConfig:
     # Dtype used for stored parameters
     dtype: str = "bfloat16"
 
+    weights_only: bool = True
 
-def load_checkpoint(model: torch.nn.Module, checkpoint_path: str):
+
+def load_checkpoint(model: torch.nn.Module, checkpoint_path: str, weights_only: bool = True):
     if Path(checkpoint_path).is_dir():
         from torch.distributed.checkpoint import load
 
@@ -47,7 +50,7 @@ def load_checkpoint(model: torch.nn.Module, checkpoint_path: str):
         load(state_dict, checkpoint_id=checkpoint_path)
         model.load_state_dict(state_dict["state_dict"])
     else:
-        ckpt_data = torch.load(checkpoint_path, map_location="cpu")
+        ckpt_data = torch.load(checkpoint_path, map_location="cpu", weights_only=weights_only)
         model.load_state_dict(ckpt_data["state_dict"])
 
 
@@ -59,13 +62,18 @@ def main(cfg: HfExportConfig):
 
     Also supports distributed checkpoints for models trained with FSDP2/TP.
     """
+    logging.info(f"Exporting model with config: {cfg}")
     model_cfg = OmegaConf.to_container(OmegaConf.load(cfg.ckpt_config).model, resolve=True)
     model_cfg["torch_dtype"] = cfg.dtype
+    logging.info("Instantiating model...")
     cls = import_class_by_path(cfg.class_path)
     model = cls(model_cfg)
-    load_checkpoint(model, cfg.ckpt_path)
+    load_checkpoint(model, cfg.ckpt_path, cfg.weights_only)
+    logging.info("Loading model weights...")
     model = model.to(getattr(torch, cfg.dtype))
+    logging.info("Saving model...")
     model.save_pretrained(cfg.output_dir)
+    logging.info(f"Model saved to {cfg.output_dir}")
 
 
 if __name__ == "__main__":

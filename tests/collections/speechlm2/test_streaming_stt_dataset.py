@@ -133,6 +133,9 @@ class _MockHFTokenizer:
             return [self.AUDIO_TAG_ID]
         if text == self.blank_token:
             return [self.BLANK_ID]
+        # Footer text from the ChatML-like text template
+        if text == "<|im_end|>\n":
+            return [self.FOOTER, self.NEWLINE]
         # Handle repeated audio tags (chunk encoding)
         if self.audio_tag in text and text == self.audio_tag * text.count(self.audio_tag):
             return [self.AUDIO_TAG_ID] * text.count(self.audio_tag)
@@ -148,6 +151,15 @@ class _MockHFTokenizer:
         return list(ids)
 
     def apply_chat_template(self, messages, **kwargs):
+        tokenize = kwargs.get("tokenize", True)
+
+        if not tokenize:
+            # Return ChatML-like text form for sentinel-based footer discovery.
+            text = ""
+            for msg in messages:
+                text += f"<|im_start|>{msg['role']}\n{msg['content']}<|im_end|>\n"
+            return text
+
         input_ids = []
         assistant_masks = []
 
@@ -207,8 +219,10 @@ class _MockHFTokenizerNoGeneration(_MockHFTokenizer):
 
     def apply_chat_template(self, messages, **kwargs):
         result = super().apply_chat_template(messages, **kwargs)
-        # Zero out the masks to simulate missing {% generation %} support
-        result["assistant_masks"] = [0] * len(result["assistant_masks"])
+        # Zero out the masks to simulate missing {% generation %} support.
+        # When tokenize=False, result is a string — pass through unchanged.
+        if isinstance(result, dict):
+            result["assistant_masks"] = [0] * len(result["assistant_masks"])
         return result
 
 
@@ -757,8 +771,8 @@ class TestTokenizeWithAssistantMaskFallback:
     primary path when the tokenizer doesn't support {% generation %}.
     """
 
-    def test_fallback_matches_primary(self):
-        """Fallback mask should equal the primary mask for the docstring example."""
+    def test_fallback_includes_primary_content_plus_footer(self):
+        """Fallback mask should include all primary-masked (content) positions plus footer tokens."""
         msgs = _make_messages()
         primary_tok = _MockHFTokenizer()
         fallback_tok = _MockHFTokenizerNoGeneration()
@@ -770,7 +784,12 @@ class TestTokenizeWithAssistantMaskFallback:
         ids_f, mask_f = _tokenize_with_assistant_mask(msgs, nemo_fallback)
 
         assert ids_p == ids_f, "Token IDs should be identical"
-        assert mask_p == mask_f, "Masks should be identical"
+        # Fallback mask includes all primary-masked (content) positions
+        for i, (mp, mf) in enumerate(zip(mask_p, mask_f)):
+            if mp:
+                assert mf, f"Position {i}: primary has mask=1 but fallback has mask=0"
+        # Fallback has additional masked positions (footer tokens)
+        assert sum(mask_f) > sum(mask_p), "Fallback should have additional footer positions"
 
     def test_fallback_has_nonzero_mask(self):
         """Fallback should produce assistant-masked tokens, not all zeros."""
@@ -781,15 +800,38 @@ class TestTokenizeWithAssistantMaskFallback:
         _, mask = _tokenize_with_assistant_mask(msgs, nemo_tok)
         assert any(mask), "Fallback mask should have at least one assistant token"
 
-    def test_fallback_mask_count_equals_assistant_content(self):
-        """Number of masked tokens should equal total assistant content tokens."""
+    def test_fallback_mask_count_includes_footer(self):
+        """Number of masked tokens should equal assistant content + footer tokens."""
         msgs = _make_messages()
         tok = _MockHFTokenizerNoGeneration()
         nemo_tok = _MockNemoTokenizer(tok)
 
         _, mask = _tokenize_with_assistant_mask(msgs, nemo_tok)
-        # 7 assistant turns: 5 blanks (1 token each) + 2 words (1 token each) = 7
-        assert sum(mask) == 7
+        # 7 assistant turns: 7 content tokens + 7 * 2 footer tokens (FOOTER + NEWLINE) = 21
+        assert sum(mask) == 7 + 7 * _MockHFTokenizer.N_FOOTER
+
+    def test_fallback_footer_tokens_in_mask(self):
+        """Fallback should include end-of-turn footer tokens in the assistant mask."""
+        msgs = [
+            {"role": "system", "content": "test"},
+            {"role": "user", "content": "<audio><audio>"},
+            {"role": "assistant", "content": "<blank>"},
+        ]
+        tok = _MockHFTokenizerNoGeneration()
+        nemo_tok = _MockNemoTokenizer(tok)
+
+        input_ids, mask = _tokenize_with_assistant_mask(msgs, nemo_tok)
+
+        # Find the blank token position
+        blank_id = _MockHFTokenizer.BLANK_ID
+        blank_pos = input_ids.index(blank_id)
+
+        # The two tokens after blank should be FOOTER and NEWLINE, both masked
+        assert input_ids[blank_pos + 1] == _MockHFTokenizer.FOOTER
+        assert input_ids[blank_pos + 2] == _MockHFTokenizer.NEWLINE
+        assert mask[blank_pos] == 1, "Content token should be masked"
+        assert mask[blank_pos + 1] == 1, "FOOTER token should be masked"
+        assert mask[blank_pos + 2] == 1, "NEWLINE token should be masked"
 
     def test_fallback_pipeline_produces_trainable_targets(self):
         """Full pipeline with fallback tokenizer should have non-zero trainable targets."""
@@ -799,3 +841,20 @@ class TestTokenizeWithAssistantMaskFallback:
 
         n_trainable = sum(1 for t in target_ids if t != IGNORE_INDEX)
         assert n_trainable > 0, "Should have trainable targets with fallback mask"
+
+    def test_fallback_eot_in_target(self):
+        """After shift, the model should be trained to predict the end-of-turn token."""
+        msgs = [
+            {"role": "system", "content": "test"},
+            {"role": "user", "content": "<audio><audio>"},
+            {"role": "assistant", "content": "<blank>"},
+        ]
+        tok = _MockHFTokenizerNoGeneration()
+        input_ids, target_ids, _ = _run_pipeline(msgs, tok)
+
+        # The FOOTER token (end-of-turn) should appear as a trainable target
+        footer_id = _MockHFTokenizer.FOOTER
+        assert footer_id in target_ids, "FOOTER should appear as a trainable target"
+        # Verify it's not masked out
+        footer_target_pos = target_ids.index(footer_id)
+        assert target_ids[footer_target_pos] != IGNORE_INDEX

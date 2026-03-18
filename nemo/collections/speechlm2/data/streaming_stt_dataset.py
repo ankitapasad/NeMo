@@ -373,6 +373,40 @@ def _tokenize_with_assistant_mask(
     # across turn boundaries.
     assistant_mask = [0] * len(input_ids)
 
+    # Discover assistant end-of-turn footer tokens (e.g. <|im_end|>\n for ChatML)
+    # so we can include them in the mask.  Uses the same sentinel technique as
+    # StreamingSTTModel._ensure_inference_cache.
+    _SENTINEL = "XSENTINELX"
+    convo_text = hf_tok.apply_chat_template(
+        [
+            {"role": "user", "content": _SENTINEL},
+            {"role": "assistant", "content": _SENTINEL},
+            {"role": "user", "content": "x"},
+            {"role": "assistant", "content": "x"},
+        ],
+        tokenize=False,
+        add_generation_prompt=False,
+        enable_thinking=False,
+    )
+    parts = convo_text.split(_SENTINEL)
+    # parts[0] = user header       (e.g. "<|im_start|>user\n")
+    # parts[2] = assistant footer + remaining dummy turns
+    # Here's what parts[2] looks like for ChatML after splitting on the sentinel:
+    # <|im_end|>\n<|im_start|>user\nx<|im_end|>\n<|im_start|>assistant\nx<|im_end|>\n
+    # ^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    # footer we want    remaining dummy turns (garbage we need to trim)
+    #
+    # We know the next turn starts with the same pattern as parts[0] (the user header, e.g., <|im_start|>user\n).
+    # So we search for it to find where the footer ends and the next turn begins:
+    # footer_and_rest = "<|im_end|>\n<|im_start|>user\nx<|im_end|>\n..."
+    #                                ^--- next_turn = 11 (found user header here)
+    # footer_text = footer_and_rest[:11] = "<|im_end|>\n"  ← just the footer
+    user_header = parts[0].lstrip()  # strip potential BOS text
+    footer_and_rest = parts[2]
+    next_turn = footer_and_rest.find(user_header)
+    footer_text = footer_and_rest[:next_turn] if next_turn > 0 else ""
+    footer_ids = hf_tok.encode(footer_text, add_special_tokens=False) if footer_text else []
+
     assistant_content_ids = []
     for msg in messages:
         if msg["role"] == "assistant":
@@ -387,7 +421,12 @@ def _tokenize_with_assistant_mask(
         for i in range(pos, len(input_ids) - clen + 1):
             if input_ids[i : i + clen] == content_ids:
                 assistant_mask[i : i + clen] = [1] * clen
-                pos = i + clen
+                # Include the end-of-turn footer tokens in the mask so the model
+                # learns content → <|im_end|> (or equivalent).
+                flen = len(footer_ids)
+                end = min(i + clen + flen, len(input_ids))
+                assistant_mask[i + clen : end] = [1] * (end - i - clen)
+                pos = end
                 break
 
     return input_ids, assistant_mask

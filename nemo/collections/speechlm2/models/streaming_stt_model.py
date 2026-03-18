@@ -11,10 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
 import re
 import warnings
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, List, Optional
 
 import torch
@@ -24,8 +25,6 @@ from lightning.pytorch.utilities.model_summary import ModelSummary
 from omegaconf import DictConfig
 from torch import Tensor
 from torch.distributed.tensor.parallel import loss_parallel
-from transformers import GenerationConfig
-
 from nemo.collections.common.data.utils import move_data_to_device
 from nemo.collections.common.tokenizers import AutoTokenizer
 from nemo.collections.speechlm2.data.streaming_stt_dataset import (
@@ -42,6 +41,15 @@ from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers, i
 from nemo.collections.speechlm2.parts.pretrained import load_pretrained_hf, move_embedding, setup_perception
 from nemo.collections.speechlm2.parts.utils import freeze_module, to_dataclass, unfreeze_module
 from nemo.utils import logging
+
+
+def _find_sublist(haystack: list, needle: list) -> int | None:
+    """Return the start index of *needle* in *haystack*, or ``None``."""
+    n = len(needle)
+    for i in range(len(haystack) - n + 1):
+        if haystack[i : i + n] == needle:
+            return i
+    return None
 
 
 def interleave_embeddings(
@@ -124,9 +132,21 @@ class StreamingSTTModelConfig:
     freeze_llm_head: bool
     freeze_embed_tokens: bool
     chunk_size: int
+    audio_tag: str = "<audio>"
     att_context_size: Optional[List[int]] = None
     audio_pad_to: Optional[int] = None
+    sample_rate: int = 16000
+    frame_length_in_secs: float = 0.08
     log_every_n_steps: int = 10
+
+
+@dataclass
+class StreamingState:
+    """Holds the KV cache and other state for one streaming audio session."""
+
+    cache: tuple | None = None  # HF past_key_values
+    generated_tokens: list[list[int]] = field(default_factory=list)  # per-chunk generated token IDs
+    seq_len: int = 0  # total sequence length seen so far
 
 
 class StreamingSTTModel(LightningModule, HFHubMixin):
@@ -537,54 +557,355 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
     # Inference
     # ------------------------------------------------------------------
 
+    def _ensure_inference_cache(self) -> None:
+        """Lazily cache token templates and IDs needed for streaming inference.
+
+        Uses ``apply_chat_template(tokenize=False)`` on a 4-message dummy
+        conversation and splits the text around a sentinel to isolate
+        user-header, user-footer + assistant-header, and assistant-footer tokens.
+
+        The 4-message pattern (two user+assistant pairs) ensures the *first*
+        assistant turn is not the last — this prevents Qwen3-style chat
+        templates from injecting ``<think>``/``</think>`` tags, which only
+        appear on the final assistant turn.
+        """
+        if hasattr(self, '_turn_template_ids'):
+            return
+
+        hf_tok = self.tokenizer.tokenizer
+        chunk_size = self.core_cfg.chunk_size
+        _SENTINEL = "XSENTINELX"
+
+        # --- Build turn template from text form of a 4-message conversation ---
+        # The sentinel appears in the first user+assistant pair.  A second
+        # dummy pair ensures the first assistant turn is NOT the last, so
+        # Qwen3 think tags are not injected.
+        convo_text = hf_tok.apply_chat_template(
+            [
+                {"role": "user", "content": _SENTINEL},
+                {"role": "assistant", "content": _SENTINEL},
+                {"role": "user", "content": "x"},
+                {"role": "assistant", "content": "x"},
+            ],
+            tokenize=False,
+            add_generation_prompt=False,
+            enable_thinking=False,
+        )
+        parts = convo_text.split(_SENTINEL)
+        assert len(parts) >= 3, f"Expected >=3 parts after splitting on sentinel, got {len(parts)}: {parts}"
+        # parts[0] = user header       (e.g. "<|im_start|>user\n")
+        # parts[1] = user footer + assistant header (e.g. "<|im_end|>\n<|im_start|>assistant\n")
+        # parts[2] = assistant footer + remaining dummy turns
+
+        user_header_ids = hf_tok.encode(parts[0], add_special_tokens=False)
+        user_footer_and_asst_header_ids = hf_tok.encode(parts[1], add_special_tokens=False)
+
+        # Trim the assistant footer at the next turn boundary.
+        asst_footer_and_rest = parts[2]
+        next_turn = asst_footer_and_rest.find("<|im_start|>")
+        asst_footer_text = asst_footer_and_rest[:next_turn] if next_turn >= 0 else asst_footer_and_rest
+        self._asst_footer_ids = hf_tok.encode(asst_footer_text, add_special_tokens=False)
+
+        # Strip leading BOS — it is already in the KV cache from the system prompt.
+        bos_id = getattr(hf_tok, "bos_token_id", None)
+        if user_header_ids and bos_id is not None and user_header_ids[0] == bos_id:
+            user_header_ids = user_header_ids[1:]
+
+        turn_ids = user_header_ids + [AUDIO_TOKEN_IDX] * chunk_size + user_footer_and_asst_header_ids
+        self._turn_template_ids = turn_ids
+        n_audio = turn_ids.count(AUDIO_TOKEN_IDX)
+        logging.info(
+            f"Streaming turn template ({len(turn_ids)} tokens, "
+            f"{n_audio} audio slots, chunk_size={chunk_size}): {turn_ids}"
+        )
+
+        self._blank_id = hf_tok.convert_tokens_to_ids(self.blank_token)
+        self._eos_id = getattr(hf_tok, 'eos_token_id', None)
+        logging.info(
+            f"Assistant footer IDs: {self._asst_footer_ids}, " f"blank ID: {self._blank_id}, EOS ID: {self._eos_id}"
+        )
+
+    def _greedy_decode(
+        self,
+        logits: Tensor,
+        cache: tuple,
+        max_new_tokens: int,
+    ) -> tuple[list[int], tuple, bool]:
+        """Greedy autoregressive decoding from initial LLM logits.
+
+        Generation stops when any of these conditions is met (checked in order):
+
+        1. **EOS** — the tokenizer's ``eos_token_id`` is predicted.  The token is
+           *not* fed to the LLM and *not* included in the output.
+        2. **Blank** — the ``<blank>`` token is predicted.  It is fed to the LLM
+           (so the KV cache stays consistent) and included in the output.
+        3. **Footer sequence** — the last *N* generated tokens match
+           ``self._asst_footer_ids`` (e.g. ``[<|im_end|>, \\n]``).  All *N*
+           tokens have been fed to the LLM; they are stripped from the output
+           and ``footer_consumed`` is set to ``True``.
+        4. **Max tokens** — ``max_new_tokens`` is reached.
+
+        Returns:
+            ``(generated_token_ids, updated_cache, footer_consumed)`` —
+            *footer_consumed* is ``True`` when the footer sequence was detected
+            and is already present in the KV cache.
+        """
+        footer = self._asst_footer_ids
+        flen = len(footer)
+        next_token = logits[:, -1, :].argmax(dim=-1)
+        generated = []
+        footer_consumed = False
+
+        while len(generated) < max_new_tokens:
+            tid = next_token.item()
+
+            # EOS: stop without feeding to LLM
+            if self._eos_id is not None and tid == self._eos_id:
+                break
+
+            # Append token and feed to LLM
+            generated.append(tid)
+            token_emb = self.embed_tokens(next_token.unsqueeze(0))
+            out = self.llm(
+                inputs_embeds=token_emb,
+                past_key_values=cache,
+                use_cache=True,
+                return_dict=True,
+            )
+            cache = out.past_key_values
+
+            # Blank: stop (token is in cache and in generated)
+            if tid == self._blank_id:
+                break
+
+            # Footer sequence match
+            if flen > 0 and len(generated) >= flen and generated[-flen:] == footer:
+                generated = generated[:-flen]
+                footer_consumed = True
+                break
+
+            next_token = out.logits[:, -1, :].argmax(dim=-1)
+
+        return generated, cache, footer_consumed
+
+    def _init_streaming_state(self, system_prompt: str, device: torch.device) -> StreamingState:
+        """Forward the system prompt through the LLM and return a fresh :class:`StreamingState`."""
+        hf_tok = self.tokenizer.tokenizer
+        sys_ids = hf_tok.apply_chat_template(
+            [{"role": "system", "content": system_prompt}],
+            tokenize=True,
+            add_generation_prompt=False,
+            enable_thinking=False,
+        )
+        sys_embs = self.embed_tokens(torch.tensor(sys_ids, device=device).unsqueeze(0))
+        out = self.llm(inputs_embeds=sys_embs, use_cache=True, return_dict=True)
+        return StreamingState(
+            cache=out.past_key_values,
+            generated_tokens=[],
+            seq_len=sys_embs.shape[1],
+        )
+
+    @torch.no_grad()
+    def generate_streaming(
+        self,
+        audio_chunk_embs: Tensor,
+        state: StreamingState,
+        max_new_tokens: int = 64,
+    ) -> list[int]:
+        """
+        Process one audio chunk and generate the assistant response.
+
+        Builds the user turn from ``audio_chunk_embs`` using the same
+        ``apply_chat_template`` + ``AUDIO_TOKEN_IDX`` replacement pattern as
+        :class:`StreamingSTTDataset`, forwards through the LLM with the KV cache
+        in ``state``, runs greedy autoregressive decoding until end-of-turn or
+        ``max_new_tokens``, then finalizes the assistant turn in the cache.
+
+        Args:
+            audio_chunk_embs: (1, chunk_size, H) frame embeddings for this chunk.
+            state: Mutable :class:`StreamingState` (updated in place).
+            max_new_tokens: Maximum tokens to generate per chunk.
+
+        Returns:
+            List of generated token IDs (excluding end-of-turn tokens).
+        """
+        self._ensure_inference_cache()
+        device = audio_chunk_embs.device
+
+        # 1. Build input embeddings from cached turn template
+        turn_ids_t = torch.tensor(self._turn_template_ids, device=device).unsqueeze(0)  # (1, L)
+        audio_mask = turn_ids_t == AUDIO_TOKEN_IDX  # (1, L)
+
+        # Embed text tokens (zero out audio positions for valid embedding lookup)
+        text_tokens = turn_ids_t.where(~audio_mask, torch.zeros_like(turn_ids_t))
+        input_embeds = self.embed_tokens(text_tokens)  # (1, L, H)
+
+        # Replace audio placeholder positions with actual audio embeddings
+        input_embeds[audio_mask] = audio_chunk_embs.reshape(-1, audio_chunk_embs.shape[-1])
+
+        # 2. Forward through LLM with cache
+        out = self.llm(
+            inputs_embeds=input_embeds,
+            past_key_values=state.cache,
+            use_cache=True,
+            return_dict=True,
+        )
+        state.cache = out.past_key_values
+        state.seq_len += input_embeds.shape[1]
+
+        # 3. Autoregressive generation loop
+        generated, state.cache, footer_consumed = self._greedy_decode(out.logits, state.cache, max_new_tokens)
+        state.seq_len += len(generated)
+
+        # 4. Finalize turn — ensure end-of-turn tokens are in the cache.
+        #    If _greedy_decode already consumed the footer (matched the full
+        #    sequence), it is already in the KV cache; only update seq_len.
+        #    Otherwise, feed the footer explicitly.
+        if footer_consumed:
+            state.seq_len += len(self._asst_footer_ids)
+        elif self._asst_footer_ids:
+            asst_footer_embs = self.embed_tokens(torch.tensor(self._asst_footer_ids, device=device).unsqueeze(0))
+            out = self.llm(
+                inputs_embeds=asst_footer_embs,
+                past_key_values=state.cache,
+                use_cache=True,
+                return_dict=True,
+            )
+            state.cache = out.past_key_values
+            state.seq_len += asst_footer_embs.shape[1]
+
+        # 5. Store and return
+        state.generated_tokens.append(generated)
+        return generated
+
+    def _generate_streaming_sample(
+        self,
+        audio_embs_b: Tensor,
+        n_frames: int,
+        system_prompt: str,
+        max_new_tokens: int,
+    ) -> str:
+        """Chunk-by-chunk streaming generation for one sample."""
+        if n_frames == 0:
+            return ""
+        device = audio_embs_b.device
+        chunk_size = self.core_cfg.chunk_size
+        state = self._init_streaming_state(system_prompt, device)
+
+        num_chunks = math.ceil(n_frames / chunk_size)
+        all_token_ids = []
+        for i in range(num_chunks):
+            start = i * chunk_size
+            end = min(start + chunk_size, n_frames)
+            chunk_embs = audio_embs_b[start:end].unsqueeze(0)  # (1, C, H)
+
+            # Pad last chunk with zeros if shorter than chunk_size
+            if chunk_embs.shape[1] < chunk_size:
+                pad_len = chunk_size - chunk_embs.shape[1]
+                chunk_embs = F.pad(chunk_embs, (0, 0, 0, pad_len))
+
+            all_token_ids.extend(self.generate_streaming(chunk_embs, state, max_new_tokens))
+
+        return decode_with_blank(all_token_ids, self.blank_token, self.tokenizer)
+
+    def _generate_oneshot_sample(
+        self,
+        audio_embs_b: Tensor,
+        n_frames: int,
+        system_prompt: str,
+        max_new_tokens: int,
+    ) -> str:
+        """One-shot generation: feed all audio in a single user turn."""
+        if n_frames == 0:
+            return ""
+        hf_tok = self.tokenizer.tokenizer
+        device = audio_embs_b.device
+        _SENTINEL = "XSENTINELX"
+
+        # Build input with system prompt + user turn (sentinel placeholder) + generation prompt
+        input_ids = list(
+            hf_tok.apply_chat_template(
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": _SENTINEL},
+                ],
+                tokenize=True,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+        )
+        sentinel_ids = hf_tok.encode(_SENTINEL, add_special_tokens=False)
+        sentinel_start = _find_sublist(input_ids, sentinel_ids)
+        assert sentinel_start is not None, "Could not find sentinel in one-shot input template"
+        input_ids = (
+            input_ids[:sentinel_start] + [AUDIO_TOKEN_IDX] * n_frames + input_ids[sentinel_start + len(sentinel_ids) :]
+        )
+
+        # Build embeddings — same interleave pattern as training
+        input_ids_t = torch.tensor(input_ids, device=device).unsqueeze(0)
+        audio_mask = input_ids_t == AUDIO_TOKEN_IDX
+        text_tokens = input_ids_t.where(~audio_mask, torch.zeros_like(input_ids_t))
+        input_embeds = self.embed_tokens(text_tokens)
+        input_embeds[audio_mask] = audio_embs_b[:n_frames]
+
+        # Forward + decode
+        out = self.llm(inputs_embeds=input_embeds, use_cache=True, return_dict=True)
+        generated, _, _ = self._greedy_decode(out.logits, out.past_key_values, max_new_tokens)
+
+        return self.tokenizer.ids_to_text(generated)
+
     @torch.no_grad()
     def generate(
         self,
-        input_tokens: Tensor,
-        audios: Tensor | None = None,
-        audio_lens: Tensor | None = None,
-        generation_config: GenerationConfig | None = None,
-        **generation_kwargs,
-    ) -> Tensor:
+        audios: Tensor,
+        audio_lens: Tensor,
+        system_prompt: str = "Transcribe the audio into text.",
+        max_new_tokens: int = 64,
+        simulate_streaming: bool = True,
+    ) -> list[str]:
         """
-        Generate text from (optionally) audio-augmented token prompts.
+        Transcribe full audio(s).
 
         Args:
-            input_tokens: (B, L) token IDs with ``AUDIO_TOKEN_IDX`` at audio
-                positions (if audio is provided).
-            audios: (B, T_samples) raw waveforms, or *None* for text-only.
+            audios: (B, T_samples) raw waveforms.
             audio_lens: (B,) waveform lengths in samples.
-            generation_config: HuggingFace ``GenerationConfig``.
-            **generation_kwargs: forwarded to ``self.llm.generate()``.
+            system_prompt: System prompt for the LLM.
+            max_new_tokens: Maximum tokens to generate per chunk/turn.
+            simulate_streaming: When ``True``, processes audio chunk-by-chunk
+                (simulating real-time streaming with alternating user/assistant
+                turns and ``<blank>`` tokens).  When ``False`` (default), feeds
+                all audio in a single user turn for direct transcription.
 
         Returns:
-            Generated token IDs tensor.
+            List of transcription strings, one per sample.
         """
-        if audios is not None:
-            inputs = self._build_input_embeds(input_tokens, audios, audio_lens)
-            generation_inputs = {
-                "inputs_embeds": inputs["input_embeds"],
-                "attention_mask": inputs["attention_mask"],
-            }
-        else:
-            generation_inputs = {
-                "input_ids": input_tokens,
-                "attention_mask": input_tokens != self.text_pad_id,
-            }
+        self._ensure_inference_cache()
 
-        if generation_config is None:
-            generation_config = GenerationConfig(
-                bos_token_id=self.text_bos_id,
-                eos_token_id=self.text_eos_id,
-                pad_token_id=self.text_pad_id,
-            )
-
-        # Temporarily restore embed_tokens inside the LLM so HF's generate()
-        # can embed newly produced tokens during autoregressive decoding.
         with move_embedding(self):
-            answer_tokens = self.llm.generate(
-                **generation_inputs,
-                **generation_kwargs,
-                generation_config=generation_config,
-            )
-        return answer_tokens
+            # --- Encode all audio (batched) ---
+            audio_embs, audio_emb_lens = self.perception(
+                input_signal=audios,
+                input_signal_length=audio_lens,
+            )  # (B, T_total_frames, H)
+
+            B = audios.shape[0]
+            results = []
+            for b in range(B):
+                n_frames = int(audio_emb_lens[b].item())
+                if simulate_streaming:
+                    text = self._generate_streaming_sample(
+                        audio_embs[b],
+                        n_frames,
+                        system_prompt,
+                        max_new_tokens,
+                    )
+                else:
+                    text = self._generate_oneshot_sample(
+                        audio_embs[b],
+                        n_frames,
+                        system_prompt,
+                        max_new_tokens,
+                    )
+                results.append(text)
+
+        return results
