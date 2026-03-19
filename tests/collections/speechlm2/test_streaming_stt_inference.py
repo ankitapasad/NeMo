@@ -163,6 +163,12 @@ class TestEnsureInferenceCache:
         mock = _run_ensure_cache(hf_tok)
         assert mock._eos_id == hf_tok.eos_token_id
 
+    def test_eos_in_footer(self, hf_tok):
+        """For Qwen3, eos_token_id (<|im_end|>) is the first token of the footer."""
+        mock = _run_ensure_cache(hf_tok)
+        assert mock._eos_in_footer is True
+        assert mock._eos_id == mock._asst_footer_ids[0]
+
     def test_blank_id(self, hf_tok):
         """Blank token ID should be resolved (not UNK)."""
         mock = _make_mock_self(hf_tok)
@@ -182,8 +188,10 @@ class TestEnsureInferenceCache:
         first_template = list(mock._turn_template_ids)
         first_footer = list(mock._asst_footer_ids)
         first_eos = mock._eos_id
+        first_eos_in_footer = mock._eos_in_footer
 
         StreamingSTTModel._ensure_inference_cache(mock)
         assert mock._turn_template_ids == first_template
         assert mock._asst_footer_ids == first_footer
         assert mock._eos_id == first_eos
+        assert mock._eos_in_footer == first_eos_in_footer

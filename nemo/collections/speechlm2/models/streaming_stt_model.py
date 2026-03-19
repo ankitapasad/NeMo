@@ -16,7 +16,7 @@ import re
 import warnings
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Union
 
 import torch
 import torch.nn.functional as F
@@ -25,6 +25,8 @@ from lightning.pytorch.utilities.model_summary import ModelSummary
 from omegaconf import DictConfig
 from torch import Tensor
 from torch.distributed.tensor.parallel import loss_parallel
+from transformers import GenerationConfig
+
 from nemo.collections.common.data.utils import move_data_to_device
 from nemo.collections.common.tokenizers import AutoTokenizer
 from nemo.collections.speechlm2.data.streaming_stt_dataset import (
@@ -33,6 +35,7 @@ from nemo.collections.speechlm2.data.streaming_stt_dataset import (
     StreamingSTTBatch,
     StreamingSTTDataset,
     decode_with_blank,
+    parse_chat_template_ids,
 )
 from nemo.collections.speechlm2.parts.alignments import ForcedAligner
 from nemo.collections.speechlm2.parts.hf_hub import HFHubMixin
@@ -574,42 +577,10 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
         hf_tok = self.tokenizer.tokenizer
         chunk_size = self.core_cfg.chunk_size
-        _SENTINEL = "XSENTINELX"
 
-        # --- Build turn template from text form of a 4-message conversation ---
-        # The sentinel appears in the first user+assistant pair.  A second
-        # dummy pair ensures the first assistant turn is NOT the last, so
-        # Qwen3 think tags are not injected.
-        convo_text = hf_tok.apply_chat_template(
-            [
-                {"role": "user", "content": _SENTINEL},
-                {"role": "assistant", "content": _SENTINEL},
-                {"role": "user", "content": "x"},
-                {"role": "assistant", "content": "x"},
-            ],
-            tokenize=False,
-            add_generation_prompt=False,
-            enable_thinking=False,
-        )
-        parts = convo_text.split(_SENTINEL)
-        assert len(parts) >= 3, f"Expected >=3 parts after splitting on sentinel, got {len(parts)}: {parts}"
-        # parts[0] = user header       (e.g. "<|im_start|>user\n")
-        # parts[1] = user footer + assistant header (e.g. "<|im_end|>\n<|im_start|>assistant\n")
-        # parts[2] = assistant footer + remaining dummy turns
-
-        user_header_ids = hf_tok.encode(parts[0], add_special_tokens=False)
-        user_footer_and_asst_header_ids = hf_tok.encode(parts[1], add_special_tokens=False)
-
-        # Trim the assistant footer at the next turn boundary.
-        asst_footer_and_rest = parts[2]
-        next_turn = asst_footer_and_rest.find("<|im_start|>")
-        asst_footer_text = asst_footer_and_rest[:next_turn] if next_turn >= 0 else asst_footer_and_rest
-        self._asst_footer_ids = hf_tok.encode(asst_footer_text, add_special_tokens=False)
-
-        # Strip leading BOS — it is already in the KV cache from the system prompt.
-        bos_id = getattr(hf_tok, "bos_token_id", None)
-        if user_header_ids and bos_id is not None and user_header_ids[0] == bos_id:
-            user_header_ids = user_header_ids[1:]
+        # --- Build turn template from the shared template parser ---
+        user_header_ids, user_footer_and_asst_header_ids, asst_footer_ids = parse_chat_template_ids(hf_tok)
+        self._asst_footer_ids = asst_footer_ids
 
         turn_ids = user_header_ids + [AUDIO_TOKEN_IDX] * chunk_size + user_footer_and_asst_header_ids
         self._turn_template_ids = turn_ids
@@ -621,28 +592,147 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
         self._blank_id = hf_tok.convert_tokens_to_ids(self.blank_token)
         self._eos_id = getattr(hf_tok, 'eos_token_id', None)
+
+        # When eos_token_id coincides with a token in the footer (e.g. Qwen3
+        # where eos = <|im_end|> = footer[0]), detecting EOS acts as an
+        # early-stop shortcut that avoids generating the remaining footer
+        # tokens.  When eos_token_id is NOT in the footer it serves as a
+        # safety-net stop only.
+        self._eos_in_footer = self._eos_id is not None and self._eos_id in self._asst_footer_ids
         logging.info(
-            f"Assistant footer IDs: {self._asst_footer_ids}, " f"blank ID: {self._blank_id}, EOS ID: {self._eos_id}"
+            f"Assistant footer IDs: {self._asst_footer_ids}, "
+            f"blank ID: {self._blank_id}, EOS ID: {self._eos_id}, "
+            f"EOS in footer: {self._eos_in_footer}"
         )
 
-    def _greedy_decode(
+    def _sample_token(
+        self,
+        logits: Tensor,
+        generated_ids: list[int] | None = None,
+        generation_config: Optional[GenerationConfig] = None,
+        **generation_kwargs,
+    ) -> Tensor:
+        """Select the next token from logits.
+
+        Applies the following transforms in order (each is skipped when the
+        corresponding parameter is at its default/off value):
+
+        1. **Suppress tokens** — force listed token IDs to ``-inf``.
+        2. **No-repeat-ngram** — block n-grams that already appear in
+           *generated_ids*.
+        3. **Repetition penalty** — scale logits for tokens that already appear
+           in *generated_ids*.
+        4. **Temperature** — divide logits by temperature.
+        5. **Top-k** — keep only the *k* highest-scoring tokens.
+        6. **Top-p (nucleus)** — keep the smallest set of tokens whose
+           cumulative probability is ≥ *top_p*.
+        7. If ``do_sample`` is ``True``, sample from the filtered distribution;
+           otherwise return the argmax.
+
+        Parameters are read from *generation_kwargs* first, falling back to
+        *generation_config*, then to HuggingFace defaults.
+
+        Args:
+            logits: ``(1, vocab_size)`` logits for the last position.
+            generated_ids: Token IDs generated so far (for repetition-aware
+                transforms).  May be ``None`` or empty.
+            generation_config: Optional HuggingFace ``GenerationConfig``.
+            generation_kwargs: Per-call overrides.
+
+        Returns:
+            ``(1,)`` tensor with the selected token ID.
+        """
+        # Fast path: no config → greedy
+        if generation_config is None and not generation_kwargs:
+            return logits.argmax(dim=-1)
+
+        cfg = generation_config or GenerationConfig()
+        do_sample = generation_kwargs.get('do_sample', cfg.do_sample)
+        temperature = generation_kwargs.get('temperature', cfg.temperature)
+        top_k = generation_kwargs.get('top_k', cfg.top_k)
+        top_p = generation_kwargs.get('top_p', cfg.top_p)
+        repetition_penalty = generation_kwargs.get('repetition_penalty', cfg.repetition_penalty)
+        no_repeat_ngram_size = generation_kwargs.get('no_repeat_ngram_size', cfg.no_repeat_ngram_size)
+        suppress_tokens = generation_kwargs.get('suppress_tokens', cfg.suppress_tokens)
+
+        # --- logit manipulation (order matters) ---
+
+        # 1. Suppress tokens
+        if suppress_tokens:
+            logits[..., suppress_tokens] = float('-inf')
+
+        # 2. No-repeat-ngram blocking
+        if no_repeat_ngram_size > 0 and generated_ids and len(generated_ids) >= no_repeat_ngram_size - 1:
+            ngram_prefix = generated_ids[-(no_repeat_ngram_size - 1) :]
+            for i in range(len(generated_ids) - no_repeat_ngram_size + 1):
+                if generated_ids[i : i + no_repeat_ngram_size - 1] == ngram_prefix:
+                    # The token that followed this prefix last time is banned
+                    logits[..., generated_ids[i + no_repeat_ngram_size - 1]] = float('-inf')
+
+        # 3. Repetition penalty
+        if repetition_penalty != 1.0 and generated_ids:
+            prev_token_ids = torch.tensor(list(set(generated_ids)), device=logits.device)
+            scores = logits[..., prev_token_ids]
+            # Penalize: divide positive scores, multiply negative scores
+            logits[..., prev_token_ids] = torch.where(
+                scores > 0, scores / repetition_penalty, scores * repetition_penalty
+            )
+
+        # Greedy fast path (no sampling-related transforms needed)
+        if not do_sample:
+            return logits.argmax(dim=-1)
+
+        # 4. Temperature scaling
+        if temperature > 0 and temperature != 1.0:
+            logits = logits / temperature
+
+        # 5. Top-k filtering
+        if top_k > 0:
+            k = min(top_k, logits.size(-1))
+            kth_val = torch.topk(logits, k, dim=-1)[0][..., -1:]
+            logits = logits.masked_fill(logits < kth_val, float('-inf'))
+
+        # 6. Top-p (nucleus) filtering
+        if 0 < top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+            # Mark tokens whose cumulative probability (excluding themselves) >= top_p
+            sorted_mask = cumulative_probs - F.softmax(sorted_logits, dim=-1) >= top_p
+            indices_to_remove = sorted_mask.scatter(dim=-1, index=sorted_indices, src=sorted_mask)
+            logits = logits.masked_fill(indices_to_remove, float('-inf'))
+
+        # 7. Sample
+        probs = F.softmax(logits, dim=-1)
+        return torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+    def _streaming_decode(
         self,
         logits: Tensor,
         cache: tuple,
         max_new_tokens: int,
+        generation_config: Optional[GenerationConfig] = None,
+        **generation_kwargs,
     ) -> tuple[list[int], tuple, bool]:
-        """Greedy autoregressive decoding from initial LLM logits.
+        """Autoregressive decoding for the streaming path.
+
+        Token selection is delegated to :meth:`_sample_token`, which supports
+        greedy (default), sampling (temperature / top-k / top-p), repetition
+        penalty, no-repeat-ngram blocking, and token suppression.
 
         Generation stops when any of these conditions is met (checked in order):
 
         1. **EOS** — the tokenizer's ``eos_token_id`` is predicted.  The token is
-           *not* fed to the LLM and *not* included in the output.
+           *not* fed to the LLM and *not* included in the output.  When
+           ``eos_token_id`` is also part of the footer (e.g. Qwen3 where
+           ``<|im_end|>`` = ``eos`` = ``footer[0]``), this acts as an early-stop
+           shortcut that avoids generating the remaining footer tokens.
         2. **Blank** — the ``<blank>`` token is predicted.  It is fed to the LLM
            (so the KV cache stays consistent) and included in the output.
         3. **Footer sequence** — the last *N* generated tokens match
            ``self._asst_footer_ids`` (e.g. ``[<|im_end|>, \\n]``).  All *N*
            tokens have been fed to the LLM; they are stripped from the output
-           and ``footer_consumed`` is set to ``True``.
+           and ``footer_consumed`` is set to ``True``.  This is the primary
+           stop mechanism for models whose ``eos_token_id`` is not in the footer.
         4. **Max tokens** — ``max_new_tokens`` is reached.
 
         Returns:
@@ -652,9 +742,9 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         """
         footer = self._asst_footer_ids
         flen = len(footer)
-        next_token = logits[:, -1, :].argmax(dim=-1)
         generated = []
         footer_consumed = False
+        next_token = self._sample_token(logits[:, -1, :], generated, generation_config, **generation_kwargs)
 
         while len(generated) < max_new_tokens:
             tid = next_token.item()
@@ -684,7 +774,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 footer_consumed = True
                 break
 
-            next_token = out.logits[:, -1, :].argmax(dim=-1)
+            next_token = self._sample_token(out.logits[:, -1, :], generated, generation_config, **generation_kwargs)
 
         return generated, cache, footer_consumed
 
@@ -711,6 +801,8 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         audio_chunk_embs: Tensor,
         state: StreamingState,
         max_new_tokens: int = 64,
+        generation_config: Optional[GenerationConfig] = None,
+        **generation_kwargs,
     ) -> list[int]:
         """
         Process one audio chunk and generate the assistant response.
@@ -718,14 +810,16 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         Builds the user turn from ``audio_chunk_embs`` using the same
         ``apply_chat_template`` + ``AUDIO_TOKEN_IDX`` replacement pattern as
         :class:`StreamingSTTDataset`, forwards through the LLM with the KV cache
-        in ``state``, runs greedy autoregressive decoding until end-of-turn or
+        in ``state``, runs autoregressive decoding until end-of-turn or
         ``max_new_tokens``, then finalizes the assistant turn in the cache.
 
         Args:
             audio_chunk_embs: (1, chunk_size, H) frame embeddings for this chunk.
             state: Mutable :class:`StreamingState` (updated in place).
             max_new_tokens: Maximum tokens to generate per chunk.
-
+            generation_config: Optional HuggingFace ``GenerationConfig``.
+                Supports ``temperature``, ``top_k``, ``top_p``, ``do_sample``.
+            generation_kwargs: Per-call overrides for generation parameters.
         Returns:
             List of generated token IDs (excluding end-of-turn tokens).
         """
@@ -754,7 +848,9 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         state.seq_len += input_embeds.shape[1]
 
         # 3. Autoregressive generation loop
-        generated, state.cache, footer_consumed = self._greedy_decode(out.logits, state.cache, max_new_tokens)
+        generated, state.cache, footer_consumed = self._streaming_decode(
+            out.logits, state.cache, max_new_tokens, generation_config, **generation_kwargs
+        )
         state.seq_len += len(generated)
 
         # 4. Finalize turn — ensure end-of-turn tokens are in the cache.
@@ -784,6 +880,8 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         n_frames: int,
         system_prompt: str,
         max_new_tokens: int,
+        generation_config: Optional[GenerationConfig] = None,
+        **generation_kwargs,
     ) -> str:
         """Chunk-by-chunk streaming generation for one sample."""
         if n_frames == 0:
@@ -804,7 +902,9 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 pad_len = chunk_size - chunk_embs.shape[1]
                 chunk_embs = F.pad(chunk_embs, (0, 0, 0, pad_len))
 
-            all_token_ids.extend(self.generate_streaming(chunk_embs, state, max_new_tokens))
+            all_token_ids.extend(
+                self.generate_streaming(chunk_embs, state, max_new_tokens, generation_config, **generation_kwargs)
+            )
 
         return decode_with_blank(all_token_ids, self.blank_token, self.tokenizer)
 
@@ -814,8 +914,16 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         n_frames: int,
         system_prompt: str,
         max_new_tokens: int,
+        generation_config: Optional[GenerationConfig] = None,
+        **generation_kwargs,
     ) -> str:
-        """One-shot generation: feed all audio in a single user turn."""
+        """One-shot generation: feed all audio in a single user turn.
+
+        When *generation_config* or *generation_kwargs* are provided, delegates
+        to ``self.llm.generate()`` for full HuggingFace generation support
+        (beam search, diverse decoding, etc.).  Otherwise uses the custom
+        :meth:`_decode` loop (greedy by default).
+        """
         if n_frames == 0:
             return ""
         hf_tok = self.tokenizer.tokenizer
@@ -848,9 +956,26 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         input_embeds = self.embed_tokens(text_tokens)
         input_embeds[audio_mask] = audio_embs_b[:n_frames]
 
-        # Forward + decode
-        out = self.llm(inputs_embeds=input_embeds, use_cache=True, return_dict=True)
-        generated, _, _ = self._greedy_decode(out.logits, out.past_key_values, max_new_tokens)
+        if generation_config is not None or generation_kwargs:
+            # Delegate to HF generate() for full generation support
+            output_ids = self.llm.generate(
+                inputs_embeds=input_embeds,
+                max_new_tokens=max_new_tokens,
+                generation_config=generation_config,
+                **generation_kwargs,
+            )
+            input_len = input_embeds.shape[1]
+            generated = output_ids[0, input_len:].tolist()
+            # Strip trailing EOS / footer tokens that HF generate may include
+            if generated and self._eos_id is not None and generated[-1] == self._eos_id:
+                generated.pop()
+            flen = len(self._asst_footer_ids)
+            if flen > 0 and len(generated) >= flen and generated[-flen:] == self._asst_footer_ids:
+                generated = generated[:-flen]
+        else:
+            # Default: custom decode loop (greedy)
+            out = self.llm(inputs_embeds=input_embeds, use_cache=True, return_dict=True)
+            generated, _, _ = self._streaming_decode(out.logits, out.past_key_values, max_new_tokens)
 
         return self.tokenizer.ids_to_text(generated)
 
@@ -859,9 +984,11 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         self,
         audios: Tensor,
         audio_lens: Tensor,
-        system_prompt: str = "Transcribe the audio into text.",
-        max_new_tokens: int = 64,
+        system_prompt: Union[str, List[str]] = "Transcribe the audio into text.",
         simulate_streaming: bool = True,
+        max_new_tokens: int = 64,
+        generation_config: Optional[GenerationConfig] = None,
+        **generation_kwargs,
     ) -> list[str]:
         """
         Transcribe full audio(s).
@@ -875,6 +1002,8 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 (simulating real-time streaming with alternating user/assistant
                 turns and ``<blank>`` tokens).  When ``False`` (default), feeds
                 all audio in a single user turn for direct transcription.
+            generation_config: Optional HuggingFace GenerationConfig object.
+            generation_kwargs: Keyword arguments passed directly to the underlying LLM's ``generate`` method.
 
         Returns:
             List of transcription strings, one per sample.
@@ -889,6 +1018,8 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             )  # (B, T_total_frames, H)
 
             B = audios.shape[0]
+            if isinstance(system_prompt, str):
+                system_prompt = [system_prompt] * B
             results = []
             for b in range(B):
                 n_frames = int(audio_emb_lens[b].item())
@@ -896,15 +1027,19 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     text = self._generate_streaming_sample(
                         audio_embs[b],
                         n_frames,
-                        system_prompt,
+                        system_prompt[b],
                         max_new_tokens,
+                        generation_config,
+                        **generation_kwargs,
                     )
                 else:
                     text = self._generate_oneshot_sample(
                         audio_embs[b],
                         n_frames,
-                        system_prompt,
+                        system_prompt[b],
                         max_new_tokens,
+                        generation_config,
+                        **generation_kwargs,
                     )
                 results.append(text)
 

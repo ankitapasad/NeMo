@@ -332,6 +332,68 @@ def get_llm_messages_for_batch(
     return batch_messages
 
 
+def parse_chat_template_ids(hf_tok) -> tuple[list[int], list[int], list[int]]:
+    """Discover turn-structure token IDs from a HuggingFace chat template.
+
+    Uses a 4-message sentinel conversation (two user+assistant pairs) to
+    isolate the token IDs for each structural component of a turn.  The second
+    pair prevents Qwen3-style templates from injecting ``<think>`` tags on the
+    first assistant turn.
+
+    The boundary between the assistant footer and the next user header is
+    detected by searching for the user-header text in the remaining template
+    string, making this template-agnostic (works for ChatML, Llama, etc.).
+
+    Args:
+        hf_tok: A HuggingFace tokenizer (``tokenizer.tokenizer``).
+
+    Returns:
+        ``(user_header_ids, user_footer_and_asst_header_ids, asst_footer_ids)``
+
+        - *user_header_ids*: tokens before user content, BOS stripped
+          (e.g. ``[<|im_start|>, user, \\n]``).
+        - *user_footer_and_asst_header_ids*: tokens between user content and
+          assistant content (e.g. ``[<|im_end|>, \\n, <|im_start|>, assistant, \\n]``).
+        - *asst_footer_ids*: tokens after assistant content
+          (e.g. ``[<|im_end|>, \\n]``).
+    """
+    _SENTINEL = "XSENTINELX"
+    convo_text = hf_tok.apply_chat_template(
+        [
+            {"role": "user", "content": _SENTINEL},
+            {"role": "assistant", "content": _SENTINEL},
+            {"role": "user", "content": "x"},
+            {"role": "assistant", "content": "x"},
+        ],
+        tokenize=False,
+        add_generation_prompt=False,
+        enable_thinking=False,
+    )
+    parts = convo_text.split(_SENTINEL)
+    assert len(parts) >= 3, f"Expected >=3 parts after splitting on sentinel, got {len(parts)}: {parts}"
+    # parts[0] = user header       (e.g. "<|im_start|>user\n")
+    # parts[1] = user footer + assistant header (e.g. "<|im_end|>\n<|im_start|>assistant\n")
+    # parts[2] = assistant footer + remaining dummy turns
+
+    user_header_ids = hf_tok.encode(parts[0], add_special_tokens=False)
+    user_footer_and_asst_header_ids = hf_tok.encode(parts[1], add_special_tokens=False)
+
+    # Trim the assistant footer at the next turn boundary.
+    user_header_text = parts[0].lstrip()  # strip potential BOS text
+    footer_and_rest = parts[2]
+    next_turn = footer_and_rest.find(user_header_text)
+    footer_text = footer_and_rest[:next_turn] if next_turn > 0 else ""
+    asst_footer_ids = hf_tok.encode(footer_text, add_special_tokens=False) if footer_text else []
+
+    # Strip leading BOS from user header — it is already in the KV cache
+    # from the system prompt during inference.
+    bos_id = getattr(hf_tok, "bos_token_id", None)
+    if user_header_ids and bos_id is not None and user_header_ids[0] == bos_id:
+        user_header_ids = user_header_ids[1:]
+
+    return user_header_ids, user_footer_and_asst_header_ids, asst_footer_ids
+
+
 def _tokenize_with_assistant_mask(
     messages: List[dict],
     tokenizer: AutoTokenizer,
@@ -373,39 +435,15 @@ def _tokenize_with_assistant_mask(
     # across turn boundaries.
     assistant_mask = [0] * len(input_ids)
 
-    # Discover assistant end-of-turn footer tokens (e.g. <|im_end|>\n for ChatML)
-    # so we can include them in the mask.  Uses the same sentinel technique as
-    # StreamingSTTModel._ensure_inference_cache.
-    _SENTINEL = "XSENTINELX"
-    convo_text = hf_tok.apply_chat_template(
-        [
-            {"role": "user", "content": _SENTINEL},
-            {"role": "assistant", "content": _SENTINEL},
-            {"role": "user", "content": "x"},
-            {"role": "assistant", "content": "x"},
-        ],
-        tokenize=False,
-        add_generation_prompt=False,
-        enable_thinking=False,
-    )
-    parts = convo_text.split(_SENTINEL)
-    # parts[0] = user header       (e.g. "<|im_start|>user\n")
-    # parts[2] = assistant footer + remaining dummy turns
-    # Here's what parts[2] looks like for ChatML after splitting on the sentinel:
-    # <|im_end|>\n<|im_start|>user\nx<|im_end|>\n<|im_start|>assistant\nx<|im_end|>\n
-    # ^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    # footer we want    remaining dummy turns (garbage we need to trim)
-    #
-    # We know the next turn starts with the same pattern as parts[0] (the user header, e.g., <|im_start|>user\n).
-    # So we search for it to find where the footer ends and the next turn begins:
-    # footer_and_rest = "<|im_end|>\n<|im_start|>user\nx<|im_end|>\n..."
-    #                                ^--- next_turn = 11 (found user header here)
-    # footer_text = footer_and_rest[:11] = "<|im_end|>\n"  ← just the footer
-    user_header = parts[0].lstrip()  # strip potential BOS text
-    footer_and_rest = parts[2]
-    next_turn = footer_and_rest.find(user_header)
-    footer_text = footer_and_rest[:next_turn] if next_turn > 0 else ""
-    footer_ids = hf_tok.encode(footer_text, add_special_tokens=False) if footer_text else []
+    # Discover assistant end-of-turn footer tokens via the shared template parser.
+    _, _, footer_ids = parse_chat_template_ids(hf_tok)
+
+    # Trim footer to include only up to the EOS token.  During inference,
+    # _streaming_decode stops at EOS and feeds the full footer manually, so
+    # training on tokens after EOS (e.g. the \n in <|im_end|>\n) is wasted.
+    eos_id = getattr(hf_tok, 'eos_token_id', None)
+    if eos_id is not None and eos_id in footer_ids:
+        footer_ids = footer_ids[: footer_ids.index(eos_id) + 1]
 
     assistant_content_ids = []
     for msg in messages:

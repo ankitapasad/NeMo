@@ -106,6 +106,7 @@ class _MockHFTokenizer:
         self.audio_tag = audio_tag
         self.blank_token = blank_token
         self.unk_token_id = 0
+        self.eos_token_id = _MockHFTokenizer.FOOTER  # EOS = first footer token (like Qwen3)
         self._next_word_id = 200
         # Cache for content → token IDs mapping so encode() and apply_chat_template() agree.
         self._content_cache: dict[str, list[int]] = {}
@@ -224,6 +225,14 @@ class _MockHFTokenizerNoGeneration(_MockHFTokenizer):
         if isinstance(result, dict):
             result["assistant_masks"] = [0] * len(result["assistant_masks"])
         return result
+
+
+class _MockHFTokenizerNoEOS(_MockHFTokenizerNoGeneration):
+    """Mock without eos_token_id — footer trimming should fall back to full footer."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.eos_token_id = None
 
 
 class _MockNemoTokenizer:
@@ -800,18 +809,18 @@ class TestTokenizeWithAssistantMaskFallback:
         _, mask = _tokenize_with_assistant_mask(msgs, nemo_tok)
         assert any(mask), "Fallback mask should have at least one assistant token"
 
-    def test_fallback_mask_count_includes_footer(self):
-        """Number of masked tokens should equal assistant content + footer tokens."""
+    def test_fallback_mask_count_includes_eos(self):
+        """Number of masked tokens should equal assistant content + 1 EOS token per turn."""
         msgs = _make_messages()
         tok = _MockHFTokenizerNoGeneration()
         nemo_tok = _MockNemoTokenizer(tok)
 
         _, mask = _tokenize_with_assistant_mask(msgs, nemo_tok)
-        # 7 assistant turns: 7 content tokens + 7 * 2 footer tokens (FOOTER + NEWLINE) = 21
-        assert sum(mask) == 7 + 7 * _MockHFTokenizer.N_FOOTER
+        # 7 assistant turns: 7 content tokens + 7 * 1 EOS token (FOOTER only, not NEWLINE) = 14
+        assert sum(mask) == 7 + 7 * 1
 
-    def test_fallback_footer_tokens_in_mask(self):
-        """Fallback should include end-of-turn footer tokens in the assistant mask."""
+    def test_fallback_eos_in_mask_but_not_rest_of_footer(self):
+        """Fallback should mask the EOS token but not post-EOS footer tokens."""
         msgs = [
             {"role": "system", "content": "test"},
             {"role": "user", "content": "<audio><audio>"},
@@ -826,12 +835,32 @@ class TestTokenizeWithAssistantMaskFallback:
         blank_id = _MockHFTokenizer.BLANK_ID
         blank_pos = input_ids.index(blank_id)
 
-        # The two tokens after blank should be FOOTER and NEWLINE, both masked
+        # FOOTER (= eos_token_id) should be masked, NEWLINE should NOT
         assert input_ids[blank_pos + 1] == _MockHFTokenizer.FOOTER
         assert input_ids[blank_pos + 2] == _MockHFTokenizer.NEWLINE
         assert mask[blank_pos] == 1, "Content token should be masked"
-        assert mask[blank_pos + 1] == 1, "FOOTER token should be masked"
-        assert mask[blank_pos + 2] == 1, "NEWLINE token should be masked"
+        assert mask[blank_pos + 1] == 1, "EOS (FOOTER) should be masked"
+        assert mask[blank_pos + 2] == 0, "Post-EOS (NEWLINE) should NOT be masked"
+
+    def test_fallback_full_footer_when_no_eos(self):
+        """When eos_token_id is None, the full footer should be included in the mask."""
+        msgs = [
+            {"role": "system", "content": "test"},
+            {"role": "user", "content": "<audio><audio>"},
+            {"role": "assistant", "content": "<blank>"},
+        ]
+        tok = _MockHFTokenizerNoEOS()
+        nemo_tok = _MockNemoTokenizer(tok)
+
+        input_ids, mask = _tokenize_with_assistant_mask(msgs, nemo_tok)
+
+        blank_id = _MockHFTokenizer.BLANK_ID
+        blank_pos = input_ids.index(blank_id)
+
+        # Without EOS, the full footer (FOOTER + NEWLINE) should be masked
+        assert mask[blank_pos] == 1, "Content should be masked"
+        assert mask[blank_pos + 1] == 1, "FOOTER should be masked"
+        assert mask[blank_pos + 2] == 1, "NEWLINE should be masked (no EOS trimming)"
 
     def test_fallback_pipeline_produces_trainable_targets(self):
         """Full pipeline with fallback tokenizer should have non-zero trainable targets."""
