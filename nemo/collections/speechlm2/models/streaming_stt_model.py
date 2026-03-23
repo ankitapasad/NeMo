@@ -549,17 +549,36 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
     def oomptimizer_schema(self) -> dict:
         from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, NeuralType
 
-        return {
-            "cls": StreamingSTTBatch,
-            "inputs": [
-                {"name": "input_tokens", "type": NeuralType(("B", "L"), LabelsType()), "seq_length": "input"},
-                {"name": "input_token_lens", "type": NeuralType(("B",), LengthsType()), "seq_length": "input"},
-                {"name": "target_tokens", "type": NeuralType(("B", "L"), LabelsType()), "seq_length": "input"},
-                {"name": "target_token_lens", "type": NeuralType(("B",), LengthsType()), "seq_length": "input"},
-                {"name": "audios", "type": NeuralType(("B", "T"), AudioSignal()), "seq_length": "input"},
-                {"name": "audio_lens", "type": NeuralType(("B",), LengthsType()), "seq_length": "input"},
-            ],
-        }
+        if self.forced_aligner is not None:
+            return {
+                "cls": StreamingSTTBatch,
+                "inputs": [
+                    {"name": "audios", "type": NeuralType(("B", "T"), AudioSignal()), "seq_length": "input"},
+                    {"name": "audio_lens", "type": NeuralType(("B",), LengthsType()), "seq_length": "input"},
+                ],
+            }
+        else:
+            return {
+                "cls": StreamingSTTBatch,
+                "inputs": [
+                    {
+                        "name": "input_tokens",
+                        "type": NeuralType(("B", "T"), LabelsType()),
+                        "seq_length": "output",
+                        "vocab_size": self.text_vocab_size,
+                    },
+                    {"name": "input_token_lens", "type": NeuralType(("B",), LengthsType()), "seq_length": "input"},
+                    {
+                        "name": "target_tokens",
+                        "type": NeuralType(("B", "T"), LabelsType()),
+                        "seq_length": "output",
+                        "vocab_size": self.text_vocab_size,
+                    },
+                    {"name": "target_token_lens", "type": NeuralType(("B",), LengthsType()), "seq_length": "input"},
+                    {"name": "audios", "type": NeuralType(("B", "T"), AudioSignal()), "seq_length": "input"},
+                    {"name": "audio_lens", "type": NeuralType(("B",), LengthsType()), "seq_length": "input"},
+                ],
+            }
 
     # ------------------------------------------------------------------
     # Inference
