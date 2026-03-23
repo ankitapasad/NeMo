@@ -250,7 +250,7 @@ def get_llm_messages_for_sample(
         ready_indices = []
         while word_idx < len(alignments):
             word = alignments[word_idx]
-            word_end_frame = round(word.end_time / frame_length_in_secs)
+            word_end_frame = math.ceil(word.end_time / frame_length_in_secs)
             ready_frame = word_end_frame + num_delay_frames
             if ready_frame <= chunk_end_frame:
                 ready_indices.append(word_idx)
