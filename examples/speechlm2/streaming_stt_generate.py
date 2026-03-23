@@ -66,12 +66,13 @@ class StreamingSTTEvalConfig:
     batch_size: int = 64
     max_new_tokens: int = 64
     system_prompt: str = "Transcribe the audio into text."
-    simulate_streaming: bool = False
+    simulate_streaming: bool = True
     output_manifest: Optional[str] = "streaming_stt_generations.jsonl"
     verbose: bool = True
     device: str = "cuda"
     dtype: str = "bfloat16"
     use_normalizer: Optional[str] = "english"  # "english", "basic", or "none"
+    use_offline_embs: bool = False
 
 
 @hydra_runner(config_name="StreamingSTTEvalConfig", schema=StreamingSTTEvalConfig)
@@ -112,6 +113,7 @@ def main(cfg: StreamingSTTEvalConfig):
             system_prompt=cfg.system_prompt,
             max_new_tokens=cfg.max_new_tokens,
             simulate_streaming=cfg.simulate_streaming,
+            use_offline_embs=cfg.use_offline_embs,
         )
         batch_infer_duration = perf_counter() - ts
 
@@ -129,7 +131,7 @@ def main(cfg: StreamingSTTEvalConfig):
                 f"RTFx={batch_rtfx:.1f}"
             )
             for ref, hyp in zip(batch_refs, batch_hyps):
-                logging.info(f"[REF]\t`{ref}`\n[HYP]\t`{hyp}`\n")
+                logging.info(f"\n[REF]\t`{ref}`\n[HYP]\t`{hyp}`\n")
             logging.info("--------------------------------")
 
         refs.extend(batch_refs)

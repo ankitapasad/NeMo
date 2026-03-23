@@ -31,6 +31,14 @@ model:
   #   lora_dropout: 0.01
 
   perception:
+    spec_augment:
+      _target_: nemo.collections.asr.modules.SpectrogramAugmentation
+      freq_masks: 2 # set to zero to disable it
+      # you may use lower time_masks for smaller models to have a faster convergence
+      time_masks: 10 # set to zero to disable it
+      freq_width: 27
+      time_width: 0.05
+
     modality_adapter:
       _target_: nemo.collections.speechlm2.modules.perception.IdentityConnector
 

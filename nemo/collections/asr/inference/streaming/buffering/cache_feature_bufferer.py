@@ -145,7 +145,7 @@ class BatchedCacheFeatureBufferer:
         features, _ = self.preprocessor(input_signal=signals, length=signals_len)
         if features.shape[2] > expected_feat_len:
             features = features[:, :, :expected_feat_len]  # B x F x T
-        right_padding = torch.floor(right_paddings / self.sample_rate / self.timestep_duration)  # B
+        right_padding = torch.floor(right_paddings / self.sample_rate / self.timestep_duration).long()  # B
         return features, right_padding
 
     def _update_feature_buffer(self, slot_ids: int, feat_chunk: Tensor) -> None:

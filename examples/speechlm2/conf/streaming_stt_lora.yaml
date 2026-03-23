@@ -18,21 +18,25 @@ model:
   freeze_llm_head: false
   freeze_embed_tokens: false
 
+  freeze_params: []
+  prevent_freeze_params: []  # Use to make specific submodules trainable; overrides freeze_params
+
+
   # LoRA (uncomment to enable)
-  # lora:
-  #   task_type: CAUSAL_LM
-  #   r: 128
-  #   lora_alpha: 256
-  #   lora_dropout: 0.01
+  lora:
+    task_type: CAUSAL_LM
+    r: 128
+    lora_alpha: 256
+    lora_dropout: 0.01
 
   perception:
-    # spec_augment:
-    #   _target_: nemo.collections.asr.modules.SpectrogramAugmentation
-    #   freq_masks: 2 # set to zero to disable it
-    #   # you may use lower time_masks for smaller models to have a faster convergence
-    #   time_masks: 10 # set to zero to disable it
-    #   freq_width: 27
-    #   time_width: 0.05
+    spec_augment:
+      _target_: nemo.collections.asr.modules.SpectrogramAugmentation
+      freq_masks: 2 # set to zero to disable it
+      # you may use lower time_masks for smaller models to have a faster convergence
+      time_masks: 10 # set to zero to disable it
+      freq_width: 27
+      time_width: 0.05
       
     modality_adapter:
       _target_: nemo.collections.speechlm2.modules.perception.IdentityConnector

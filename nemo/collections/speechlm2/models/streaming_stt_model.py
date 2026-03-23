@@ -27,6 +27,9 @@ from torch import Tensor
 from torch.distributed.tensor.parallel import loss_parallel
 from transformers import GenerationConfig
 
+from nemo.collections.asr.inference.streaming.buffering.cache_feature_bufferer import BatchedCacheFeatureBufferer
+from nemo.collections.asr.inference.streaming.framing.request import Frame
+from nemo.collections.asr.inference.utils.context_manager import CacheAwareContext
 from nemo.collections.common.data.utils import move_data_to_device
 from nemo.collections.common.tokenizers import AutoTokenizer
 from nemo.collections.speechlm2.data.streaming_stt_dataset import (
@@ -141,6 +144,7 @@ class StreamingSTTModelConfig:
     sample_rate: int = 16000
     frame_length_in_secs: float = 0.08
     log_every_n_steps: int = 10
+    dtype: str = "bfloat16"
 
 
 @dataclass
@@ -150,6 +154,8 @@ class StreamingState:
     cache: tuple | None = None  # HF past_key_values
     generated_tokens: list[list[int]] = field(default_factory=list)  # per-chunk generated token IDs
     seq_len: int = 0  # total sequence length seen so far
+    audio_cache: CacheAwareContext | None = None
+    audio_feature_buffer: BatchedCacheFeatureBufferer | None = None
 
 
 class StreamingSTTModel(LightningModule, HFHubMixin):
@@ -303,7 +309,6 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 positions and ``text_pad_id`` at left-padding positions.
             audios: (B, T_samples) raw waveforms.
             audio_lens: (B,) waveform lengths in samples.
-
         Returns:
             dict with keys ``input_embeds`` (B, L, H), ``attention_mask`` (B, L).
         """
@@ -778,7 +783,28 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
         return generated, cache, footer_consumed
 
-    def _init_streaming_state(self, system_prompt: str, device: torch.device) -> StreamingState:
+    def get_audio_feature_buffer(self, batch_size: int) -> BatchedCacheFeatureBufferer:
+        """Get the audio feature buffer for the streaming state."""
+        preprocessor_cfg: DictConfig = self.perception.cfg.preprocessor
+        window_stride_in_secs = preprocessor_cfg.window_stride
+        pre_encode_cache_size = self.perception.encoder.streaming_cfg.pre_encode_cache_size
+        if isinstance(pre_encode_cache_size, list):
+            pre_encode_cache_size = pre_encode_cache_size[1]
+        pre_encode_cache_size_in_secs = pre_encode_cache_size * window_stride_in_secs
+        chunk_size_in_secs = self.core_cfg.chunk_size * self.core_cfg.frame_length_in_secs
+        buffer_size_in_secs = pre_encode_cache_size_in_secs + chunk_size_in_secs
+
+        audio_feature_buffer = BatchedCacheFeatureBufferer(
+            num_slots=batch_size,
+            sample_rate=self.core_cfg.sample_rate,
+            buffer_size_in_secs=buffer_size_in_secs,
+            chunk_size_in_secs=chunk_size_in_secs,
+            preprocessor_cfg=preprocessor_cfg,
+            device=self.device,
+        )
+        return audio_feature_buffer
+
+    def get_init_streaming_state(self, system_prompt: str, device: torch.device) -> StreamingState:
         """Forward the system prompt through the LLM and return a fresh :class:`StreamingState`."""
         hf_tok = self.tokenizer.tokenizer
         sys_ids = hf_tok.apply_chat_template(
@@ -787,44 +813,113 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             add_generation_prompt=False,
             enable_thinking=False,
         )
-        sys_embs = self.embed_tokens(torch.tensor(sys_ids, device=device).unsqueeze(0))
+        dtype = self.embed_tokens.weight.dtype
+        sys_embs = self.embed_tokens(torch.tensor(sys_ids, device=device, dtype=torch.long).unsqueeze(0))
         out = self.llm(inputs_embeds=sys_embs, use_cache=True, return_dict=True)
+        cache_last_channel, cache_last_time, cache_last_channel_len = self.perception.get_initial_cache_state(
+            batch_size=1, dtype=dtype, device=device
+        )
+        audio_feature_buffer = self.get_audio_feature_buffer(batch_size=1)
+        audio_cache = CacheAwareContext(
+            cache_last_channel=cache_last_channel,
+            cache_last_time=cache_last_time,
+            cache_last_channel_len=cache_last_channel_len,
+        )
         return StreamingState(
             cache=out.past_key_values,
             generated_tokens=[],
             seq_len=sys_embs.shape[1],
+            audio_cache=audio_cache,
+            audio_feature_buffer=audio_feature_buffer,
         )
 
     @torch.no_grad()
     def generate_streaming(
         self,
-        audio_chunk_embs: Tensor,
-        state: StreamingState,
+        audio_chunk: Tensor,
+        audio_chunk_len: Optional[Tensor] = None,
+        state: Optional[StreamingState] = None,
         max_new_tokens: int = 64,
         generation_config: Optional[GenerationConfig] = None,
+        _audio_embs: Optional[Tensor] = None,
         **generation_kwargs,
     ) -> list[int]:
         """
-        Process one audio chunk and generate the assistant response.
+        Process one raw audio chunk and generate the assistant response.
 
-        Builds the user turn from ``audio_chunk_embs`` using the same
-        ``apply_chat_template`` + ``AUDIO_TOKEN_IDX`` replacement pattern as
-        :class:`StreamingSTTDataset`, forwards through the LLM with the KV cache
-        in ``state``, runs autoregressive decoding until end-of-turn or
-        ``max_new_tokens``, then finalizes the assistant turn in the cache.
+        Encodes ``audio_chunk`` through the perception module (using the
+        streaming encoder cache stored in ``state``), then builds the user turn
+        using the same ``apply_chat_template`` + ``AUDIO_TOKEN_IDX`` replacement
+        pattern as :class:`StreamingSTTDataset`, forwards through the LLM with
+        the KV cache in ``state``, runs autoregressive decoding until
+        end-of-turn or ``max_new_tokens``, then finalizes the assistant turn in
+        the cache.
 
         Args:
-            audio_chunk_embs: (1, chunk_size, H) frame embeddings for this chunk.
+            audio_chunk: (1, T_samples) raw waveform for one chunk.
+            audio_chunk_len: (1,) number of valid samples.
             state: Mutable :class:`StreamingState` (updated in place).
             max_new_tokens: Maximum tokens to generate per chunk.
             generation_config: Optional HuggingFace ``GenerationConfig``.
                 Supports ``temperature``, ``top_k``, ``top_p``, ``do_sample``.
+            _audio_embs: Optional pre-computed audio embeddings (1, chunk_size, H).
+                When provided, bypasses both the feature buffer and the
+                perception module entirely.  Diagnostic use only.
             generation_kwargs: Per-call overrides for generation parameters.
         Returns:
             List of generated token IDs (excluding end-of-turn tokens).
         """
+
         self._ensure_inference_cache()
-        device = audio_chunk_embs.device
+        device = audio_chunk.device
+
+        if _audio_embs is not None:
+            # Diagnostic: skip feature buffer + perception entirely.
+            audio_chunk_embs = _audio_embs.type_as(self.embed_tokens.weight)
+        else:
+            # 0. Update audio feature buffer
+            audio_chunk = audio_chunk.view(-1)
+            audio_dur = audio_chunk.shape[0] / self.core_cfg.sample_rate
+
+            if audio_chunk_len is None:
+                audio_chunk_len = audio_chunk.shape[0]
+            frame = Frame(
+                samples=audio_chunk,
+                length=audio_chunk_len,
+                stream_id=0,
+            )
+            # features: list of (D, T) tensors
+            # right_paddings: list of ints
+            features, right_paddings = state.audio_feature_buffer.update([frame])
+            processed_signal = features[0].unsqueeze(0).type_as(self.embed_tokens.weight)
+            processed_signal_length = torch.tensor(
+                [processed_signal.shape[-1] - int(right_paddings[0])], device=device
+            ).long()
+
+            # 1. Encode audio chunk with streaming cache
+            outputs = self.perception(
+                processed_signal=processed_signal,
+                processed_signal_length=processed_signal_length,
+                cache_last_channel=state.audio_cache.cache_last_channel,
+                cache_last_time=state.audio_cache.cache_last_time,
+                cache_last_channel_len=state.audio_cache.cache_last_channel_len,
+                streaming=True,
+            )
+            audio_chunk_embs, audio_chunk_emb_lens, new_perception_cache = outputs
+
+            # 2. Update streaming state with new perception cache
+            if new_perception_cache is not None:
+                state.audio_cache.cache_last_channel = new_perception_cache['cache_last_channel']
+                state.audio_cache.cache_last_time = new_perception_cache['cache_last_time']
+                state.audio_cache.cache_last_channel_len = new_perception_cache['cache_last_channel_len']
+
+        # 3. Pad/trim to chunk_size frames (template expects exactly chunk_size audio slots)
+        chunk_size = self.core_cfg.chunk_size
+        n_frames = audio_chunk_embs.shape[1]
+        if n_frames < chunk_size:
+            audio_chunk_embs = F.pad(audio_chunk_embs, (0, 0, 0, chunk_size - n_frames))
+        elif n_frames > chunk_size:
+            audio_chunk_embs = audio_chunk_embs[:, :chunk_size, :]
 
         # 1. Build input embeddings from cached turn template
         turn_ids_t = torch.tensor(self._turn_template_ids, device=device).unsqueeze(0)  # (1, L)
@@ -876,37 +971,103 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
     def _generate_streaming_sample(
         self,
-        audio_embs_b: Tensor,
-        n_frames: int,
+        audio_wav_b: Tensor,
+        n_samples: int,
         system_prompt: str,
         max_new_tokens: int,
         generation_config: Optional[GenerationConfig] = None,
+        use_offline_embs: bool = False,
         **generation_kwargs,
     ) -> str:
-        """Chunk-by-chunk streaming generation for one sample."""
-        if n_frames == 0:
-            return ""
-        device = audio_embs_b.device
-        chunk_size = self.core_cfg.chunk_size
-        state = self._init_streaming_state(system_prompt, device)
+        """Chunk-by-chunk streaming generation for one sample.
 
-        num_chunks = math.ceil(n_frames / chunk_size)
+        Args:
+            audio_wav_b: (T_samples,) 1-D raw waveform for one sample.
+            n_samples: Number of valid samples in ``audio_wav_b``.
+            system_prompt: System prompt for the LLM.
+            max_new_tokens: Maximum tokens to generate per chunk.
+            generation_config: Optional HuggingFace ``GenerationConfig``.
+            use_offline_embs: When ``True``, pre-compute perception embeddings
+                on the full audio offline and slice them into ``chunk_size``
+                frame groups, bypassing both the feature buffer **and** the
+                streaming encoder.  This isolates the LLM / generation logic
+                from perception entirely.  Diagnostic use only.
+            generation_kwargs: Per-call overrides for generation parameters.
+        """
+        if n_samples == 0:
+            return ""
+        device = audio_wav_b.device
+        chunk_size = self.core_cfg.chunk_size
+        chunk_samples = math.ceil(chunk_size * self.core_cfg.frame_length_in_secs * self.core_cfg.sample_rate)
+        state = self.get_init_streaming_state(system_prompt, device=device)
+
+        # Optionally pre-compute offline perception embeddings.
+        offline_emb_chunks = None
+        if use_offline_embs:
+            offline_emb_chunks = self._build_offline_emb_chunks(audio_wav_b[:n_samples], n_samples, device)
+
+        num_chunks = math.ceil(n_samples / chunk_samples) if n_samples > 0 else 0
         all_token_ids = []
         for i in range(num_chunks):
-            start = i * chunk_size
-            end = min(start + chunk_size, n_frames)
-            chunk_embs = audio_embs_b[start:end].unsqueeze(0)  # (1, C, H)
+            start = i * chunk_samples
+            end = min(start + chunk_samples, n_samples)
+            chunk_wav = audio_wav_b[start:end].unsqueeze(0)  # (1, T)
+            chunk_len = torch.tensor([end - start], device=device)  # (1,)
 
-            # Pad last chunk with zeros if shorter than chunk_size
-            if chunk_embs.shape[1] < chunk_size:
-                pad_len = chunk_size - chunk_embs.shape[1]
-                chunk_embs = F.pad(chunk_embs, (0, 0, 0, pad_len))
+            # zero padding to chunk_samples
+            if chunk_wav.shape[1] < chunk_samples:
+                chunk_wav = F.pad(chunk_wav, (0, chunk_samples - chunk_wav.shape[1]))
+            extra_kwargs = {}
+            if offline_emb_chunks is not None and i < len(offline_emb_chunks):
+                extra_kwargs["_audio_embs"] = offline_emb_chunks[i]
 
             all_token_ids.extend(
-                self.generate_streaming(chunk_embs, state, max_new_tokens, generation_config, **generation_kwargs)
+                self.generate_streaming(
+                    chunk_wav,
+                    chunk_len,
+                    state,
+                    max_new_tokens,
+                    generation_config,
+                    **extra_kwargs,
+                    **generation_kwargs,
+                )
             )
 
         return decode_with_blank(all_token_ids, self.blank_token, self.tokenizer)
+
+    def _build_offline_emb_chunks(
+        self,
+        audio_wav: Tensor,
+        n_samples: int,
+        device: torch.device,
+    ) -> list[Tensor]:
+        """Pre-compute offline perception embeddings and slice into chunk_size groups.
+
+        Runs the full perception module on the complete audio (the same path
+        used during training), then splits the resulting embeddings into
+        ``chunk_size``-frame groups that can be fed directly to the LLM turn
+        template.  This bypasses both the feature buffer and the streaming
+        encoder, isolating the LLM / generation logic from perception.
+
+        Returns a list of ``(1, chunk_size, H)`` tensors, one per chunk.
+        """
+        chunk_size = self.core_cfg.chunk_size
+        with torch.no_grad():
+            offline_embs, offline_emb_lens = self.perception(
+                input_signal=audio_wav.unsqueeze(0),
+                input_signal_length=torch.tensor([n_samples], device=device),
+            )
+        # offline_embs: (1, T_total, H)
+        total_frames = offline_embs.shape[1]
+        chunks: list[Tensor] = []
+        for start in range(0, total_frames, chunk_size):
+            end = min(start + chunk_size, total_frames)
+            chunk = offline_embs[:, start:end, :]  # (1, <=chunk_size, H)
+            # Pad last chunk if needed so the template always gets chunk_size slots.
+            if chunk.shape[1] < chunk_size:
+                chunk = F.pad(chunk, (0, 0, 0, chunk_size - chunk.shape[1]))
+            chunks.append(chunk)
+        return chunks
 
     def _generate_oneshot_sample(
         self,
@@ -988,6 +1149,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         simulate_streaming: bool = True,
         max_new_tokens: int = 64,
         generation_config: Optional[GenerationConfig] = None,
+        use_offline_embs: bool = False,
         **generation_kwargs,
     ) -> list[str]:
         """
@@ -1003,6 +1165,11 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 turns and ``<blank>`` tokens).  When ``False`` (default), feeds
                 all audio in a single user turn for direct transcription.
             generation_config: Optional HuggingFace GenerationConfig object.
+            use_offline_embs: When ``True`` and ``simulate_streaming`` is also
+                ``True``, pre-compute perception embeddings on the full audio
+                offline and slice them into ``chunk_size``-frame groups,
+                bypassing both the feature buffer and the streaming encoder.
+                Diagnostic use only.
             generation_kwargs: Keyword arguments passed directly to the underlying LLM's ``generate`` method.
 
         Returns:
@@ -1011,28 +1178,33 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         self._ensure_inference_cache()
 
         with move_embedding(self):
-            # --- Encode all audio (batched) ---
-            audio_embs, audio_emb_lens = self.perception(
-                input_signal=audios,
-                input_signal_length=audio_lens,
-            )  # (B, T_total_frames, H)
-
             B = audios.shape[0]
             if isinstance(system_prompt, str):
                 system_prompt = [system_prompt] * B
+
+            # Only encode all audio upfront for the one-shot path
+            audio_embs, audio_emb_lens = None, None
+            if not simulate_streaming:
+                audio_embs, audio_emb_lens = self.perception(
+                    input_signal=audios,
+                    input_signal_length=audio_lens,
+                )  # (B, T_total_frames, H)
+
             results = []
             for b in range(B):
-                n_frames = int(audio_emb_lens[b].item())
                 if simulate_streaming:
+                    n_samples = int(audio_lens[b].item())
                     text = self._generate_streaming_sample(
-                        audio_embs[b],
-                        n_frames,
+                        audios[b],
+                        n_samples,
                         system_prompt[b],
                         max_new_tokens,
                         generation_config,
+                        use_offline_embs=use_offline_embs,
                         **generation_kwargs,
                     )
                 else:
+                    n_frames = int(audio_emb_lens[b].item())
                     text = self._generate_oneshot_sample(
                         audio_embs[b],
                         n_frames,
