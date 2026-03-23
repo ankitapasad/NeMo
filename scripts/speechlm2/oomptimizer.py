@@ -390,9 +390,12 @@ def oomptimizer(
     if isinstance(model, (SALM, SALMWithAsrDecoder)):
         model.prepare_inputs = partial(_override_prepare_inputs, model)
 
-    import pdb
+    # if isinstance(model, StreamingSTTModel) and cfg.get("forced_aligner", None):
+    #     forced_aligner_cfg = cfg.get("forced_aligner", None)
+    #     assert forced_aligner_cfg is not None, "Forced aligner configuration is required for online forced alignment"
+    #     forced_aligner = Serialization.from_config_dict(forced_aligner_cfg)
+    #     model.forced_aligner = forced_aligner
 
-    pdb.set_trace()
     if not hasattr(model, "oomptimizer_schema"):
         click.secho(
             f"We read model of type {type(model)} which doesn't seem to support OOMptimizer "
@@ -484,6 +487,8 @@ def oomptimizer(
     # a tiny bit smaller batches, likely due to worse memory fragmentation.
     with torch.autocast("cuda", dtype=None, enabled=False):
         for bucket, (seq_len_in, seq_len_out) in reversed(list(zip(buckets, max_seq_lens))):
+            seq_len_in = math.ceil(seq_len_in)
+            seq_len_out = math.ceil(seq_len_out)
             click.echo(f"The current sequence lengths are: input={seq_len_in} output={seq_len_out}.")
             gen.reset()
             batch_idx = 0
