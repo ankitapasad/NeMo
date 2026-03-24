@@ -287,6 +287,10 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         return self.perception.preprocessor.featurizer.sample_rate
 
     @property
+    def sample_rate(self) -> int:
+        return self.perception.preprocessor.featurizer.sample_rate
+
+    @property
     def frame_duration(self) -> float:
         """Duration (in seconds) of one audio frame at the perception output."""
         return self.perception.token_equivalent_duration
@@ -559,17 +563,17 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 {
                     "name": "input_tokens",
                     "type": NeuralType(("B", "T"), LabelsType()),
-                    "seq_length": "input",
+                    "seq_length": "output",
                     "vocab_size": int(self.text_vocab_size),
                 },
-                {"name": "input_token_lens", "type": NeuralType(("B",), LengthsType()), "seq_length": "input"},
+                {"name": "input_token_lens", "type": NeuralType(("B",), LengthsType()), "seq_length": "output"},
                 {
                     "name": "target_tokens",
                     "type": NeuralType(("B", "T"), LabelsType()),
-                    "seq_length": "input",
+                    "seq_length": "output",
                     "vocab_size": int(self.text_vocab_size),
                 },
-                {"name": "target_token_lens", "type": NeuralType(("B",), LengthsType()), "seq_length": "input"},
+                {"name": "target_token_lens", "type": NeuralType(("B",), LengthsType()), "seq_length": "output"},
                 {"name": "audios", "type": NeuralType(("B", "T"), AudioSignal()), "seq_length": "input"},
                 {"name": "audio_lens", "type": NeuralType(("B",), LengthsType()), "seq_length": "input"},
             ],

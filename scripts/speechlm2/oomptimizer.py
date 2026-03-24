@@ -29,6 +29,7 @@ from omegaconf import OmegaConf
 from torch.utils.data import DataLoader, IterableDataset
 
 from nemo.collections.speechlm2 import SALM, SALMWithAsrDecoder
+from nemo.collections.speechlm2.models import StreamingSTTModel
 from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, MaskType, NeuralType
 from nemo.utils import logging
 from nemo.utils.trainer_utils import resolve_trainer_cfg
@@ -390,11 +391,9 @@ def oomptimizer(
     if isinstance(model, (SALM, SALMWithAsrDecoder)):
         model.prepare_inputs = partial(_override_prepare_inputs, model)
 
-    # if isinstance(model, StreamingSTTModel) and cfg.get("forced_aligner", None):
-    #     forced_aligner_cfg = cfg.get("forced_aligner", None)
-    #     assert forced_aligner_cfg is not None, "Forced aligner configuration is required for online forced alignment"
-    #     forced_aligner = Serialization.from_config_dict(forced_aligner_cfg)
-    #     model.forced_aligner = forced_aligner
+    if isinstance(model, StreamingSTTModel):
+        model._build_input_embeds = partial(_override_build_input_embeds, model)
+        model.forced_aligner = None  # skip forced alignment for synthetic batches
 
     if not hasattr(model, "oomptimizer_schema"):
         click.secho(
@@ -592,6 +591,44 @@ def _override_prepare_inputs(self, batch: dict) -> dict:
         "attention_mask": attention_mask,
         "target_ids": target_ids,
     }
+
+
+def _override_build_input_embeds(self, input_tokens, audios, audio_lens):
+    """Override _build_input_embeds for oomptimizer profiling of StreamingSTTModel.
+
+    The profiling batch generator creates input_tokens with random token IDs,
+    but _build_input_embeds expects AUDIO_TOKEN_IDX markers at positions where
+    audio embeddings should be placed.  This override runs perception on the
+    synthetic audio and constructs properly marked input_tokens.
+    """
+    from nemo.collections.speechlm2.models.streaming_stt_model import AUDIO_TOKEN_IDX, interleave_embeddings
+
+    # Run perception to get audio embeddings
+    audio_embs, audio_emb_lens = self.perception(
+        input_signal=audios,
+        input_signal_length=audio_lens,
+    )
+    n_audio_frames = audio_embs.shape[1]  # (B, T_enc, H)
+    B, L = input_tokens.shape
+
+    # Build input_tokens with AUDIO_TOKEN_IDX at the first n_audio positions
+    input_tokens = input_tokens.clone()
+    n_audio = min(n_audio_frames, L)
+    input_tokens[:, :n_audio] = AUDIO_TOKEN_IDX
+    # Ensure remaining tokens are valid vocab IDs
+    input_tokens[:, n_audio:] = torch.clamp(input_tokens[:, n_audio:].abs(), 0, self.text_vocab_size - 1)
+
+    audio_mask = input_tokens == AUDIO_TOKEN_IDX
+    text_tokens = input_tokens.where(~audio_mask, torch.zeros_like(input_tokens))
+    text_embeds = self.embed_tokens(text_tokens)
+
+    return interleave_embeddings(
+        input_tokens=input_tokens,
+        audio_mask=audio_mask,
+        text_embeds=text_embeds,
+        audio_embs=audio_embs,
+        pad_id=self.text_pad_id,
+    )
 
 
 if __name__ == "__main__":
