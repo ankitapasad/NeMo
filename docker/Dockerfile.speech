@@ -118,8 +118,9 @@ RUN INSTALL_MSG=$(/bin/bash /tmp/nemo/scripts/installers/install_k2.sh); INSTALL
 
 # install nemo dependencies
 WORKDIR /tmp/nemo
-ENV LHOTSE_REQUIRE_TORCHAUDIO=0
-COPY requirements .
+ENV LHOTSE_REQUIRE_TORCHAUDIO=1
+# Preserve requirements/ layout so requirements/requirements*.txt matches (COPY dir . flattens into WORKDIR).
+COPY requirements requirements/
 
 RUN for f in requirements/requirements*.txt; do \
     pip install --disable-pip-version-check --no-cache-dir -r $f; done
@@ -185,3 +186,4 @@ RUN INSTALL_MSG=$(/bin/bash /tmp/nemo/scripts/installers/install_ais_cli_latest.
   else echo "AIS CLI installed successfully"; fi
 
 RUN pip install qwen_asr
+RUN pip install torchaudio==2.11.0
