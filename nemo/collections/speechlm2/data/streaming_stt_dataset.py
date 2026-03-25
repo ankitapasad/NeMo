@@ -275,6 +275,27 @@ def get_llm_messages_for_sample(
         else:
             messages.append({"role": "assistant", "content": blank_token})
 
+    # Append any residual words that weren't emitted (e.g., due to delay pushing
+    # them past the last chunk boundary, or alignment end_time > audio_duration).
+    if word_idx < len(alignments):
+        residual_indices = list(range(word_idx, len(alignments)))
+        if word_spans and transcript:
+            first_span = word_spans[residual_indices[0]]
+            last_span = word_spans[residual_indices[-1]]
+            if first_span is not None and last_span is not None:
+                content = transcript[first_span[0] : last_span[1]]
+            else:
+                content = " ".join(alignments[i].text for i in residual_indices)
+        else:
+            content = " ".join(alignments[i].text for i in residual_indices)
+        # Append to the last assistant turn if it was blank, otherwise add the content
+        if messages[-1]["role"] == "assistant" and messages[-1]["content"] == blank_token:
+            messages[-1]["content"] = content
+        elif messages[-1]["role"] == "assistant":
+            messages[-1]["content"] += " " + content
+        else:
+            messages.append({"role": "assistant", "content": content})
+
     return messages
 
 

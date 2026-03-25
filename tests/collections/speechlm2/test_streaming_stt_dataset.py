@@ -348,6 +348,52 @@ class TestGetLlmMessagesForSample:
         user_msgs = [m for m in msgs if m["role"] == "user"]
         assert all(m["content"] == AUDIO_TAG for m in user_msgs)
 
+    def test_residual_words_appended_to_last_turn(self):
+        """Words whose ready_frame exceeds the last chunk should still appear."""
+        # Audio is 0.16s → 2 frames → 1 chunk (end_frame=2).
+        # Word ends at 0.20s → end_frame=ceil(0.20/0.08)=3. With delay=0, ready_frame=3 > 2.
+        # The word would be dropped without the residual fix.
+        alignments = [WordAlignment(text="Late", start_time=0.10, end_time=0.20)]
+        msgs = _make_messages(
+            audio_duration_secs=0.16,
+            alignments=alignments,
+            num_delay_frames=0,
+        )
+        asst = [m["content"] for m in msgs if m["role"] == "assistant"]
+        assert "Late" in asst[-1], f"Residual word 'Late' not in last turn: {asst}"
+
+    def test_residual_words_with_delay(self):
+        """Delay pushes a word past the last chunk — it should still be emitted."""
+        # Audio is 1.0s. Word ends at 0.96s → end_frame=12. With delay=2, ready_frame=14.
+        # Last chunk end_frame = ceil(13/2)*2 = 14. So ready_frame=14 <= 14, it fits.
+        # But if word ends at 1.0s → end_frame=13, ready_frame=15 > 14. Residual.
+        alignments = [
+            WordAlignment(text="Hello", start_time=0.0, end_time=0.48),
+            WordAlignment(text="World", start_time=0.80, end_time=1.0),
+        ]
+        msgs = _make_messages(
+            audio_duration_secs=1.0,
+            alignments=alignments,
+            num_delay_frames=2,
+        )
+        asst = [m["content"] for m in msgs if m["role"] == "assistant"]
+        all_text = " ".join(a for a in asst if a != BLANK_TOKEN)
+        assert "Hello" in all_text, f"'Hello' missing: {asst}"
+        assert "World" in all_text, f"'World' missing: {asst}"
+
+    def test_residual_replaces_blank_last_turn(self):
+        """If last turn was blank and there are residual words, blank is replaced."""
+        # Short audio, word ends after it
+        alignments = [WordAlignment(text="Overflow", start_time=0.0, end_time=0.20)]
+        msgs = _make_messages(
+            audio_duration_secs=0.08,  # 1 frame → 1 chunk (end_frame=2 with chunk_size=2? No, ceil(1/2)=1 chunk, end_frame=2)
+            alignments=alignments,
+            num_delay_frames=0,
+        )
+        asst = [m["content"] for m in msgs if m["role"] == "assistant"]
+        # The word should appear, not blank
+        assert asst[-1] == "Overflow", f"Expected 'Overflow' but got: {asst}"
+
 
 # ===========================================================================
 # Tests: compute_word_spans
