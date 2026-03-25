@@ -137,6 +137,9 @@ COPY . .
 # start building the final container
 FROM nemo-deps as nemo
 ARG NEMO_VERSION=2.8.0rc
+# Match the PyTorch major.minor in BASE_IMAGE (e.g. nvcr.io/nvidia/pytorch:26.02-py3). Override if needed:
+# docker build --build-arg TORCHAUDIO_TAG=v2.10.0 ...
+ARG TORCHAUDIO_TAG=v2.11.0
 
 # Check that NEMO_VERSION is set. Build will fail without this. Expose NEMO and base container
 # version information as runtime environment variable for introspection purposes
@@ -186,4 +189,10 @@ RUN INSTALL_MSG=$(/bin/bash /tmp/nemo/scripts/installers/install_ais_cli_latest.
   else echo "AIS CLI installed successfully"; fi
 
 RUN pip install qwen_asr
-RUN pip install torchaudio==2.11.0
+# Build torchaudio from source so extensions link to this image's torch (PyPI wheels target stock PyTorch).
+RUN pip uninstall -y torchaudio 2>/dev/null || true && \
+  apt-get update && apt-get install -y --no-install-recommends cmake ninja-build git && \
+  rm -rf /var/lib/apt/lists/* && \
+  git clone --depth 1 --branch "${TORCHAUDIO_TAG}" https://github.com/pytorch/audio.git /tmp/audio && \
+  cd /tmp/audio && pip install --no-build-isolation --disable-pip-version-check -v . && \
+  cd / && rm -rf /tmp/audio
