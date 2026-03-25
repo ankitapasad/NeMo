@@ -66,7 +66,6 @@ class StreamingSTTEvalConfig:
     batch_size: int = 64
     max_new_tokens: int = 64
     system_prompt: str = "Transcribe the audio into text."
-    simulate_streaming: bool = True
     output_manifest: Optional[str] = "streaming_stt_generations.jsonl"
     verbose: bool = True
     device: str = "cuda"
@@ -112,7 +111,6 @@ def main(cfg: StreamingSTTEvalConfig):
             audio_lens=batch["audio_lens"].to(model.device, non_blocking=True),
             system_prompt=cfg.system_prompt,
             max_new_tokens=cfg.max_new_tokens,
-            simulate_streaming=cfg.simulate_streaming,
             use_offline_embs=cfg.use_offline_embs,
         )
         batch_infer_duration = perf_counter() - ts
