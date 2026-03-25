@@ -72,11 +72,24 @@ class StreamingSTTEvalConfig:
     dtype: str = "bfloat16"
     use_normalizer: Optional[str] = "english"  # "english", "basic", or "none"
     use_offline_embs: bool = False
+    seed: Optional[int] = None  # Set for deterministic results
 
 
 @hydra_runner(config_name="StreamingSTTEvalConfig", schema=StreamingSTTEvalConfig)
 def main(cfg: StreamingSTTEvalConfig):
     logging.info(f"Hydra config:\n{OmegaConf.to_yaml(cfg)}")
+
+    if cfg.seed is not None:
+        import os
+
+        torch.manual_seed(cfg.seed)
+        torch.cuda.manual_seed_all(cfg.seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.use_deterministic_algorithms(True)
 
     model = StreamingSTTModel.from_pretrained(cfg.pretrained_name)
     model = model.eval().to(getattr(torch, cfg.dtype)).to(cfg.device)
