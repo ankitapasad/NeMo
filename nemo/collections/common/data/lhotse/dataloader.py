@@ -198,6 +198,10 @@ class LhotseDataLoadingConfig:
     #   f. Padding to a minimum duration. Examples shorter than this will be padded, others are unaffected.
     pad_min_duration: Optional[float] = None
     pad_direction: str = "right"  # "right" | "left" | "both" | "random"
+    #   f. Padding examples with an extra duration. If pad_extra_duration_prob is not None,
+    #      the sample will be padded with this probability, otherwise it is always padded with the extra duration.
+    pad_extra_duration: Optional[float] = None
+    pad_extra_duration_prob: Optional[float] = None
     #   g. Bandwidth limitation via back-and-forth resampling
     lowpass_enabled: bool = False
     lowpass_frequencies_interval: Tuple[float, float] = (3500.0, 8000.0)
@@ -600,6 +604,19 @@ def get_lhotse_sampler_from_config(config, global_rank, world_size, tokenizer=No
 
     if config.pad_min_duration is not None:
         cuts = cuts.pad(duration=config.pad_min_duration, direction=config.pad_direction, preserve_id=True)
+
+    def pad_extra_duration(cut: Cut, extra_duration: float = 0.0, pad_prob: Optional[float] = None) -> Cut:
+        curr_duration = cut.duration
+        if pad_prob is None or (pad_prob is not None and random.random() < pad_prob):
+            return cut.pad(duration=curr_duration + extra_duration, direction="right", preserve_id=True)
+        return cut
+
+    if config.pad_extra_duration is not None:
+        cuts = cuts.map(
+            partial(
+                pad_extra_duration, extra_duration=config.pad_extra_duration, pad_prob=config.pad_extra_duration_prob
+            )
+        )
 
     # Duration filtering, same as native NeMo dataloaders.
     # We can filter after the augmentations because they are applied only when calling load_audio().
