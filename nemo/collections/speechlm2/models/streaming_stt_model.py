@@ -896,6 +896,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             audio_chunk_embs = _audio_embs.type_as(self.embed_tokens.weight)
         else:
             # 0. Update audio feature buffer
+            audio_chunk = audio_chunk.view(-1)
             if audio_chunk_len is None:
                 audio_chunk_len = audio_chunk.shape[0]
             frame = Frame(
