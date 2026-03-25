@@ -32,7 +32,10 @@ The model's ``generate()`` method returns ``list[str]`` directly.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 from time import perf_counter
 from typing import Optional
 
@@ -41,6 +44,7 @@ import torch
 from lhotse import CutSet
 from lhotse.serialization import SequentialJsonlWriter
 from omegaconf import OmegaConf
+from tqdm import tqdm
 from whisper_normalizer.basic import BasicTextNormalizer
 from whisper_normalizer.english import EnglishTextNormalizer
 
@@ -82,6 +86,7 @@ def main(cfg: StreamingSTTEvalConfig):
     if cfg.seed is not None:
         import os
 
+        logging.warning(f"Setting random seed to {cfg.seed}, this will slow down the inference")
         torch.manual_seed(cfg.seed)
         torch.cuda.manual_seed_all(cfg.seed)
         torch.backends.cudnn.deterministic = True
@@ -90,6 +95,8 @@ def main(cfg: StreamingSTTEvalConfig):
         torch.backends.cuda.enable_mem_efficient_sdp(False)
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
         torch.use_deterministic_algorithms(True)
+    else:
+        logging.warning("Random seed not set, results will not be deterministic")
 
     model = StreamingSTTModel.from_pretrained(cfg.pretrained_name)
     model = model.eval().to(getattr(torch, cfg.dtype)).to(cfg.device)
@@ -101,9 +108,11 @@ def main(cfg: StreamingSTTEvalConfig):
         logging.info(f"Resampling cuts from {sample_cut.sampling_rate} to {model.sampling_rate} Hz")
         cuts = CutSet.from_cuts(c.resample(model.sampling_rate) for c in cuts)
     cuts = cuts.sort_by_duration()
+    sampler = lhotse.dataset.DynamicCutSampler(cuts, max_cuts=cfg.batch_size)
+    num_batches = math.ceil(len(cuts) / cfg.batch_size)
     dloader = torch.utils.data.DataLoader(
         dataset=ToAudio(),
-        sampler=lhotse.dataset.DynamicCutSampler(cuts, max_cuts=cfg.batch_size),
+        sampler=sampler,
         num_workers=1,
         batch_size=None,
     )
@@ -116,7 +125,7 @@ def main(cfg: StreamingSTTEvalConfig):
     input_durations = []
     infer_durations = []
 
-    for batch_idx, batch in enumerate(dloader):
+    for batch_idx, batch in tqdm(enumerate(dloader), total=num_batches):
         ts = perf_counter()
         logging
         batch_hyps_raw = model.generate(
@@ -156,9 +165,28 @@ def main(cfg: StreamingSTTEvalConfig):
     logging.info(f"RTFx: {rtfx:.1f}")
 
     if cfg.output_manifest is not None:
+        log_file = Path(cfg.output_manifest).parent / "log.txt"
+        with open(log_file, "a") as f:
+            f.write(f"======{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}======\n")
+            f.write(f"Input: {cfg.inputs}\n")
+            f.write(f"WER: {wer:.2%} [ins={nins:.2%} del={ndel:.2%} sub={nsub:.2%}]\n")
+            f.write(f"RTFx: {rtfx:.1f}\n")
+            f.write(f"=============================================\n\n")
         with SequentialJsonlWriter(cfg.output_manifest) as writer:
             for cut, ref, hyp in zip(cuts, refs, hyps):
-                writer.write({"id": cut.id, "duration": cut.duration, "text": ref, "pred_text": hyp})
+                wer, _, nins, ndel, nsub = word_error_rate_detail(hypotheses=[hyp], references=[ref], use_cer=False)
+                writer.write(
+                    {
+                        "id": cut.id,
+                        "duration": cut.duration,
+                        "text": ref,
+                        "pred_text": hyp,
+                        "wer": wer,
+                        "ins": nins,
+                        "del": ndel,
+                        "sub": nsub,
+                    }
+                )
 
 
 if __name__ == "__main__":
