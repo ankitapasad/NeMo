@@ -223,6 +223,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             assert data_cfg is not None, "Dataset config is required for online forced alignment"
             assert dataset_cls is not None, "Dataset class is required for online forced alignment"
             self.forced_aligner = forced_aligner
+            freeze_module(self.forced_aligner)
             self.dataset = dataset_cls(cfg=data_cfg, tokenizer=self.tokenizer)
         else:
             self.forced_aligner = None
