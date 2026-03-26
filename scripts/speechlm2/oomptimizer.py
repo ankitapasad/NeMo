@@ -392,7 +392,7 @@ def oomptimizer(
         model.prepare_inputs = partial(_override_prepare_inputs, model)
 
     if isinstance(model, StreamingSTTModel):
-        model._build_input_embeds = partial(_override_build_input_embeds, model)
+        model._build_input_embeds = partial(_override_build_input_embeds, model, ratio=ratio)
         model.forced_aligner = None  # skip forced alignment for synthetic batches
 
     if not hasattr(model, "oomptimizer_schema"):
@@ -435,9 +435,35 @@ def oomptimizer(
             else:
                 input_len = bin
                 output_len = math.ceil(ratio * input_len)
-            sampling_rate = getattr(
-                model, "sample_rate", 16000
-            )  # TODO: may need to extend schema for broader model coverage
+            sampling_rate = getattr(model, "sample_rate", None) or getattr(model, "sampling_rate", 16000)
+
+            # For StreamingSTTModel, output_len must account for the streaming
+            # chat template overhead: each chunk adds ~10 template tokens + text.
+            if isinstance(model, StreamingSTTModel):
+                model._ensure_inference_cache()
+                chunk_size = model.core_cfg.chunk_size
+                frame_length = model.core_cfg.frame_length_in_secs
+                num_audio_frames = math.ceil(input_len / frame_length)
+                num_chunks = math.ceil(num_audio_frames / chunk_size)
+                turn_template_len = len(model._turn_template_ids)
+                asst_footer_len = len(model._asst_footer_ids)
+                chunk_duration = chunk_size * frame_length
+                avg_text_per_turn = max(1, math.ceil(ratio * chunk_duration))
+                hf_tok = model.tokenizer.tokenizer
+                system_prompt = (
+                    cfg.get("data", {}).get("dataset", {}).get("system_prompt", "Transcribe the audio into text.")
+                )
+                sys_len = len(
+                    hf_tok.apply_chat_template(
+                        [{"role": "system", "content": system_prompt}],
+                        tokenize=True,
+                        add_generation_prompt=False,
+                        enable_thinking=False,
+                    )
+                )
+                output_len = sys_len + num_chunks * (turn_template_len + avg_text_per_turn + asst_footer_len)
+                return (compute_num_samples(input_len, sampling_rate=sampling_rate), output_len)
+
             match modalities:
                 case "audio", "audio":
                     return (
@@ -593,13 +619,12 @@ def _override_prepare_inputs(self, batch: dict) -> dict:
     }
 
 
-def _override_build_input_embeds(self, input_tokens, audios, audio_lens):
+def _override_build_input_embeds(self, input_tokens, audios, audio_lens, ratio=12):
     """Override _build_input_embeds for oomptimizer profiling of StreamingSTTModel.
 
-    The profiling batch generator creates input_tokens with random token IDs,
-    but _build_input_embeds expects AUDIO_TOKEN_IDX markers at positions where
-    audio embeddings should be placed.  This override runs perception on the
-    synthetic audio and constructs properly marked input_tokens.
+    The schema now generates input_tokens at the correct length (including chat
+    template overhead). This override places AUDIO_TOKEN_IDX at the right positions
+    and runs the perception module on the synthetic audio.
     """
     from nemo.collections.speechlm2.models.streaming_stt_model import AUDIO_TOKEN_IDX, interleave_embeddings
 
@@ -611,7 +636,7 @@ def _override_build_input_embeds(self, input_tokens, audios, audio_lens):
     n_audio_frames = audio_embs.shape[1]  # (B, T_enc, H)
     B, L = input_tokens.shape
 
-    # Build input_tokens with AUDIO_TOKEN_IDX at the first n_audio positions
+    # Place AUDIO_TOKEN_IDX at the first n_audio positions
     input_tokens = input_tokens.clone()
     n_audio = min(n_audio_frames, L)
     input_tokens[:, :n_audio] = AUDIO_TOKEN_IDX
