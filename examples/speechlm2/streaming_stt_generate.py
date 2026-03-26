@@ -67,6 +67,22 @@ class ToAudio(torch.utils.data.Dataset):
 
 
 @dataclass
+class StreamingSTTGenerationConfig:
+    """
+    A proxy class for GenerationConfig so that we can use OmegaConf with hydra overrides.
+    All parameters will be passed to GenerationConfig.
+    """
+
+    max_new_tokens: int = 64
+    do_sample: bool = False
+    temperature: float = 1.0
+    top_k: int = 0
+    top_p: float = 1.0
+    repetition_penalty: float = 1.0
+    no_repeat_ngram_size: int = 0
+
+
+@dataclass
 class StreamingSTTEvalConfig:
     pretrained_name: str = ""
     inputs: str = ""
@@ -81,7 +97,7 @@ class StreamingSTTEvalConfig:
     use_offline_embs: bool = False
     seed: Optional[int] = None  # Set for deterministic results
     pad_extra_duration: Optional[float] = 0.0
-    generation_config: GenerationConfig = field(default_factory=GenerationConfig)
+    generation_config: StreamingSTTGenerationConfig = field(default_factory=StreamingSTTGenerationConfig)
 
 
 @hydra_runner(config_name="StreamingSTTEvalConfig", schema=StreamingSTTEvalConfig)
@@ -133,9 +149,8 @@ def main(cfg: StreamingSTTEvalConfig):
 
     for batch_idx, batch in tqdm(enumerate(dloader), total=num_batches):
         ts = perf_counter()
-        logging
-        generation_config = cfg.generation_config
-        generation_config.max_new_tokens = cfg.max_new_tokens
+        cfg.generation_config.max_new_tokens = cfg.max_new_tokens
+        generation_config = GenerationConfig(**OmegaConf.to_container(cfg.generation_config))
         batch_hyps_raw = model.generate(
             audios=batch["audios"].to(model.device, non_blocking=True),
             audio_lens=batch["audio_lens"].to(model.device, non_blocking=True),
