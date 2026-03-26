@@ -33,8 +33,9 @@ The model's ``generate()`` method returns ``list[str]`` directly.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 from time import perf_counter
 from typing import Optional
@@ -45,11 +46,13 @@ from lhotse import CutSet
 from lhotse.serialization import SequentialJsonlWriter
 from omegaconf import OmegaConf
 from tqdm import tqdm
+from transformers import GenerationConfig
 from whisper_normalizer.basic import BasicTextNormalizer
 from whisper_normalizer.english import EnglishTextNormalizer
 
 from nemo.collections.asr.metrics.wer import word_error_rate_detail
 from nemo.collections.common.data.lhotse.cutset import guess_parse_cutset
+from nemo.collections.common.data.lhotse.dataloader import pad_extra_duration
 from nemo.collections.speechlm2.models import StreamingSTTModel
 from nemo.core.config import hydra_runner
 from nemo.utils import logging
@@ -77,6 +80,8 @@ class StreamingSTTEvalConfig:
     use_normalizer: Optional[str] = "english"  # "english", "basic", or "none"
     use_offline_embs: bool = False
     seed: Optional[int] = None  # Set for deterministic results
+    pad_extra_duration: Optional[float] = 0.0
+    generation_config: GenerationConfig = field(default_factory=GenerationConfig)
 
 
 @hydra_runner(config_name="StreamingSTTEvalConfig", schema=StreamingSTTEvalConfig)
@@ -108,6 +113,7 @@ def main(cfg: StreamingSTTEvalConfig):
         logging.info(f"Resampling cuts from {sample_cut.sampling_rate} to {model.sampling_rate} Hz")
         cuts = CutSet.from_cuts(c.resample(model.sampling_rate) for c in cuts)
     cuts = cuts.sort_by_duration()
+    cuts = cuts.map(partial(pad_extra_duration, extra_duration=cfg.pad_extra_duration))
     sampler = lhotse.dataset.DynamicCutSampler(cuts, max_cuts=cfg.batch_size)
     num_batches = math.ceil(len(cuts) / cfg.batch_size)
     dloader = torch.utils.data.DataLoader(
@@ -128,11 +134,14 @@ def main(cfg: StreamingSTTEvalConfig):
     for batch_idx, batch in tqdm(enumerate(dloader), total=num_batches):
         ts = perf_counter()
         logging
+        generation_config = cfg.generation_config
+        generation_config.max_new_tokens = cfg.max_new_tokens
         batch_hyps_raw = model.generate(
             audios=batch["audios"].to(model.device, non_blocking=True),
             audio_lens=batch["audio_lens"].to(model.device, non_blocking=True),
             system_prompt=cfg.system_prompt,
             max_new_tokens=cfg.max_new_tokens,
+            generation_config=generation_config,
             use_offline_embs=cfg.use_offline_embs,
         )
         batch_infer_duration = perf_counter() - ts

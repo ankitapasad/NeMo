@@ -605,12 +605,6 @@ def get_lhotse_sampler_from_config(config, global_rank, world_size, tokenizer=No
     if config.pad_min_duration is not None:
         cuts = cuts.pad(duration=config.pad_min_duration, direction=config.pad_direction, preserve_id=True)
 
-    def pad_extra_duration(cut: Cut, extra_duration: float = 0.0, pad_prob: Optional[float] = None) -> Cut:
-        curr_duration = cut.duration
-        if pad_prob is None or (pad_prob is not None and random.random() < pad_prob):
-            return cut.pad(duration=curr_duration + extra_duration, direction="right", preserve_id=True)
-        return cut
-
     if config.pad_extra_duration is not None:
         cuts = cuts.map(
             partial(
@@ -937,6 +931,15 @@ def tokenize_with_prompt(example, tokenizer, prompt_format: str | PromptFormatte
     for key, value in encoded.items():
         setattr(example, key, value)
     return example
+
+
+def pad_extra_duration(cut: Cut, extra_duration: float = 0.0, pad_prob: Optional[float] = None) -> Cut:
+    if extra_duration is None or extra_duration == 0.0:
+        return cut
+    curr_duration = cut.duration
+    if pad_prob is None or (pad_prob is not None and random.random() < pad_prob):
+        return cut.pad(duration=curr_duration + extra_duration, direction="right", preserve_id=True)
+    return cut
 
 
 # The helper callables below exist to avoid passing lambdas into lhotse CutSet map/filter methods.
