@@ -196,6 +196,9 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
         # Ensure <blank> token is in the vocabulary.
         self.blank_token = self.core_cfg.blank_token
+        import pdb
+
+        pdb.set_trace()
         if self.blank_token not in self.tokenizer.tokenizer.get_vocab():
             logging.info(f"Adding blank token `{self.blank_token}` to tokenizer")
             self.tokenizer.add_special_tokens({"additional_special_tokens": [self.blank_token]})
