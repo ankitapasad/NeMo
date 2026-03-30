@@ -49,13 +49,12 @@ from nemo.collections.speechlm2.parts.utils import freeze_module, to_dataclass, 
 from nemo.utils import logging
 
 
-def _find_sublist(haystack: list, needle: list) -> int | None:
-    """Return the start index of *needle* in *haystack*, or ``None``."""
-    n = len(needle)
-    for i in range(len(haystack) - n + 1):
-        if haystack[i : i + n] == needle:
-            return i
-    return None
+def token_in_vocab(token: str, tokenizer: AutoTokenizer) -> bool:
+    token_pieces = tokenizer.text_to_tokens(token)
+    if len(token_pieces) == 1:
+        return True
+    else:
+        return False
 
 
 def interleave_embeddings(
@@ -196,10 +195,8 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
         # Ensure <blank> token is in the vocabulary.
         self.blank_token = self.core_cfg.blank_token
-        import pdb
 
-        pdb.set_trace()
-        if self.blank_token not in self.tokenizer.tokenizer.get_vocab():
+        if not token_in_vocab(self.blank_token, self.tokenizer):
             logging.info(f"Adding blank token `{self.blank_token}` to tokenizer")
             self.tokenizer.add_special_tokens({"additional_special_tokens": [self.blank_token]})
             self.llm.resize_token_embeddings(len(self.tokenizer.tokenizer))
