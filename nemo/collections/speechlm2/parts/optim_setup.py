@@ -221,7 +221,7 @@ def freeze_and_subset(
         if _exclude(name) and not _must_keep(name):
             param.requires_grad = False
             discard = True
-        if not discard and param.requires_grad:
+        if not discard:
             yield param
             trainable += param.numel()
         else:
