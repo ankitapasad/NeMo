@@ -197,8 +197,11 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         # Ensure <blank> token is in the vocabulary.
         self.blank_token = self.core_cfg.blank_token
         if self.blank_token not in self.tokenizer.tokenizer.get_vocab():
+            logging.info(f"Adding blank token `{self.blank_token}` to tokenizer")
             self.tokenizer.add_special_tokens({"additional_special_tokens": [self.blank_token]})
             self.llm.resize_token_embeddings(len(self.tokenizer.tokenizer))
+        else:
+            logging.info(f"Blank token `{self.blank_token}` already in tokenizer")
 
         # Separate embedding layer to avoid FSDP/TP conflicts (same pattern as SALM)
         self.embed_tokens = self.llm.model.embed_tokens
