@@ -201,7 +201,9 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             self.tokenizer.add_special_tokens({"additional_special_tokens": [self.blank_token]})
             self.llm.resize_token_embeddings(len(self.tokenizer.tokenizer))
         else:
-            logging.info(f"Blank token `{self.blank_token}` already in tokenizer")
+            logging.info(
+                f"Blank token `{self.blank_token}` already in tokenizer: {self.tokenizer.text_to_ids(self.blank_token)}"
+            )
 
         # Separate embedding layer to avoid FSDP/TP conflicts (same pattern as SALM)
         self.embed_tokens = self.llm.model.embed_tokens
