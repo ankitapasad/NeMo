@@ -197,13 +197,11 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         self.blank_token = self.core_cfg.blank_token
 
         if not token_in_vocab(self.blank_token, self.tokenizer):
-            logging.info(f"Adding blank token `{self.blank_token}` to tokenizer")
             self.tokenizer.add_special_tokens({"additional_special_tokens": [self.blank_token]})
             self.llm.resize_token_embeddings(len(self.tokenizer.tokenizer))
+            logging.info(f"Added blank token `{self.blank_token}` to tokenizer: {self.blank_token_id}")
         else:
-            logging.info(
-                f"Blank token `{str(self.blank_token)}` already in tokenizer: {self.tokenizer.text_to_ids(self.blank_token)}"
-            )
+            logging.info(f"Blank token `{str(self.blank_token)}` already in tokenizer: {self.blank_token_id}")
 
         # Separate embedding layer to avoid FSDP/TP conflicts (same pattern as SALM)
         self.embed_tokens = self.llm.model.embed_tokens
@@ -310,6 +308,10 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
     def frame_duration(self) -> float:
         """Duration (in seconds) of one audio frame at the perception output."""
         return self.perception.token_equivalent_duration
+
+    @property
+    def blank_token_id(self) -> int:
+        return self.tokenizer.text_to_ids(self.blank_token)[0]
 
     # ------------------------------------------------------------------
     # Core: efficient audio-text embedding interleaving
@@ -629,7 +631,6 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             f"{n_audio} audio slots, chunk_size={chunk_size}): {turn_ids}"
         )
 
-        self._blank_id = hf_tok.convert_tokens_to_ids(self.blank_token)
         self._eos_id = getattr(hf_tok, 'eos_token_id', None)
 
         # When eos_token_id coincides with a token in the footer (e.g. Qwen3
@@ -640,7 +641,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         self._eos_in_footer = self._eos_id is not None and self._eos_id in self._asst_footer_ids
         logging.info(
             f"Assistant footer IDs: {self._asst_footer_ids}, "
-            f"blank ID: {self._blank_id}, EOS ID: {self._eos_id}, "
+            f"blank ID: {self.blank_token_id}, EOS ID: {self._eos_id}, "
             f"EOS in footer: {self._eos_in_footer}"
         )
 
@@ -809,7 +810,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 feed_mask[b] = True
 
                 # Blank: stop (token IS fed to LLM, IS in generated)
-                if tid == self._blank_id:
+                if tid == self.blank_token_id:
                     finished[b] = True
 
                 # Footer sequence match
@@ -828,7 +829,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             tokens_to_feed = next_tokens.clone()
             for b in range(B):
                 if not feed_mask[b]:
-                    tokens_to_feed[b] = self._blank_id
+                    tokens_to_feed[b] = self.blank_token_id
 
             # All tokens are "real" (blank is a valid token), so all seq_lens grow
             if state is not None:
