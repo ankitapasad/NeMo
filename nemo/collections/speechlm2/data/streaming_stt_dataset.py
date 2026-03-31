@@ -16,13 +16,17 @@ import logging
 import math
 import re
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Iterable, List, Optional, Union
 
+import numpy as np
 import torch
+import torch.nn.functional as F
 import torch.utils.data
 from lhotse import CutSet
 from lhotse.dataset.collation import collate_audio
 from omegaconf import DictConfig
+from torch.nn import CrossEntropyLoss
+from torch.nn.utils.rnn import pad_sequence
 
 from nemo.collections.common.tokenizers import AutoTokenizer
 from nemo.collections.speechlm2.data.salm_dataset import left_collate_vectors
@@ -31,6 +35,15 @@ from nemo.collections.speechlm2.parts.utils import to_dataclass
 
 AUDIO_TOKEN_IDX = -200
 IGNORE_INDEX = -100
+
+
+def right_collate_vectors(
+    tensors: Iterable[Union[torch.Tensor, np.ndarray]],
+    padding_value: Union[int, float] = CrossEntropyLoss().ignore_index,
+) -> torch.Tensor:
+    tensors = [torch.as_tensor(t) for t in tensors]
+    assert all(len(t.shape) == 1 for t in tensors), "Expected only 1-D input tensors."
+    return pad_sequence(tensors, batch_first=True, padding_value=padding_value, padding_side="right")
 
 
 @dataclass
@@ -477,7 +490,7 @@ def _tokenize_with_assistant_mask(
     _, _, footer_ids = parse_chat_template_ids(hf_tok)
 
     # Trim footer to include only up to the EOS token.  During inference,
-    # _streaming_decode stops at EOS and feeds the full footer manually, so
+    # autoregressive decoding stops at EOS and feeds the full footer manually, so
     # training on tokens after EOS (e.g. the \n in <|im_end|>\n) is wasted.
     eos_id = getattr(hf_tok, 'eos_token_id', None)
     if eos_id is not None and eos_id in footer_ids:
@@ -673,11 +686,22 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             all_input_ids.append(torch.tensor(input_ids, dtype=torch.long))
             all_target_ids.append(torch.tensor(target_ids, dtype=torch.long))
 
-        # Left-pad to uniform length within the batch
-        input_tokens = left_collate_vectors(all_input_ids, padding_value=self.tokenizer.pad_id)
-        target_tokens = left_collate_vectors(all_target_ids, padding_value=IGNORE_INDEX)
-        input_token_lens = torch.tensor([len(ids) for ids in all_input_ids], dtype=torch.long)
-        target_token_lens = input_token_lens.clone()
+        if self.cfg.chunk_size > 0:
+            input_tokens = right_collate_vectors(all_input_ids, padding_value=self.tokenizer.pad_id)
+            target_tokens = right_collate_vectors(all_target_ids, padding_value=IGNORE_INDEX)
+            input_token_lens = torch.tensor([len(ids) for ids in all_input_ids], dtype=torch.long)
+            target_token_lens = torch.tensor([len(ids) for ids in all_target_ids], dtype=torch.long)
+        else:
+            # Left-pad to uniform length within the batch
+            input_tokens = left_collate_vectors(all_input_ids, padding_value=self.tokenizer.pad_id)
+            target_tokens = left_collate_vectors(all_target_ids, padding_value=IGNORE_INDEX)
+            # length is the same size as input_tokens.shape[1] since they're left-padded
+            input_token_lens = torch.tensor(
+                [input_tokens.shape[1] for _ in range(len(all_input_ids))], dtype=torch.long
+            )
+            target_token_lens = torch.tensor(
+                [target_tokens.shape[1] for _ in range(len(all_target_ids))], dtype=torch.long
+            )
 
         return StreamingSTTBatch(
             audios=audios,
