@@ -222,19 +222,36 @@ def get_llm_messages_for_sample(
         system_prompt: The prompt for the system.
         audio_tag: The tag for the audio placeholder.
         blank_token: The token for blank/no-emission.
-        chunk_size: The number of frames per chunk.
+        chunk_size: The number of frames per chunk. If -1, the whole audio is used as a single chunk.
         num_delay_frames: Number of frames to delay word emission after word end.
         audio_duration_secs: The duration of the audio in seconds.
         frame_length_in_secs: The length of a single frame in seconds.
         alignments: List of WordAlignment objects for the sample.
     """
-    num_frames = math.ceil(audio_duration_secs / frame_length_in_secs)
-    num_chunks = math.ceil(num_frames / chunk_size) if num_frames > 0 else 0
+
+    assert chunk_size != 0, "chunk_size must be greater than 0 or -1"
 
     messages = [{"role": system_role, "content": system_prompt}]
 
+    num_frames = math.ceil(audio_duration_secs / frame_length_in_secs)
+
+    if chunk_size < 0 or chunk_size is None:
+        # Offline mode: use the whole audio as a single chunk
+        num_chunks = 1 if num_frames > 0 else 0
+        chunk_size = num_frames
+        offline_mode = True
+    else:
+        # Streaming mode: split the audio into chunks
+        num_chunks = math.ceil(num_frames / chunk_size) if num_frames > 0 else 0
+        offline_mode = False
+
     if alignments is None:
         alignments = []
+
+    if offline_mode and not alignments:
+        messages.append({"role": "user", "content": audio_tag * num_frames})
+        messages.append({"role": "assistant", "content": transcript if transcript is not None else blank_token})
+        return messages
 
     # Pre-compute word character spans if transcript is provided.
     word_spans = compute_word_spans(alignments, transcript, preserve_whitespace=True) if transcript else None
@@ -552,8 +569,13 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
         # its token ID sequence.  We must encode the full chunk as a single string
         # because BPE may merge tokens across adjacent audio tags (e.g.,
         # "<audio><audio>" tokenizes differently from encode("<audio>") * 2).
-        audio_chunk_str = self.cfg.audio_tag * self.cfg.chunk_size
-        self.audio_chunk_ids = self.tokenizer.tokenizer.encode(audio_chunk_str, add_special_tokens=False)
+        # When chunk_size=-1 (offline mode), audio_chunk_ids is computed per sample
+        # in get_batch_data because num_frames varies per sample.
+        if self.cfg.chunk_size > 0:
+            audio_chunk_str = self.cfg.audio_tag * self.cfg.chunk_size
+            self.audio_chunk_ids = self.tokenizer.tokenizer.encode(audio_chunk_str, add_special_tokens=False)
+        else:
+            self.audio_chunk_ids = None
 
         # blank_token is part of the LLM output vocabulary — it must be a single
         # special token, otherwise loss is dominated by multi-token blanks and
@@ -620,15 +642,25 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
         all_input_ids = []
         all_target_ids = []
 
-        for messages in batch_messages:
+        for sample_idx, messages in enumerate(batch_messages):
             # Tokenize and compute assistant content mask.
             input_ids, assistant_mask = _tokenize_with_assistant_mask(messages, self.tokenizer)
 
             # Replace each audio chunk token sequence with chunk_size AUDIO_TOKEN_IDX markers.
             # We match the full chunk (audio_tag * chunk_size) as a unit because BPE
             # may merge tokens across adjacent audio tags.
+            if self.audio_chunk_ids is not None:
+                audio_chunk_ids = self.audio_chunk_ids
+                chunk_size = self.cfg.chunk_size
+            else:
+                # Offline mode (chunk_size=-1): each sample has a different num_frames.
+                # Compute audio_chunk_ids per sample from the user turn's audio tag count.
+                num_frames = math.ceil(audio_durations_secs[sample_idx] / self.cfg.frame_length_in_secs)
+                audio_chunk_str = self.cfg.audio_tag * num_frames
+                audio_chunk_ids = self.tokenizer.tokenizer.encode(audio_chunk_str, add_special_tokens=False)
+                chunk_size = num_frames
             input_ids, assistant_mask = _replace_audio_chunks(
-                input_ids, self.audio_chunk_ids, self.cfg.chunk_size, mask=assistant_mask
+                input_ids, audio_chunk_ids, chunk_size, mask=assistant_mask
             )
 
             # Build targets: next-token prediction with loss only on assistant content.

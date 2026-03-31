@@ -28,6 +28,8 @@ The primary reference is the docstring example in get_llm_messages_for_sample:
       [<blank>, <blank>, Hello, <blank>, World, <blank>, <blank>]
 """
 
+import math
+
 import pytest
 
 from nemo.collections.speechlm2.data.streaming_stt_dataset import (
@@ -529,7 +531,10 @@ class TestTranscriptPreservation:
             transcript="she said good night",
         )
         asst = [m["content"] for m in msgs if m["role"] == "assistant"]
-        assert asst[0] == "said good"
+        # Trailing space is included because preserve_whitespace extends through
+        # whitespace after "good" (up to "night"), ensuring correct concatenation
+        # when turns are joined.
+        assert asst[0] == "said good "
 
     def test_without_transcript_falls_back(self):
         """Without transcript, words are joined with plain space."""
@@ -571,8 +576,9 @@ class TestTranscriptPreservation:
             transcript="yes, indeed",
         )
         asst = [m["content"] for m in msgs if m["role"] == "assistant"]
-        # "yes" is ready at chunk 0 (end_frame=1 <= 2), alone in its chunk
-        assert asst[0] == "yes,"
+        # "yes" is ready at chunk 0 (end_frame=1 <= 2), alone in its chunk.
+        # Trailing space included via preserve_whitespace (space before "indeed").
+        assert asst[0] == "yes, "
 
     def test_blanks_unchanged_with_transcript(self):
         """Blank chunks still produce <blank> even when transcript is provided."""
@@ -933,3 +939,134 @@ class TestTokenizeWithAssistantMaskFallback:
         # Verify it's not masked out
         footer_target_pos = target_ids.index(footer_id)
         assert target_ids[footer_target_pos] != IGNORE_INDEX
+
+
+# ===========================================================================
+# Tests: chunk_size=-1 (offline / single-chunk mode)
+# ===========================================================================
+class TestOfflineSingleChunk:
+    """Verify chunk_size=-1 treats the whole audio as one chunk."""
+
+    def test_single_chunk_structure(self):
+        """chunk_size=-1 should produce exactly 1 user turn + 1 assistant turn."""
+        msgs = _make_messages(chunk_size=-1)
+        user_msgs = [m for m in msgs if m["role"] == "user"]
+        asst_msgs = [m for m in msgs if m["role"] == "assistant"]
+        assert len(user_msgs) == 1
+        assert len(asst_msgs) == 1
+
+    def test_audio_tags_equal_num_frames(self):
+        """The single user turn should have num_frames audio tags."""
+        msgs = _make_messages(chunk_size=-1, audio_duration_secs=1.0)
+        user_msg = [m for m in msgs if m["role"] == "user"][0]
+        num_frames = math.ceil(1.0 / FRAME_LEN)  # 13
+        assert user_msg["content"] == AUDIO_TAG * num_frames
+
+    def test_all_words_in_single_turn(self):
+        """All words should appear in the single assistant turn."""
+        msgs = _make_messages(chunk_size=-1)
+        asst = [m["content"] for m in msgs if m["role"] == "assistant"]
+        assert len(asst) == 1
+        assert "Hello" in asst[0]
+        assert "World" in asst[0]
+
+    def test_no_blanks(self):
+        """With all audio in one chunk, all words are ready — no blanks."""
+        msgs = _make_messages(chunk_size=-1)
+        asst = [m["content"] for m in msgs if m["role"] == "assistant"]
+        assert BLANK_TOKEN not in asst
+
+    def test_transcript_preserved(self):
+        """Punctuation from transcript should be preserved in single-chunk mode."""
+        alignments = [
+            WordAlignment(text="hello", start_time=0.0, end_time=0.08),
+            WordAlignment(text="world", start_time=0.10, end_time=0.16),
+        ]
+        msgs = _make_messages(
+            chunk_size=-1,
+            audio_duration_secs=0.16,
+            alignments=alignments,
+            transcript="Hello, World!",
+        )
+        asst = [m["content"] for m in msgs if m["role"] == "assistant"]
+        assert asst[0] == "Hello, World!"
+
+    def test_empty_alignments_no_transcript_produces_blank(self):
+        """No alignments and no transcript → single blank turn."""
+        msgs = _make_messages(chunk_size=-1, alignments=[], transcript=None)
+        asst = [m["content"] for m in msgs if m["role"] == "assistant"]
+        assert asst == [BLANK_TOKEN]
+
+    def test_empty_alignments_with_transcript_uses_transcript(self):
+        """No alignments but transcript provided → uses raw transcript."""
+        msgs = _make_messages(
+            chunk_size=-1,
+            alignments=[],
+            audio_duration_secs=1.0,
+            transcript="Hello, World!",
+        )
+        asst = [m["content"] for m in msgs if m["role"] == "assistant"]
+        assert asst == ["Hello, World!"]
+
+    def test_none_alignments_with_transcript_uses_transcript(self):
+        """None alignments with transcript → uses raw transcript."""
+        msgs = _make_messages(
+            chunk_size=-1,
+            alignments=None,
+            audio_duration_secs=1.0,
+            transcript="some text here",
+        )
+        asst = [m["content"] for m in msgs if m["role"] == "assistant"]
+        assert asst == ["some text here"]
+
+    def test_zero_duration(self):
+        """Zero-duration audio with no alignments → early return with empty user turn and blank."""
+        msgs = _make_messages(chunk_size=-1, audio_duration_secs=0.0, alignments=[])
+        assert len(msgs) == 3
+        assert msgs[0]["role"] == "system"
+        assert msgs[1] == {"role": "user", "content": ""}
+        assert msgs[2] == {"role": "assistant", "content": BLANK_TOKEN}
+
+    def test_delay_ignored_single_chunk(self):
+        """With one chunk spanning all frames, delay shouldn't matter
+        (all words fit within the single chunk's end frame)."""
+        msgs = _make_messages(chunk_size=-1, num_delay_frames=2)
+        asst = [m["content"] for m in msgs if m["role"] == "assistant"]
+        # num_frames=13, chunk_end_frame=13.
+        # Hello: end_frame=6, ready=8 <= 13 ✓
+        # World: end_frame=10, ready=12 <= 13 ✓
+        assert len(asst) == 1
+        assert "Hello" in asst[0]
+        assert "World" in asst[0]
+
+    def test_delay_causes_residual_in_single_chunk(self):
+        """Large delay can push a word past the single chunk's end frame → residual."""
+        # Audio 1.0s → 13 frames → chunk_end_frame=13
+        # World: end_frame=ceil(0.80/0.08)=10, with delay=5 → ready_frame=15 > 13
+        msgs = _make_messages(chunk_size=-1, num_delay_frames=5)
+        asst = [m["content"] for m in msgs if m["role"] == "assistant"]
+        assert len(asst) == 1
+        # World should still appear via the residual logic
+        assert "Hello" in asst[0]
+        assert "World" in asst[0]
+
+    def test_matches_large_chunk_size(self):
+        """chunk_size=-1 should produce the same result as chunk_size=num_frames."""
+        num_frames = math.ceil(1.0 / FRAME_LEN)
+        msgs_offline = _make_messages(chunk_size=-1)
+        msgs_large = _make_messages(chunk_size=num_frames)
+        # Both should have 1 system + 1 user + 1 assistant = 3 messages
+        assert len(msgs_offline) == len(msgs_large)
+        # Same assistant content
+        asst_offline = [m["content"] for m in msgs_offline if m["role"] == "assistant"]
+        asst_large = [m["content"] for m in msgs_large if m["role"] == "assistant"]
+        assert asst_offline == asst_large
+        # Same user content (same number of audio tags)
+        user_offline = [m["content"] for m in msgs_offline if m["role"] == "user"]
+        user_large = [m["content"] for m in msgs_large if m["role"] == "user"]
+        assert user_offline == user_large
+
+    def test_chunk_size_zero_raises(self):
+        """chunk_size=0 should raise an assertion error."""
+        with pytest.raises(AssertionError):
+            _make_messages(chunk_size=0)
