@@ -253,6 +253,7 @@ def get_llm_messages_for_sample(
         num_chunks = 1 if num_frames > 0 else 0
         chunk_size = num_frames
         offline_mode = True
+        num_delay_frames = 0  # force delay to 0 for offline mode
     else:
         # Streaming mode: split the audio into chunks
         num_chunks = math.ceil(num_frames / chunk_size) if num_frames > 0 else 0
