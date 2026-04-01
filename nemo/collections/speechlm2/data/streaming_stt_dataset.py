@@ -383,20 +383,28 @@ def get_llm_messages_for_batch(
     return batch_messages
 
 
-def parse_chat_template_ids(hf_tok) -> tuple[list[int], list[int], list[int]]:
+def parse_chat_template_ids(hf_tok, offline: bool = False) -> tuple[list[int], list[int], list[int]]:
     """Discover turn-structure token IDs from a HuggingFace chat template.
 
-    Uses a 4-message sentinel conversation (two user+assistant pairs) to
-    isolate the token IDs for each structural component of a turn.  The second
-    pair prevents Qwen3-style templates from injecting ``<think>`` tags on the
-    first assistant turn.
+    Extracts the structural token IDs that surround user and assistant content
+    in the chat template.  Uses a 2-message sentinel conversation (1 user +
+    1 assistant) to get the ``user_header``, ``asst_footer``, and the full
+    ``user_footer_and_asst_header`` (which may include Qwen3-style
+    ``<think>...</think>`` suppression tags).
 
-    The boundary between the assistant footer and the next user header is
-    detected by searching for the user-header text in the remaining template
-    string, making this template-agnostic (works for ChatML, Llama, etc.).
+    For **streaming** (``offline=False``), a second 4-message sentinel is used
+    to obtain the assistant header *without* thinking tags — Qwen3 only injects
+    them on the last assistant turn, and in streaming each chunk is a non-final
+    turn.
+
+    For **offline** (``offline=True``), the 2-message result is returned as-is,
+    since the single assistant turn IS the last turn and must include thinking
+    suppression tags to match training.
 
     Args:
         hf_tok: A HuggingFace tokenizer (``tokenizer.tokenizer``).
+        offline: When True, return the assistant header with thinking
+            suppression tags (for single-turn offline inference).
 
     Returns:
         ``(user_header_ids, user_footer_and_asst_header_ids, asst_footer_ids)``
@@ -404,43 +412,55 @@ def parse_chat_template_ids(hf_tok) -> tuple[list[int], list[int], list[int]]:
         - *user_header_ids*: tokens before user content, BOS stripped
           (e.g. ``[<|im_start|>, user, \\n]``).
         - *user_footer_and_asst_header_ids*: tokens between user content and
-          assistant content (e.g. ``[<|im_end|>, \\n, <|im_start|>, assistant, \\n]``).
+          assistant content.
         - *asst_footer_ids*: tokens after assistant content
           (e.g. ``[<|im_end|>, \\n]``).
     """
     _SENTINEL = "XSENTINELX"
-    convo_text = hf_tok.apply_chat_template(
+
+    # --- 2-message template: correct footer, full assistant header ---
+    convo_2msg = hf_tok.apply_chat_template(
         [
             {"role": "user", "content": _SENTINEL},
             {"role": "assistant", "content": _SENTINEL},
-            {"role": "user", "content": "x"},
-            {"role": "assistant", "content": "x"},
         ],
         tokenize=False,
         add_generation_prompt=False,
         enable_thinking=False,
     )
-    parts = convo_text.split(_SENTINEL)
+    parts = convo_2msg.split(_SENTINEL)
     assert len(parts) >= 3, f"Expected >=3 parts after splitting on sentinel, got {len(parts)}: {parts}"
-    # parts[0] = user header       (e.g. "<|im_start|>user\n")
-    # parts[1] = user footer + assistant header (e.g. "<|im_end|>\n<|im_start|>assistant\n")
-    # parts[2] = assistant footer + remaining dummy turns
 
     user_header_ids = hf_tok.encode(parts[0], add_special_tokens=False)
-    user_footer_and_asst_header_ids = hf_tok.encode(parts[1], add_special_tokens=False)
-
-    # Trim the assistant footer at the next turn boundary.
-    user_header_text = parts[0].lstrip()  # strip potential BOS text
-    footer_and_rest = parts[2]
-    next_turn = footer_and_rest.find(user_header_text)
-    footer_text = footer_and_rest[:next_turn] if next_turn > 0 else ""
-    asst_footer_ids = hf_tok.encode(footer_text, add_special_tokens=False) if footer_text else []
+    asst_footer_ids = hf_tok.encode(parts[2], add_special_tokens=False) if parts[2].strip() else []
 
     # Strip leading BOS from user header — it is already in the KV cache
     # from the system prompt during inference.
     bos_id = getattr(hf_tok, "bos_token_id", None)
     if user_header_ids and bos_id is not None and user_header_ids[0] == bos_id:
         user_header_ids = user_header_ids[1:]
+
+    if offline:
+        # Offline: use the 2-msg assistant header (includes thinking tags).
+        user_footer_and_asst_header_ids = hf_tok.encode(parts[1], add_special_tokens=False)
+    else:
+        # Streaming: use the 4-msg assistant header (no thinking tags).
+        # The 4-msg trick places the sentinel on the first assistant turn,
+        # which is NOT the last turn → Qwen3 omits thinking tags.
+        convo_4msg = hf_tok.apply_chat_template(
+            [
+                {"role": "user", "content": _SENTINEL},
+                {"role": "assistant", "content": _SENTINEL},
+                {"role": "user", "content": "x"},
+                {"role": "assistant", "content": "x"},
+            ],
+            tokenize=False,
+            add_generation_prompt=False,
+            enable_thinking=False,
+        )
+        parts_4msg = convo_4msg.split(_SENTINEL)
+        assert len(parts_4msg) >= 3
+        user_footer_and_asst_header_ids = hf_tok.encode(parts_4msg[1], add_special_tokens=False)
 
     return user_header_ids, user_footer_and_asst_header_ids, asst_footer_ids
 

@@ -83,13 +83,13 @@ def interleave_embeddings(
         audio_embs: (B, T_enc, H) frame-level embeddings from the audio encoder.
             If there are more audio tokens than encoder frames (last-chunk
             ceiling), the tensor is zero-padded automatically.
-        pad_id: token ID used for left-padding — these positions get
+        pad_id: text token ID used for padding — these positions get
             ``attention_mask = False``.
 
     Returns:
         dict with:
             ``input_embeds`` — (B, L, H) interleaved embeddings.
-            ``attention_mask`` — (B, L) bool, False only at left-padding positions.
+            ``attention_mask`` — (B, L) bool, False only at padding positions.
     """
     B, L = input_tokens.shape
 
@@ -160,6 +160,7 @@ class StreamingState:
     seq_lens: list[int] = field(default_factory=list)  # per-stream sequence lengths
     audio_cache: CacheAwareContext | None = None  # perception cache with batch dim B
     audio_feature_buffer: BatchedCacheFeatureBufferer | None = None
+    attention_mask: Optional[Tensor] = None  # (B, seq_len) mask for left-padded prefill
     batch_size: int = 1
 
     @property
@@ -602,7 +603,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
     # ------------------------------------------------------------------
 
     def _ensure_inference_cache(self) -> None:
-        """Lazily cache token templates and IDs needed for streaming inference.
+        """Lazily cache token templates and IDs needed for inference.
 
         Uses ``apply_chat_template(tokenize=False)`` on a 4-message dummy
         conversation and splits the text around a sentinel to isolate
@@ -613,23 +614,31 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         templates from injecting ``<think>``/``</think>`` tags, which only
         appear on the final assistant turn.
         """
-        if hasattr(self, '_turn_template_ids'):
+        if hasattr(self, '_inference_cache_ready'):
             return
 
         hf_tok = self.tokenizer.tokenizer
         chunk_size = self.core_cfg.chunk_size
 
-        # --- Build turn template from the shared template parser ---
-        user_header_ids, user_footer_and_asst_header_ids, asst_footer_ids = parse_chat_template_ids(hf_tok)
+        # --- Build turn template ---
+        user_header_ids, user_footer_and_asst_header_ids, asst_footer_ids = parse_chat_template_ids(
+            hf_tok, offline=(chunk_size < 0)
+        )
+        self._user_header_ids = user_header_ids
+        self._user_footer_and_asst_header_ids = user_footer_and_asst_header_ids
         self._asst_footer_ids = asst_footer_ids
 
-        turn_ids = user_header_ids + [AUDIO_TOKEN_IDX] * chunk_size + user_footer_and_asst_header_ids
-        self._turn_template_ids = turn_ids
-        n_audio = turn_ids.count(AUDIO_TOKEN_IDX)
-        logging.info(
-            f"Streaming turn template ({len(turn_ids)} tokens, "
-            f"{n_audio} audio slots, chunk_size={chunk_size}): {turn_ids}"
-        )
+        if chunk_size > 0:
+            turn_ids = user_header_ids + [AUDIO_TOKEN_IDX] * chunk_size + user_footer_and_asst_header_ids
+            self._turn_template_ids = turn_ids
+            n_audio = turn_ids.count(AUDIO_TOKEN_IDX)
+            logging.info(
+                f"Streaming turn template ({len(turn_ids)} tokens, "
+                f"{n_audio} audio slots, chunk_size={chunk_size}): {turn_ids}"
+            )
+        else:
+            self._turn_template_ids = None
+            logging.info(f"Offline mode (chunk_size={chunk_size}): no fixed turn template")
 
         self._eos_id = getattr(hf_tok, 'eos_token_id', None)
 
@@ -644,6 +653,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             f"blank ID: {self.blank_token_id}, EOS ID: {self._eos_id}, "
             f"EOS in footer: {self._eos_in_footer}"
         )
+        self._inference_cache_ready = True
 
     def _sample_token(
         self,
@@ -746,16 +756,17 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         probs = F.softmax(logits, dim=-1)
         return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
-    def _streaming_decode(
+    def _autoregressive_decode(
         self,
         logits: Tensor,
         cache: tuple,
         state: Optional['StreamingState'],
         max_new_tokens: int,
         generation_config: Optional[GenerationConfig] = None,
+        attention_mask: Optional[Tensor] = None,
         **generation_kwargs,
     ) -> tuple[list[list[int]], tuple, list[bool], int]:
-        """Autoregressive decoding for the streaming path (supports B streams).
+        """Autoregressive decoding (supports B streams).
 
         Token selection is delegated to :meth:`_sample_token`, which supports
         greedy (default), sampling (temperature / top-k / top-p), repetition
@@ -773,6 +784,11 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             cache: HF ``past_key_values`` with batch dim B.
             max_new_tokens: Maximum tokens to generate per stream.
             generation_config: Optional HuggingFace ``GenerationConfig``.
+            attention_mask: Optional ``(B, seq_len)`` attention mask.  When
+                provided, it is extended by one column on each decode step
+                and passed to the LLM.  Required when the prefill used
+                left-padding (e.g. offline mode).  When ``None`` (streaming
+                path), no mask is passed — fully backward-compatible.
             generation_kwargs: Per-call overrides.
 
         Returns:
@@ -837,12 +853,19 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     state.seq_lens[b] += 1
 
             token_emb = self.embed_tokens(tokens_to_feed.unsqueeze(1))  # (B, 1, H)
-            out = self.llm(
+            llm_kwargs = dict(
                 inputs_embeds=token_emb,
                 past_key_values=cache,
                 use_cache=True,
                 return_dict=True,
             )
+            if attention_mask is not None:
+                attention_mask = torch.cat(
+                    [attention_mask, torch.ones(B, 1, dtype=attention_mask.dtype, device=attention_mask.device)],
+                    dim=1,
+                )
+                llm_kwargs["attention_mask"] = attention_mask
+            out = self.llm(**llm_kwargs)
             cache = out.past_key_values
             num_feed_steps += 1
 
@@ -876,29 +899,70 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
     def get_init_streaming_state(
         self,
-        system_prompt: str,
+        system_prompt: Union[str, List[str]],
         device: torch.device,
         batch_size: int = 1,
     ) -> StreamingState:
         """Forward the system prompt through the LLM and return a fresh :class:`StreamingState`.
 
         Args:
-            system_prompt: System prompt (same for all B streams).
+            system_prompt: System prompt string (shared) or list of B per-sample prompts.
             device: Target device.
             batch_size: Number of parallel streams (B).
         """
         hf_tok = self.tokenizer.tokenizer
-        sys_ids = hf_tok.apply_chat_template(
-            [{"role": "system", "content": system_prompt}],
-            tokenize=True,
-            add_generation_prompt=False,
-            enable_thinking=False,
-        )
         dtype = self.embed_tokens.weight.dtype
-        # (1, L_sys, H) → expand to (B, L_sys, H)
-        sys_embs = self.embed_tokens(torch.tensor(sys_ids, device=device, dtype=torch.long).unsqueeze(0))
-        sys_embs = sys_embs.expand(batch_size, -1, -1)
-        out = self.llm(inputs_embeds=sys_embs, use_cache=True, return_dict=True)
+
+        if isinstance(system_prompt, str):
+            prompts = [system_prompt] * batch_size
+        else:
+            prompts = system_prompt
+
+        # Tokenize each prompt
+        all_sys_ids = []
+        for prompt in prompts:
+            ids = hf_tok.apply_chat_template(
+                [{"role": "system", "content": prompt}],
+                tokenize=True,
+                add_generation_prompt=False,
+                enable_thinking=False,
+            )
+            all_sys_ids.append(ids)
+
+        # Check if all prompts are the same length (common case: same prompt)
+        sys_lens = [len(ids) for ids in all_sys_ids]
+        needs_padding = len(set(sys_lens)) > 1
+
+        if not needs_padding:
+            # Fast path: all same length, no padding needed
+            sys_embs = self.embed_tokens(
+                torch.tensor(all_sys_ids[0], device=device, dtype=torch.long).unsqueeze(0)
+            ).expand(batch_size, -1, -1)
+            out = self.llm(inputs_embeds=sys_embs, use_cache=True, return_dict=True)
+            attention_mask = None
+            max_sys_len = sys_lens[0]
+        else:
+            # Per-sample prompts with different lengths: left-pad and use attention mask
+            max_sys_len = max(sys_lens)
+            H = self.embed_tokens.weight.shape[-1]
+            sys_embs = torch.zeros(batch_size, max_sys_len, H, device=device, dtype=dtype)
+            attention_mask = torch.zeros(batch_size, max_sys_len, dtype=torch.long, device=device)
+            for b in range(batch_size):
+                embs = self.embed_tokens(
+                    torch.tensor(all_sys_ids[b], device=device, dtype=torch.long).unsqueeze(0)
+                ).squeeze(
+                    0
+                )  # (L_b, H)
+                offset = max_sys_len - sys_lens[b]
+                sys_embs[b, offset:] = embs
+                attention_mask[b, offset:] = 1
+            out = self.llm(
+                inputs_embeds=sys_embs,
+                attention_mask=attention_mask,
+                use_cache=True,
+                return_dict=True,
+            )
+
         cache_last_channel, cache_last_time, cache_last_channel_len = self.perception.get_initial_cache_state(
             batch_size=batch_size, dtype=dtype, device=device
         )
@@ -908,13 +972,13 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             cache_last_time=cache_last_time,
             cache_last_channel_len=cache_last_channel_len,
         )
-        sys_len = sys_embs.shape[1]
         return StreamingState(
             cache=out.past_key_values,
             generated_tokens=[[] for _ in range(batch_size)],
-            seq_lens=[sys_len] * batch_size,
+            seq_lens=[max_sys_len] * batch_size,
             audio_cache=audio_cache,
             audio_feature_buffer=audio_feature_buffer,
+            attention_mask=attention_mask,
             batch_size=batch_size,
         )
 
@@ -1008,20 +1072,39 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
         # 5. Forward through LLM with cache
         input_len = input_embeds.shape[1]
-        out = self.llm(
+        llm_kwargs = dict(
             inputs_embeds=input_embeds,
             past_key_values=state.cache,
             use_cache=True,
             return_dict=True,
         )
+        if state.attention_mask is not None:
+            state.attention_mask = torch.cat(
+                [state.attention_mask, torch.ones(B, input_len, dtype=state.attention_mask.dtype, device=device)],
+                dim=1,
+            )
+            llm_kwargs["attention_mask"] = state.attention_mask
+        out = self.llm(**llm_kwargs)
         state.cache = out.past_key_values
         for b in range(B):
             state.seq_lens[b] += input_len
 
         # 6. Autoregressive generation loop
-        generated_per_stream, state.cache, footer_consumed, num_feed_steps = self._streaming_decode(
-            out.logits, state.cache, state, max_new_tokens, generation_config, **generation_kwargs
+        generated_per_stream, state.cache, footer_consumed, num_feed_steps = self._autoregressive_decode(
+            out.logits,
+            state.cache,
+            state,
+            max_new_tokens,
+            generation_config,
+            attention_mask=state.attention_mask,
+            **generation_kwargs,
         )
+        # Update attention_mask for tokens fed during decode
+        if state.attention_mask is not None and num_feed_steps > 0:
+            state.attention_mask = torch.cat(
+                [state.attention_mask, torch.ones(B, num_feed_steps, dtype=state.attention_mask.dtype, device=device)],
+                dim=1,
+            )
 
         # 7. Finalize turn — ensure end-of-turn tokens are in the cache.
         any_needs_footer = any(not fc for fc in footer_consumed)
@@ -1030,12 +1113,19 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             asst_footer_embs = self.embed_tokens(
                 torch.tensor(self._asst_footer_ids, device=device).unsqueeze(0).expand(B, -1)
             )
-            out = self.llm(
+            footer_llm_kwargs = dict(
                 inputs_embeds=asst_footer_embs,
                 past_key_values=state.cache,
                 use_cache=True,
                 return_dict=True,
             )
+            if state.attention_mask is not None:
+                state.attention_mask = torch.cat(
+                    [state.attention_mask, torch.ones(B, flen, dtype=state.attention_mask.dtype, device=device)],
+                    dim=1,
+                )
+                footer_llm_kwargs["attention_mask"] = state.attention_mask
+            out = self.llm(**footer_llm_kwargs)
             state.cache = out.past_key_values
             for b in range(B):
                 state.seq_lens[b] += flen
@@ -1080,11 +1170,127 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             chunks.append(chunk)
         return chunks
 
+    def _generate_offline(
+        self,
+        audios: Tensor,
+        n_samples_list: list[int],
+        system_prompt: Union[str, List[str]],
+        max_new_tokens: int,
+        generation_config: Optional[GenerationConfig] = None,
+        **generation_kwargs,
+    ) -> list[str]:
+        """Offline generation: process entire audio in a single LLM forward pass.
+
+        Unlike the streaming path, this method runs offline perception on the
+        full audio (no chunking, no streaming cache), builds one input sequence
+        per sample (system prompt + user turn with all audio frames + assistant
+        header), and prefills the LLM in a single forward pass before decoding.
+
+        Args:
+            audios: ``(B, T_samples)`` raw waveforms (zero-padded to max length).
+            n_samples_list: List of B valid sample counts.
+            system_prompt: System prompt string (shared) or list of B per-sample prompts.
+            max_new_tokens: Maximum tokens to generate per sample.
+            generation_config: Optional HuggingFace ``GenerationConfig``.
+            generation_kwargs: Per-call overrides for generation parameters.
+
+        Returns:
+            List of B transcription strings.
+        """
+        B = len(n_samples_list)
+        if B == 0 or max(n_samples_list) == 0:
+            return [""] * B
+        device = audios.device
+        dtype = self.embed_tokens.weight.dtype
+
+        # 1. Encode system prompt(s)
+        hf_tok = self.tokenizer.tokenizer
+        prompts = [system_prompt] * B if isinstance(system_prompt, str) else system_prompt
+        all_sys_embs = []
+        for prompt in prompts:
+            sys_ids = hf_tok.apply_chat_template(
+                [{"role": "system", "content": prompt}],
+                tokenize=True,
+                add_generation_prompt=False,
+                enable_thinking=False,
+            )
+            embs = self.embed_tokens(torch.tensor(sys_ids, device=device, dtype=torch.long).unsqueeze(0)).squeeze(
+                0
+            )  # (L_sys_b, H)
+            all_sys_embs.append(embs)
+
+        # 2. Embed turn template components (shared across batch)
+        user_header_embs = self.embed_tokens(
+            torch.tensor(self._user_header_ids, device=device, dtype=torch.long).unsqueeze(0)
+        )  # (1, L_uh, H)
+        uf_ah_embs = self.embed_tokens(
+            torch.tensor(self._user_footer_and_asst_header_ids, device=device, dtype=torch.long).unsqueeze(0)
+        )  # (1, L_uf, H)
+
+        # 3. Run offline perception on the full batch
+        audio_lens_t = torch.tensor(n_samples_list, device=device)
+        batch_audio_embs, batch_emb_lens = self.perception(
+            input_signal=audios,
+            input_signal_length=audio_lens_t,
+        )  # (B, T_enc_max, H), (B,)
+        batch_audio_embs = batch_audio_embs.type_as(self.embed_tokens.weight)
+        all_audio_embs = [batch_audio_embs[b, : int(batch_emb_lens[b].item())] for b in range(B)]
+
+        # 4. Build per-sample input sequences:
+        #    sys_embs[b] + user_header_embs + audio_embs[b] + user_footer_asst_header_embs
+        sample_embs_list = []
+        sample_lens = []
+        for b in range(B):
+            seq = torch.cat(
+                [all_sys_embs[b], user_header_embs.squeeze(0), all_audio_embs[b], uf_ah_embs.squeeze(0)],
+                dim=0,
+            )  # (L_b, H)
+            sample_embs_list.append(seq)
+            sample_lens.append(seq.shape[0])
+
+        # 5. Left-pad to max length and build attention mask
+        max_len = max(sample_lens)
+        H = sample_embs_list[0].shape[-1]
+        input_embeds = torch.zeros(B, max_len, H, device=device, dtype=dtype)
+        attention_mask = torch.zeros(B, max_len, dtype=torch.long, device=device)
+        for b in range(B):
+            offset = max_len - sample_lens[b]
+            input_embeds[b, offset:] = sample_embs_list[b]
+            attention_mask[b, offset:] = 1
+
+        # 6. LLM prefill (single forward pass)
+        out = self.llm(
+            inputs_embeds=input_embeds,
+            attention_mask=attention_mask,
+            use_cache=True,
+            return_dict=True,
+        )
+
+        # 7. Autoregressive decode
+        state = StreamingState(
+            cache=out.past_key_values,
+            generated_tokens=[[] for _ in range(B)],
+            seq_lens=[max_len] * B,
+            batch_size=B,
+        )
+        generated_per_stream, _, _, _ = self._autoregressive_decode(
+            out.logits,
+            out.past_key_values,
+            state,
+            max_new_tokens,
+            generation_config,
+            attention_mask=attention_mask,
+            **generation_kwargs,
+        )
+
+        # 8. Decode tokens to text
+        return [decode_with_blank(toks, self.blank_token, self.tokenizer) for toks in generated_per_stream]
+
     def _generate_streaming_samples(
         self,
         audios: Tensor,
         n_samples_list: list[int],
-        system_prompt: str,
+        system_prompt: Union[str, List[str]],
         max_new_tokens: int,
         generation_config: Optional[GenerationConfig] = None,
         use_offline_embs: bool = False,
@@ -1095,7 +1301,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         Args:
             audios: ``(B, T_samples)`` raw waveforms (zero-padded to max length).
             n_samples_list: List of B valid sample counts.
-            system_prompt: System prompt for the LLM (same for all streams).
+            system_prompt: System prompt string (shared) or list of B per-sample prompts.
             max_new_tokens: Maximum tokens to generate per chunk per stream.
             generation_config: Optional HuggingFace ``GenerationConfig``.
             use_offline_embs: When True, bypass streaming perception with offline embeddings.
@@ -1104,6 +1310,10 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         Returns:
             List of B transcription strings.
         """
+        assert self.core_cfg.chunk_size > 0, (
+            f"chunk_size must be positive for streaming mode, got {self.core_cfg.chunk_size}. "
+            f"Use generate() which dispatches to _generate_offline() for chunk_size < 0."
+        )
         B = len(n_samples_list)
         if B == 0 or max(n_samples_list) == 0:
             return [""] * B
@@ -1192,7 +1402,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         Args:
             audios: (B, T_samples) raw waveforms.
             audio_lens: (B,) waveform lengths in samples.
-            system_prompt: System prompt for the LLM (same for all streams).
+            system_prompt: System prompt string (shared) or list of B per-sample prompts.
             max_new_tokens: Maximum tokens to generate per chunk per stream.
             generation_config: Optional HuggingFace GenerationConfig object.
             use_offline_embs: When True, bypass streaming perception with
@@ -1206,20 +1416,26 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
         with move_embedding(self):
             B = audios.shape[0]
-            if isinstance(system_prompt, str):
-                sys_prompt = system_prompt
-            else:
-                sys_prompt = system_prompt[0]
-
             n_samples_list = [int(audio_lens[b].item()) for b in range(B)]
-            results = self._generate_streaming_samples(
-                audios,
-                n_samples_list,
-                sys_prompt,
-                max_new_tokens,
-                generation_config,
-                use_offline_embs=use_offline_embs,
-                **generation_kwargs,
-            )
+
+            if self.core_cfg.chunk_size < 0:
+                results = self._generate_offline(
+                    audios,
+                    n_samples_list,
+                    system_prompt,
+                    max_new_tokens,
+                    generation_config,
+                    **generation_kwargs,
+                )
+            else:
+                results = self._generate_streaming_samples(
+                    audios,
+                    n_samples_list,
+                    system_prompt,
+                    max_new_tokens,
+                    generation_config,
+                    use_offline_embs=use_offline_embs,
+                    **generation_kwargs,
+                )
 
         return results
