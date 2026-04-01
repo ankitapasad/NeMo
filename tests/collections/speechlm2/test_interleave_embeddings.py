@@ -332,6 +332,119 @@ class TestBatched:
         assert mask[1].tolist() == [True, True, True, True]
 
 
+class TestRightPadding:
+    """Verify that right-padding (pad on the right side) is handled correctly."""
+
+    def test_right_padding_masked_out(self):
+        """Right-padding positions get attention_mask=False."""
+        input_tokens = torch.tensor([[5, AUD, AUD, 7, PAD_ID, PAD_ID]])
+        text_embeds = torch.zeros(1, 6, H)
+        audio_embs = torch.tensor([[[1.0] * H, [2.0] * H]])
+
+        result = _run(input_tokens, text_embeds, audio_embs)
+        mask = result["attention_mask"]
+        assert mask.tolist() == [[True, True, True, True, False, False]]
+
+    def test_right_padding_audio_correct(self):
+        """Audio frames map correctly with right-padding."""
+        input_tokens = torch.tensor([[AUD, AUD, AUD, 5, PAD_ID, PAD_ID]])
+        text_embeds = torch.zeros(1, 6, H)
+        audio_embs = torch.tensor([[[1.0] * H, [2.0] * H, [3.0] * H]])
+
+        result = _run(input_tokens, text_embeds, audio_embs)
+        embeds = result["input_embeds"]
+        assert torch.equal(embeds[0, 0], torch.tensor([1.0] * H))
+        assert torch.equal(embeds[0, 1], torch.tensor([2.0] * H))
+        assert torch.equal(embeds[0, 2], torch.tensor([3.0] * H))
+
+    def test_right_padding_batch_mixed(self):
+        """Batch with right-padded shorter sample and full-length sample."""
+        input_tokens = torch.tensor(
+            [
+                [10, AUD, AUD, 20, PAD_ID, PAD_ID],
+                [30, AUD, AUD, AUD, AUD, 40],
+            ]
+        )
+        text_embeds = torch.zeros(2, 6, H)
+        audio_embs = torch.tensor(
+            [
+                [[1.0] * H, [2.0] * H, [0.0] * H, [0.0] * H],
+                [[3.0] * H, [4.0] * H, [5.0] * H, [6.0] * H],
+            ]
+        )
+
+        result = _run(input_tokens, text_embeds, audio_embs)
+        embeds = result["input_embeds"]
+        mask = result["attention_mask"]
+
+        # Sample 0: audio at positions 1,2
+        assert torch.equal(embeds[0, 1], torch.tensor([1.0] * H))
+        assert torch.equal(embeds[0, 2], torch.tensor([2.0] * H))
+        assert mask[0].tolist() == [True, True, True, True, False, False]
+
+        # Sample 1: audio at positions 1,2,3,4
+        assert torch.equal(embeds[1, 1], torch.tensor([3.0] * H))
+        assert torch.equal(embeds[1, 4], torch.tensor([6.0] * H))
+        assert mask[1].tolist() == [True, True, True, True, True, True]
+
+
+class TestDifferentAudioLengths:
+    """Verify correct behavior when samples have different numbers of audio tokens,
+    as happens with chunk_size=-1 (offline mode) where num_frames varies per sample."""
+
+    def test_no_audio_leakage_into_padding(self):
+        """Padding positions must never contain audio embeddings."""
+        input_tokens = torch.tensor(
+            [
+                [PAD_ID, PAD_ID, PAD_ID, AUD, AUD, 10],
+                [AUD, AUD, AUD, AUD, AUD, 20],
+            ]
+        )
+        text_embeds = torch.full((2, 6, H), -1.0)  # fill with -1 so leakage is visible
+        audio_embs = torch.full((2, 5, H), 99.0)  # fill with 99
+
+        result = _run(input_tokens, text_embeds, audio_embs)
+        embeds = result["input_embeds"]
+
+        # Sample 0 padding positions should have text_embeds (-1), not audio (99)
+        for pos in [0, 1, 2]:
+            assert (
+                embeds[0, pos, 0].item() == -1.0
+            ), f"Padding position {pos} leaked audio: got {embeds[0, pos, 0].item()}"
+
+    def test_right_padded_different_audio_counts(self):
+        """Right-padded batch where samples have different audio token counts."""
+        # Sample 0 (shorter): [text, AUD, AUD, text, PAD, PAD]
+        # Sample 1 (longer):  [text, AUD, AUD, AUD, AUD, text]
+        input_tokens = torch.tensor(
+            [
+                [10, AUD, AUD, 20, PAD_ID, PAD_ID],
+                [30, AUD, AUD, AUD, AUD, 40],
+            ]
+        )
+        text_embeds = torch.zeros(2, 6, H)
+        audio_embs = torch.tensor(
+            [
+                [[1.0] * H, [2.0] * H, [0.0] * H, [0.0] * H],
+                [[3.0] * H, [4.0] * H, [5.0] * H, [6.0] * H],
+            ]
+        )
+
+        result = _run(input_tokens, text_embeds, audio_embs)
+        embeds = result["input_embeds"]
+        mask = result["attention_mask"]
+
+        # Sample 0
+        assert torch.equal(embeds[0, 1], torch.tensor([1.0] * H))
+        assert torch.equal(embeds[0, 2], torch.tensor([2.0] * H))
+        assert mask[0].tolist() == [True, True, True, True, False, False]
+
+        # Sample 1
+        assert torch.equal(embeds[1, 1], torch.tensor([3.0] * H))
+        assert torch.equal(embeds[1, 4], torch.tensor([6.0] * H))
+        assert mask[1].tolist() == [True, True, True, True, True, True]
+
+
 class TestDocstringExample:
     """
     Mirrors the dataset docstring example:
