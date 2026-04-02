@@ -5,7 +5,7 @@ model:
   load_asr_weights: true
 
   sample_rate: 16000
-  blank_token: "<blank>"
+  blank_token: " "
   frame_length_in_secs: 0.08
   chunk_size: 2
   att_context_size: [70, 1]
