@@ -253,7 +253,7 @@ def get_llm_messages_for_sample(
         num_chunks = 1 if num_frames > 0 else 0
         chunk_size = num_frames
         offline_mode = True
-        num_delay_frames = 0  # force delay to 0 for offline mode
+        num_delay_frames = 0  # delay is not used in offline mode
     else:
         # Streaming mode: split the audio into chunks
         num_chunks = math.ceil(num_frames / chunk_size) if num_frames > 0 else 0
@@ -384,7 +384,7 @@ def get_llm_messages_for_batch(
     return batch_messages
 
 
-def parse_chat_template_ids(hf_tok, offline: bool = False) -> tuple[list[int], list[int], list[int]]:
+def parse_chat_template_ids(hf_tok, last_turn: bool = False) -> tuple[list[int], list[int], list[int]]:
     """Discover turn-structure token IDs from a HuggingFace chat template.
 
     Extracts the structural token IDs that surround user and assistant content
@@ -393,19 +393,19 @@ def parse_chat_template_ids(hf_tok, offline: bool = False) -> tuple[list[int], l
     ``user_footer_and_asst_header`` (which may include Qwen3-style
     ``<think>...</think>`` suppression tags).
 
-    For **streaming** (``offline=False``), a second 4-message sentinel is used
-    to obtain the assistant header *without* thinking tags — Qwen3 only injects
-    them on the last assistant turn, and in streaming each chunk is a non-final
-    turn.
+    When ``last_turn=False``, a second 4-message sentinel is used to obtain
+    the assistant header *without* thinking tags — Qwen3 only injects them on
+    the last assistant turn, and in streaming each chunk is a non-final turn.
 
-    For **offline** (``offline=True``), the 2-message result is returned as-is,
-    since the single assistant turn IS the last turn and must include thinking
-    suppression tags to match training.
+    When ``last_turn=True``, the 2-message result is returned as-is, since the
+    assistant turn IS the last turn and must include thinking suppression tags
+    to match training.
 
     Args:
         hf_tok: A HuggingFace tokenizer (``tokenizer.tokenizer``).
-        offline: When True, return the assistant header with thinking
-            suppression tags (for single-turn offline inference).
+        last_turn: When True, the extracted assistant header corresponds to the
+            last turn in the conversation, which may include thinking
+            suppression tags (e.g. for single-turn offline inference).
 
     Returns:
         ``(user_header_ids, user_footer_and_asst_header_ids, asst_footer_ids)``
@@ -441,11 +441,11 @@ def parse_chat_template_ids(hf_tok, offline: bool = False) -> tuple[list[int], l
     if user_header_ids and bos_id is not None and user_header_ids[0] == bos_id:
         user_header_ids = user_header_ids[1:]
 
-    if offline:
-        # Offline: use the 2-msg assistant header (includes thinking tags).
+    if last_turn:
+        # Last turn: use the 2-msg assistant header (includes thinking tags).
         user_footer_and_asst_header_ids = hf_tok.encode(parts[1], add_special_tokens=False)
     else:
-        # Streaming: use the 4-msg assistant header (no thinking tags).
+        # Non-last turn: use the 4-msg assistant header (no thinking tags).
         # The 4-msg trick places the sentinel on the first assistant turn,
         # which is NOT the last turn → Qwen3 omits thinking tags.
         convo_4msg = hf_tok.apply_chat_template(

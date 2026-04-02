@@ -622,7 +622,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
         # --- Build turn template ---
         user_header_ids, user_footer_and_asst_header_ids, asst_footer_ids = parse_chat_template_ids(
-            hf_tok, offline=(chunk_size < 0)
+            hf_tok, last_turn=(chunk_size < 0)
         )
         self._user_header_ids = user_header_ids
         self._user_footer_and_asst_header_ids = user_footer_and_asst_header_ids
