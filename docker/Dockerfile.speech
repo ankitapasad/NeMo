@@ -190,9 +190,12 @@ RUN INSTALL_MSG=$(/bin/bash /tmp/nemo/scripts/installers/install_ais_cli_latest.
 
 RUN pip install qwen_asr
 # Build torchaudio from source so extensions link to this image's torch (PyPI wheels target stock PyTorch).
-RUN pip uninstall -y torchaudio 2>/dev/null || true && \
-  apt-get update && apt-get install -y --no-install-recommends cmake ninja-build git && \
-  rm -rf /var/lib/apt/lists/* && \
-  git clone --depth 1 --branch "${TORCHAUDIO_TAG}" https://github.com/pytorch/audio.git /tmp/audio && \
-  cd /tmp/audio && pip install --no-build-isolation --disable-pip-version-check -v . && \
-  cd / && rm -rf /tmp/audio
+# RUN pip uninstall -y torchaudio 2>/dev/null || true && \
+#   apt-get update && apt-get install -y --no-install-recommends cmake ninja-build git && \
+#   rm -rf /var/lib/apt/lists/* && \
+#   git clone --depth 1 --branch "${TORCHAUDIO_TAG}" https://github.com/pytorch/audio.git /tmp/audio && \
+#   cd /tmp/audio && pip install --no-build-isolation --disable-pip-version-check -v . && \
+#   cd / && rm -rf /tmp/audio
+
+# install torchcodec for lhotse to load audio files in various formats (e.g., .m4a)
+RUN pip install torchcodec==0.11 --index-url=https://download.pytorch.org/whl/cpu
