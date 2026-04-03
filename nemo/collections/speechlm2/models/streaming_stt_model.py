@@ -195,7 +195,9 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         )
 
         # Ensure <blank> token is in the vocabulary.
-        self.blank_token = self.core_cfg.blank_token
+        # Unescape Python escape sequences (e.g. "\\n" → "\n") because Hydra/OmegaConf
+        # loads YAML strings literally without interpreting backslash escapes.
+        self.blank_token = self.core_cfg.blank_token.encode().decode('unicode_escape')
 
         if not token_in_vocab(self.blank_token, self.tokenizer):
             self.tokenizer.add_special_tokens({"additional_special_tokens": [self.blank_token]})
@@ -764,6 +766,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         max_new_tokens: int,
         generation_config: Optional[GenerationConfig] = None,
         attention_mask: Optional[Tensor] = None,
+        stop_on_blank: Union[bool, str] = "first",
         **generation_kwargs,
     ) -> tuple[list[list[int]], tuple, list[bool], int]:
         """Autoregressive decoding (supports B streams).
@@ -775,7 +778,8 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         Generation stops per stream when any of these conditions is met:
 
         1. **EOS** — the tokenizer's ``eos_token_id`` is predicted.
-        2. **Blank** — the ``<blank>`` token is predicted.
+        2. **Blank** — the ``<blank>`` token is predicted (controlled by
+           ``stop_on_blank``).
         3. **Footer sequence** — the last *N* tokens match ``self._asst_footer_ids``.
         4. **Max tokens** — ``max_new_tokens`` is reached.
 
@@ -789,6 +793,13 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 and passed to the LLM.  Required when the prefill used
                 left-padding (e.g. offline mode).  When ``None`` (streaming
                 path), no mask is passed — fully backward-compatible.
+            stop_on_blank: Controls blank-token stopping behavior:
+                - ``True`` (default): stop whenever blank is predicted.
+                  Use with dedicated ``<blank>`` special tokens.
+                - ``"first"``: stop only if blank is the **first** token
+                  generated (= "no speech this chunk").  Use when the blank
+                  token is a natural text token (e.g. ``" "``).
+                - ``False``: never stop on blank.
             generation_kwargs: Per-call overrides.
 
         Returns:
@@ -825,9 +836,14 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 generated[b].append(tid)
                 feed_mask[b] = True
 
-                # Blank: stop (token IS fed to LLM, IS in generated)
+                # Blank: stop (token IS fed to LLM, IS in generated).
+                # When stop_on_blank == "first", only stop if blank is the
+                # first generated token (= "no speech this chunk").  This
+                # avoids false stops when the blank token collides with a
+                # natural text token (e.g. " ") that appears mid-sentence.
                 if tid == self.blank_token_id:
-                    finished[b] = True
+                    if stop_on_blank is True or (stop_on_blank == "first" and len(generated[b]) == 1):
+                        finished[b] = True
 
                 # Footer sequence match
                 elif flen > 0 and len(generated[b]) >= flen and generated[b][-flen:] == footer:

@@ -598,6 +598,9 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
         self.defer_get_batch = defer_get_batch
         self.tokenizer = tokenizer
         self.cfg: StreamingSTTDataConfig = to_dataclass(StreamingSTTDataConfig, cfg)
+        # Unescape Python escape sequences (e.g. "\\n" → "\n") because Hydra/OmegaConf
+        # loads YAML strings literally without interpreting backslash escapes.
+        self.cfg.blank_token = self.cfg.blank_token.encode().decode('unicode_escape')
 
         # Tokenize the full audio chunk string (audio_tag * chunk_size) to get
         # its token ID sequence.  We must encode the full chunk as a single string
