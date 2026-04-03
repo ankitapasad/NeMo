@@ -210,9 +210,6 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         self.embed_tokens = self.llm.model.embed_tokens
         del self.llm.model.embed_tokens
 
-        # --- LoRA ---
-        maybe_install_lora(self)
-
         # --- Speech encoder (perception module) ---
         self.perception = setup_perception(
             cfg=self.cfg,
@@ -224,6 +221,10 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         )
 
         self._apply_freeze_config()
+
+        # --- LoRA ---
+        # Install LoRA after freezing the LLM body to avoid freezing the LoRA weights
+        maybe_install_lora(self)
 
         if forced_aligner is not None:
             assert data_cfg is not None, "Dataset config is required for online forced alignment"
