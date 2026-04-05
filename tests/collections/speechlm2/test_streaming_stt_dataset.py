@@ -894,8 +894,8 @@ class TestTokenizeWithAssistantMaskFallback:
         assert mask[blank_pos + 1] == 1, "EOS (FOOTER) should be masked"
         assert mask[blank_pos + 2] == 0, "Post-EOS (NEWLINE) should NOT be masked"
 
-    def test_fallback_full_footer_when_no_eos(self):
-        """When eos_token_id is None, the full footer should be included in the mask."""
+    def test_fallback_no_eos_only_content_masked(self):
+        """When eos_token_id is None, only content is masked (no footer)."""
         msgs = [
             {"role": "system", "content": "test"},
             {"role": "user", "content": "<audio><audio>"},
@@ -909,10 +909,10 @@ class TestTokenizeWithAssistantMaskFallback:
         blank_id = _MockHFTokenizer.BLANK_ID
         blank_pos = input_ids.index(blank_id)
 
-        # Without EOS, the full footer (FOOTER + NEWLINE) should be masked
+        # Without EOS, only content is masked — footer tokens are not.
         assert mask[blank_pos] == 1, "Content should be masked"
-        assert mask[blank_pos + 1] == 1, "FOOTER should be masked"
-        assert mask[blank_pos + 2] == 1, "NEWLINE should be masked (no EOS trimming)"
+        assert mask[blank_pos + 1] == 0, "FOOTER should NOT be masked (no EOS)"
+        assert mask[blank_pos + 2] == 0, "NEWLINE should NOT be masked"
 
     def test_fallback_pipeline_produces_trainable_targets(self):
         """Full pipeline with fallback tokenizer should have non-zero trainable targets."""
@@ -1070,3 +1070,160 @@ class TestOfflineSingleChunk:
         """chunk_size=0 should raise an assertion error."""
         with pytest.raises(AssertionError):
             _make_messages(chunk_size=0)
+
+
+# ===========================================================================
+# Tests: _tokenize_with_assistant_mask with real HF tokenizers
+# ===========================================================================
+
+
+def _try_load_tokenizer(model_id):
+    """Try to load a HF tokenizer, return None if unavailable."""
+    try:
+        from transformers import AutoTokenizer as HFAutoTokenizer
+
+        tok = HFAutoTokenizer.from_pretrained(model_id)
+        if getattr(tok, "chat_template", None):
+            return tok
+    except Exception:
+        pass
+    # Fallback: try AutoProcessor (e.g. Gemma-4 multimodal)
+    try:
+        from transformers import AutoProcessor
+
+        processor = AutoProcessor.from_pretrained(model_id)
+        tok = processor.tokenizer
+        if getattr(tok, "chat_template", None):
+            return tok
+    except Exception:
+        pass
+    return None
+
+
+def _make_nemo_tok(hf_tok):
+    """Wrap an HF tokenizer to mimic NeMo AutoTokenizer interface."""
+
+    class _Wrapper:
+        def __init__(self, hf):
+            self.tokenizer = hf
+
+    return _Wrapper(hf_tok)
+
+
+# Model IDs to test
+_REAL_TOKENIZER_MODELS = {
+    "qwen3": "Qwen/Qwen3-1.7B",
+    "nemotron_mini": "nvidia/Nemotron-Mini-4B-Instruct",
+    "nemotron_nano_v3": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+    "gemma4": "google/gemma-4-E4B-it",
+}
+
+
+def _run_mask_test(hf_tok, messages):
+    """Run _tokenize_with_assistant_mask and return (input_ids, mask, decoded_trained)."""
+    nemo_tok = _make_nemo_tok(hf_tok)
+    # Add <blank> if not in vocab
+    if "<blank>" not in hf_tok.get_vocab():
+        hf_tok.add_special_tokens({"additional_special_tokens": ["<blank>"]})
+    input_ids, mask = _tokenize_with_assistant_mask(messages, nemo_tok)
+    trained = [hf_tok.decode([input_ids[i]]) for i in range(len(input_ids)) if mask[i]]
+    return input_ids, mask, trained
+
+
+@pytest.fixture(params=list(_REAL_TOKENIZER_MODELS.keys()))
+def real_tokenizer(request):
+    """Parametrized fixture that yields (label, hf_tok) for each available model."""
+    label = request.param
+    model_id = _REAL_TOKENIZER_MODELS[label]
+    hf_tok = _try_load_tokenizer(model_id)
+    if hf_tok is None:
+        pytest.skip(f"Tokenizer {model_id} not available")
+    return label, hf_tok
+
+
+class TestTokenizeWithAssistantMaskRealTokenizers:
+    """Verify the diff-based fallback works with real HF tokenizers."""
+
+    def test_single_turn_content_masked(self, real_tokenizer):
+        """Content tokens should be masked in a single-turn (offline) message."""
+        label, hf_tok = real_tokenizer
+        messages = [
+            {"role": "system", "content": "Transcribe the audio into text."},
+            {"role": "user", "content": "<audio><audio><audio>"},
+            {"role": "assistant", "content": "hello world"},
+        ]
+        input_ids, mask, trained = _run_mask_test(hf_tok, messages)
+
+        assert any("hello" in t.lower() for t in trained), f"[{label}] 'hello' not in trained: {trained}"
+        assert any("world" in t.lower() for t in trained), f"[{label}] 'world' not in trained: {trained}"
+
+    def test_single_turn_eos_masked(self, real_tokenizer):
+        """EOS token should be masked if it exists in the footer."""
+        label, hf_tok = real_tokenizer
+        messages = [
+            {"role": "system", "content": "Transcribe the audio into text."},
+            {"role": "user", "content": "<audio><audio><audio>"},
+            {"role": "assistant", "content": "hello world"},
+        ]
+        input_ids, mask, trained = _run_mask_test(hf_tok, messages)
+        eos_id = hf_tok.eos_token_id
+
+        if eos_id is not None and eos_id in input_ids:
+            # Find EOS positions that follow content
+            content_positions = [i for i, m in enumerate(mask) if m]
+            if content_positions:
+                last_content = max(content_positions)
+                # Check if EOS right after content is masked
+                for i in range(last_content, min(last_content + 3, len(input_ids))):
+                    if input_ids[i] == eos_id:
+                        assert mask[i] == 1, f"[{label}] EOS at position {i} should be masked"
+                        break
+
+    def test_single_turn_system_not_masked(self, real_tokenizer):
+        """System and user tokens should NOT be masked."""
+        label, hf_tok = real_tokenizer
+        messages = [
+            {"role": "system", "content": "Transcribe the audio into text."},
+            {"role": "user", "content": "<audio><audio><audio>"},
+            {"role": "assistant", "content": "hello world"},
+        ]
+        input_ids, mask, trained = _run_mask_test(hf_tok, messages)
+
+        assert not any(
+            "transcribe" in t.lower() for t in trained
+        ), f"[{label}] system content should not be trained: {trained}"
+        assert not any(
+            "audio" in t.lower() for t in trained
+        ), f"[{label}] user content should not be trained: {trained}"
+
+    def test_single_turn_think_tags_not_masked(self, real_tokenizer):
+        """Qwen3-style <think> tags should NOT be masked."""
+        label, hf_tok = real_tokenizer
+        messages = [
+            {"role": "system", "content": "Transcribe the audio into text."},
+            {"role": "user", "content": "<audio><audio><audio>"},
+            {"role": "assistant", "content": "hello world"},
+        ]
+        _, _, trained = _run_mask_test(hf_tok, messages)
+
+        assert not any("<think>" in t for t in trained), f"[{label}] <think> should not be trained: {trained}"
+        assert not any("</think>" in t for t in trained), f"[{label}] </think> should not be trained: {trained}"
+
+    def test_multi_turn_all_contents_masked(self, real_tokenizer):
+        """All assistant contents should be masked in multi-turn (streaming) messages."""
+        label, hf_tok = real_tokenizer
+        messages = [
+            {"role": "system", "content": "Transcribe the audio into text."},
+            {"role": "user", "content": "<audio><audio>"},
+            {"role": "assistant", "content": "<blank>"},
+            {"role": "user", "content": "<audio><audio>"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "<audio><audio>"},
+            {"role": "assistant", "content": "world"},
+        ]
+        _, mask, trained = _run_mask_test(hf_tok, messages)
+
+        assert sum(mask) > 0, f"[{label}] Should have some trained tokens"
+        assert any("blank" in t.lower() for t in trained), f"[{label}] '<blank>' not in trained: {trained}"
+        assert any("hello" in t.lower() for t in trained), f"[{label}] 'hello' not in trained: {trained}"
+        assert any("world" in t.lower() for t in trained), f"[{label}] 'world' not in trained: {trained}"

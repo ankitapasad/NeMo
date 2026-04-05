@@ -501,43 +501,39 @@ def _tokenize_with_assistant_mask(
     if any(assistant_mask):
         return input_ids, assistant_mask
 
-    # --- fallback: locate assistant content tokens by sequential search ---
-    # Tokenize each assistant turn's content and find it in the full sequence.
-    # Works for ChatML-style templates where special tokens prevent BPE merging
-    # across turn boundaries.
+    # --- fallback: diff-based content detection ---
+    # Tokenize the same messages but with all assistant contents emptied.
+    # Two-pointer walk finds content tokens (present in full but not empty)
+    # regardless of BPE context effects that change token IDs.
     assistant_mask = [0] * len(input_ids)
 
-    # Discover assistant end-of-turn footer tokens via the shared template parser.
-    _, _, footer_ids = parse_chat_template_ids(hf_tok)
+    msgs_empty = [{**m, "content": ""} if m["role"] == "assistant" else m for m in messages]
+    ids_empty_result = hf_tok.apply_chat_template(
+        msgs_empty,
+        tokenize=True,
+        enable_thinking=False,
+    )
+    ids_empty = list(ids_empty_result["input_ids"] if hasattr(ids_empty_result, "keys") else ids_empty_result)
 
-    # Trim footer to include only up to the EOS token.  During inference,
-    # autoregressive decoding stops at EOS and feeds the full footer manually, so
-    # training on tokens after EOS (e.g. the \n in <|im_end|>\n) is wasted.
     eos_id = getattr(hf_tok, 'eos_token_id', None)
-    if eos_id is not None and eos_id in footer_ids:
-        footer_ids = footer_ids[: footer_ids.index(eos_id) + 1]
+    i, j = 0, 0  # pointers into input_ids and ids_empty
+    while i < len(input_ids) and j < len(ids_empty):
+        if input_ids[i] == ids_empty[j]:
+            i += 1
+            j += 1
+        else:
+            # Divergence: input_ids has content tokens that ids_empty skipped.
+            while i < len(input_ids) and (j >= len(ids_empty) or input_ids[i] != ids_empty[j]):
+                assistant_mask[i] = 1
+                i += 1
+            # Include EOS token in the footer so the model learns to emit it.
+            if eos_id is not None and i < len(input_ids) and input_ids[i] == eos_id:
+                assistant_mask[i] = 1
 
-    assistant_content_ids = []
-    for msg in messages:
-        if msg["role"] == "assistant":
-            content_ids = hf_tok.encode(msg["content"], add_special_tokens=False)
-            assistant_content_ids.append(content_ids)
-
-    pos = 0
-    for content_ids in assistant_content_ids:
-        if not content_ids:
-            continue
-        clen = len(content_ids)
-        for i in range(pos, len(input_ids) - clen + 1):
-            if input_ids[i : i + clen] == content_ids:
-                assistant_mask[i : i + clen] = [1] * clen
-                # Include the end-of-turn footer tokens in the mask so the model
-                # learns content → <|im_end|> (or equivalent).
-                flen = len(footer_ids)
-                end = min(i + clen + flen, len(input_ids))
-                assistant_mask[i + clen : end] = [1] * (end - i - clen)
-                pos = end
-                break
+    # Any remaining tokens in input_ids are also content.
+    while i < len(input_ids):
+        assistant_mask[i] = 1
+        i += 1
 
     return input_ids, assistant_mask
 
