@@ -502,28 +502,40 @@ def _tokenize_with_assistant_mask(
         return input_ids, assistant_mask
 
     # --- fallback: diff-based content detection ---
-    # Tokenize the same messages but with all assistant contents emptied.
-    # Two-pointer walk finds content tokens (present in full but not empty)
-    # regardless of BPE context effects that change token IDs.
+    # Tokenize the same messages but with all assistant contents replaced by
+    # a single-character sentinel.  The two-pointer walk then identifies
+    # content tokens (present in full but replaced by the sentinel in the
+    # reference).
+    #
+    # We use a sentinel instead of "" (empty string) to preserve BPE context
+    # boundaries.  With "", template tokens adjacent to the content can merge
+    # (e.g. "assistant\n" + content "\n" → token "\n\n" vs "assistant\n" + "" →
+    # token "\n"), causing the two-pointer to desync.  A sentinel like "X"
+    # tokenizes to exactly 1 token and prevents BPE merging with neighbors.
+    _SENTINEL_CHAR = "X"
     assistant_mask = [0] * len(input_ids)
 
-    msgs_empty = [{**m, "content": ""} if m["role"] == "assistant" else m for m in messages]
-    ids_empty_result = hf_tok.apply_chat_template(
-        msgs_empty,
+    msgs_sentinel = [{**m, "content": _SENTINEL_CHAR} if m["role"] == "assistant" else m for m in messages]
+    ids_sentinel_result = hf_tok.apply_chat_template(
+        msgs_sentinel,
         tokenize=True,
         enable_thinking=False,
     )
-    ids_empty = list(ids_empty_result["input_ids"] if hasattr(ids_empty_result, "keys") else ids_empty_result)
+    ids_sentinel = list(
+        ids_sentinel_result["input_ids"] if hasattr(ids_sentinel_result, "keys") else ids_sentinel_result
+    )
 
     eos_id = getattr(hf_tok, 'eos_token_id', None)
-    i, j = 0, 0  # pointers into input_ids and ids_empty
-    while i < len(input_ids) and j < len(ids_empty):
-        if input_ids[i] == ids_empty[j]:
+    i, j = 0, 0  # pointers into input_ids and ids_sentinel
+    while i < len(input_ids) and j < len(ids_sentinel):
+        if input_ids[i] == ids_sentinel[j]:
             i += 1
             j += 1
         else:
-            # Divergence: input_ids has content tokens that ids_empty skipped.
-            while i < len(input_ids) and (j >= len(ids_empty) or input_ids[i] != ids_empty[j]):
+            # Divergence: ids_sentinel has the sentinel (1 token) where
+            # input_ids has the actual content (1+ tokens).
+            j += 1  # skip the sentinel token
+            while i < len(input_ids) and (j >= len(ids_sentinel) or input_ids[i] != ids_sentinel[j]):
                 assistant_mask[i] = 1
                 i += 1
             # Include EOS token in the footer so the model learns to emit it.
@@ -615,6 +627,7 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
         # generation becomes unreliable.  The model's __init__ should have called
         # tokenizer.add_special_tokens() before passing the tokenizer here.
         blank_ids = self.tokenizer.tokenizer.encode(self.cfg.blank_token, add_special_tokens=False)
+        logging.info(f"blank_token: {str(self.cfg.blank_token)}, blank_id: {blank_ids}")
         if len(blank_ids) != 1:
             raise ValueError(
                 f"blank_token '{self.cfg.blank_token}' tokenizes into {len(blank_ids)} tokens {blank_ids}. "
