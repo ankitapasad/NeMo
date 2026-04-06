@@ -197,5 +197,9 @@ RUN pip install qwen_asr
 #   cd /tmp/audio && pip install --no-build-isolation --disable-pip-version-check -v . && \
 #   cd / && rm -rf /tmp/audio
 
+# TorchCodec 0.11+ expects upstream torch 2.11 stable-ABI symbols (e.g. torch_dtype_float4_e2m1fn_x2)
+# that NGC PyTorch builds do not export yet — pin 0.10.x. CPU wheel only (no CUDA torchcodec).
 # install torchcodec for lhotse to load audio files in various formats (e.g., .m4a)
-RUN pip install torchcodec==0.11 --index-url=https://download.pytorch.org/whl/cpu
+RUN pip install --disable-pip-version-check --no-cache-dir --no-deps \
+  torchcodec==0.10.0 \
+  --index-url https://download.pytorch.org/whl/cpu
