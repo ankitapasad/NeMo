@@ -767,7 +767,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         max_new_tokens: int,
         generation_config: Optional[GenerationConfig] = None,
         attention_mask: Optional[Tensor] = None,
-        stop_on_blank: Union[bool, str] = "first",
+        stop_on_blank: Union[bool, str] = True,
         **generation_kwargs,
     ) -> tuple[list[list[int]], tuple, list[bool], int]:
         """Autoregressive decoding (supports B streams).
