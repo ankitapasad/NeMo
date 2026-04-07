@@ -87,6 +87,7 @@ class StreamingSTTEvalConfig:
     pretrained_name: str = ""
     inputs: str = ""
     batch_size: int = 64
+    num_workers: int = 4
     max_new_tokens: int = 64
     system_prompt: str = "Transcribe the audio into text."
     output_manifest: Optional[str] = "streaming_stt_generations.jsonl"
@@ -135,7 +136,7 @@ def main(cfg: StreamingSTTEvalConfig):
     dloader = torch.utils.data.DataLoader(
         dataset=ToAudio(),
         sampler=sampler,
-        num_workers=1,
+        num_workers=cfg.num_workers,
         batch_size=None,
     )
 
