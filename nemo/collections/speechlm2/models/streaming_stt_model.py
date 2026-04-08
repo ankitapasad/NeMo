@@ -223,8 +223,14 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         self._apply_freeze_config()
 
         # --- LoRA ---
-        # Install LoRA after freezing the LLM body to avoid freezing the LoRA weights
-        maybe_install_lora(self)
+        if "lora" in self.cfg:
+            # Install LoRA after freezing the LLM body to avoid freezing the LoRA weights
+            maybe_install_lora(self)
+            # huggingface PEFT library freezes the whole LLM, so we need to unfreeze the lm_head if needed
+            if self.core_cfg.freeze_llm_head:
+                freeze_module(self.llm.lm_head)
+            else:
+                unfreeze_module(self.llm.lm_head)
 
         if forced_aligner is not None:
             assert data_cfg is not None, "Dataset config is required for online forced alignment"
@@ -235,6 +241,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             self.forced_aligner = None
             self.dataset = None
 
+        logging.info(f"LLM trainable parameters: {self.llm.print_trainable_parameters()}")
         logging.info("\n" + str(ModelSummary(self, max_depth=2)))
 
     def _apply_freeze_config(self) -> None:

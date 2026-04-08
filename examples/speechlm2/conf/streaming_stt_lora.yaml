@@ -11,7 +11,7 @@ model:
   att_context_size: [70, 1]
   audio_pad_to: 16
 
-  freeze_speech_encoder: true
+  freeze_speech_encoder: false
   freeze_modality_adapter: false
   freeze_modality_proj: false
   freeze_llm_model: true
