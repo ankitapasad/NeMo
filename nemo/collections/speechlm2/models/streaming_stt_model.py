@@ -241,7 +241,6 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             self.forced_aligner = None
             self.dataset = None
 
-        logging.info(f"LLM trainable parameters: {self.llm.print_trainable_parameters()}")
         logging.info("\n" + str(ModelSummary(self, max_depth=2)))
 
     def _apply_freeze_config(self) -> None:
