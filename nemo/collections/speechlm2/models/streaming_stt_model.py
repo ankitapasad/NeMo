@@ -438,23 +438,22 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         flat_targets = target_ids.flatten(0, 1)
 
         with loss_parallel():
-            loss = F.cross_entropy(flat_logits, flat_targets, reduction="sum", ignore_index=IGNORE_INDEX) / num_targets
-
-        # --- Blank vs non-blank loss breakdown ---
-        blank_id = self.blank_token_id
-        valid_mask = flat_targets != IGNORE_INDEX
-        is_blank = valid_mask & (flat_targets == blank_id)
-        is_nonblank = valid_mask & (flat_targets != blank_id)
-        num_blank = is_blank.sum()
-        num_nonblank = is_nonblank.sum()
-
-        with torch.no_grad():
             per_token_loss = F.cross_entropy(
                 flat_logits,
                 flat_targets,
                 reduction="none",
                 ignore_index=IGNORE_INDEX,
             )
+        loss = per_token_loss.sum() / num_targets
+
+        # --- Blank vs non-blank loss breakdown ---
+        with torch.no_grad():
+            blank_id = self.blank_token_id
+            valid_mask = flat_targets != IGNORE_INDEX
+            is_blank = valid_mask & (flat_targets == blank_id)
+            is_nonblank = valid_mask & (flat_targets != blank_id)
+            num_blank = is_blank.sum()
+            num_nonblank = is_nonblank.sum()
             loss_blank = per_token_loss[is_blank].sum() / num_blank.clamp(min=1)
             loss_nonblank = per_token_loss[is_nonblank].sum() / num_nonblank.clamp(min=1)
 
