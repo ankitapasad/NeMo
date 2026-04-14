@@ -428,26 +428,43 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
         logits = outputs["logits"]
 
-        # Diagnose NaN sources (remove once stable).
-        if torch.isnan(inputs["input_embeds"]).any():
-            logging.warning("Batch %d: NaN in input_embeds", batch_idx)
-        if torch.isnan(logits).any():
-            logging.warning("Batch %d: NaN in logits", batch_idx)
+        # # Diagnose NaN sources (remove once stable).
+        # if torch.isnan(inputs["input_embeds"]).any():
+        #     logging.warning("Batch %d: NaN in input_embeds", batch_idx)
+        # if torch.isnan(logits).any():
+        #     logging.warning("Batch %d: NaN in logits", batch_idx)
+
+        flat_logits = logits.flatten(0, 1)
+        flat_targets = target_ids.flatten(0, 1)
 
         with loss_parallel():
-            loss = (
-                F.cross_entropy(
-                    logits.flatten(0, 1),
-                    target_ids.flatten(0, 1),
-                    reduction="sum",
-                    ignore_index=IGNORE_INDEX,
-                )
-                / num_targets
+            loss = F.cross_entropy(flat_logits, flat_targets, reduction="sum", ignore_index=IGNORE_INDEX) / num_targets
+
+        # --- Blank vs non-blank loss breakdown ---
+        blank_id = self.blank_token_id
+        valid_mask = flat_targets != IGNORE_INDEX
+        is_blank = valid_mask & (flat_targets == blank_id)
+        is_nonblank = valid_mask & (flat_targets != blank_id)
+        num_blank = is_blank.sum()
+        num_nonblank = is_nonblank.sum()
+
+        with torch.no_grad():
+            per_token_loss = F.cross_entropy(
+                flat_logits,
+                flat_targets,
+                reduction="none",
+                ignore_index=IGNORE_INDEX,
             )
+            loss_blank = per_token_loss[is_blank].sum() / num_blank.clamp(min=1)
+            loss_nonblank = per_token_loss[is_nonblank].sum() / num_nonblank.clamp(min=1)
+
         B, L = inputs["input_embeds"].shape[:2]
         self.log_dict(
             {
                 "loss": loss,
+                "loss_blank": loss_blank,
+                "loss_nonblank": loss_nonblank,
+                "blank_ratio": num_blank.float() / num_targets,
                 "learning_rate": torch.as_tensor(
                     self.trainer.optimizers[0].param_groups[0]["lr"] if self._trainer is not None else 0
                 ),
@@ -914,7 +931,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             num_slots=batch_size,
             sample_rate=self.core_cfg.sample_rate,
             buffer_size_in_secs=buffer_size_in_secs,
-            chunk_size_in_secs=chunk_size_in_secs,
+            chunk_size_in_secs=buffer_size_in_secs,  # recalculate mel-spec for the whole buffer
             preprocessor_cfg=preprocessor_cfg,
             device=self.device,
         )
