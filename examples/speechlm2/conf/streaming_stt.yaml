@@ -5,13 +5,13 @@ model:
   load_asr_weights: true
 
   sample_rate: 16000
-  blank_token: " "
+  blank_token: "<blank>"
   frame_length_in_secs: 0.08
   chunk_size: 2
   att_context_size: [70, 1]
   audio_pad_to: 16
 
-  freeze_speech_encoder: true
+  freeze_speech_encoder: false
   freeze_modality_adapter: false
   freeze_modality_proj: false
   freeze_llm_model: true
