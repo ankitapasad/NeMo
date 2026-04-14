@@ -242,8 +242,6 @@ def get_llm_messages_for_sample(
         alignments: List of WordAlignment objects for the sample.
     """
 
-    assert chunk_size != 0, "chunk_size must be greater than 0 or -1"
-
     messages = [{"role": system_role, "content": system_prompt}]
 
     num_frames = math.ceil(audio_duration_secs / frame_length_in_secs)
@@ -255,8 +253,6 @@ def get_llm_messages_for_sample(
         offline_mode = True
         num_delay_frames = 0  # delay is not used in offline mode
     else:
-        # Streaming mode: split the audio into chunks
-        num_chunks = math.ceil(num_frames / chunk_size) if num_frames > 0 else 0
         offline_mode = False
 
     if alignments is None:
@@ -270,62 +266,101 @@ def get_llm_messages_for_sample(
     # Pre-compute word character spans if transcript is provided.
     word_spans = compute_word_spans(alignments, transcript, preserve_whitespace=True) if transcript else None
 
-    word_idx = 0
-    for chunk_i in range(num_chunks):
-        chunk_end_frame = (chunk_i + 1) * chunk_size
+    if chunk_size == 0:
+        # Dynamic chunking: one user turn per word group, sized to word boundary.
+        # The model learns to predict when to stop listening via audio-position targets.
+        prev_end_frame = 0
+        for word_idx, word in enumerate(alignments):
+            word_end_frame = math.ceil(word.end_time / frame_length_in_secs) + num_delay_frames
+            word_end_frame = min(word_end_frame, num_frames)  # clamp to audio duration
+            n_frames_chunk = word_end_frame - prev_end_frame
+            if n_frames_chunk <= 0:
+                # Word fits in the previous chunk (multiple words at same boundary).
+                # Append to the last assistant turn.
+                if word_spans and transcript:
+                    span = word_spans[word_idx]
+                    if span is not None:
+                        content = transcript[span[0] : span[1]]
+                    else:
+                        content = word.text
+                else:
+                    content = word.text
+                if messages[-1]["role"] == "assistant":
+                    messages[-1]["content"] += " " + content
+                else:
+                    messages.append({"role": "assistant", "content": content})
+                continue
 
-        # User turn: one audio tag per frame in the chunk
-        messages.append({"role": "user", "content": audio_tag * chunk_size})
+            messages.append({"role": "user", "content": audio_tag * n_frames_chunk})
 
-        # Collect indices of words whose end_time (in frames) + delay <= chunk_end_frame
-        ready_indices = []
-        while word_idx < len(alignments):
-            word = alignments[word_idx]
-            word_end_frame = math.ceil(word.end_time / frame_length_in_secs)
-            ready_frame = word_end_frame + num_delay_frames
-            if ready_frame <= chunk_end_frame:
-                ready_indices.append(word_idx)
-                word_idx += 1
-            else:
-                break
-
-        # Assistant turn: transcribed words or blank
-        if ready_indices:
             if word_spans and transcript:
-                # Extract the exact substring from the transcript, preserving
-                # punctuation, casing, and inter-word spacing.
-                first_span = word_spans[ready_indices[0]]
-                last_span = word_spans[ready_indices[-1]]
+                span = word_spans[word_idx]
+                content = transcript[span[0] : span[1]] if span is not None else word.text
+            else:
+                content = word.text
+            messages.append({"role": "assistant", "content": content})
+            prev_end_frame = word_end_frame
+
+        # Trailing silence frames (after last word) — user turn only, no assistant.
+        if prev_end_frame < num_frames:
+            messages.append({"role": "user", "content": audio_tag * (num_frames - prev_end_frame)})
+    else:
+        # Fixed chunking: split the audio into equal-sized chunks.
+        num_chunks = math.ceil(num_frames / chunk_size) if num_frames > 0 else 0
+
+        word_idx = 0
+        for chunk_i in range(num_chunks):
+            chunk_end_frame = (chunk_i + 1) * chunk_size
+
+            # User turn: one audio tag per frame in the chunk
+            messages.append({"role": "user", "content": audio_tag * chunk_size})
+
+            # Collect indices of words whose end_time (in frames) + delay <= chunk_end_frame
+            ready_indices = []
+            while word_idx < len(alignments):
+                word = alignments[word_idx]
+                word_end_frame = math.ceil(word.end_time / frame_length_in_secs)
+                ready_frame = word_end_frame + num_delay_frames
+                if ready_frame <= chunk_end_frame:
+                    ready_indices.append(word_idx)
+                    word_idx += 1
+                else:
+                    break
+
+            # Assistant turn: transcribed words or blank
+            if ready_indices:
+                if word_spans and transcript:
+                    first_span = word_spans[ready_indices[0]]
+                    last_span = word_spans[ready_indices[-1]]
+                    if first_span is not None and last_span is not None:
+                        content = transcript[first_span[0] : last_span[1]]
+                    else:
+                        content = " ".join(alignments[i].text for i in ready_indices)
+                else:
+                    content = " ".join(alignments[i].text for i in ready_indices)
+                messages.append({"role": "assistant", "content": content})
+            else:
+                messages.append({"role": "assistant", "content": blank_token})
+
+        # Append any residual words that weren't emitted (e.g., due to delay pushing
+        # them past the last chunk boundary, or alignment end_time > audio_duration).
+        if word_idx < len(alignments):
+            residual_indices = list(range(word_idx, len(alignments)))
+            if word_spans and transcript:
+                first_span = word_spans[residual_indices[0]]
+                last_span = word_spans[residual_indices[-1]]
                 if first_span is not None and last_span is not None:
                     content = transcript[first_span[0] : last_span[1]]
                 else:
-                    content = " ".join(alignments[i].text for i in ready_indices)
-            else:
-                content = " ".join(alignments[i].text for i in ready_indices)
-            messages.append({"role": "assistant", "content": content})
-        else:
-            messages.append({"role": "assistant", "content": blank_token})
-
-    # Append any residual words that weren't emitted (e.g., due to delay pushing
-    # them past the last chunk boundary, or alignment end_time > audio_duration).
-    if word_idx < len(alignments):
-        residual_indices = list(range(word_idx, len(alignments)))
-        if word_spans and transcript:
-            first_span = word_spans[residual_indices[0]]
-            last_span = word_spans[residual_indices[-1]]
-            if first_span is not None and last_span is not None:
-                content = transcript[first_span[0] : last_span[1]]
+                    content = " ".join(alignments[i].text for i in residual_indices)
             else:
                 content = " ".join(alignments[i].text for i in residual_indices)
-        else:
-            content = " ".join(alignments[i].text for i in residual_indices)
-        # Append to the last assistant turn if it was blank, otherwise add the content
-        if messages[-1]["role"] == "assistant" and messages[-1]["content"] == blank_token:
-            messages[-1]["content"] = content
-        elif messages[-1]["role"] == "assistant":
-            messages[-1]["content"] += " " + content
-        else:
-            messages.append({"role": "assistant", "content": content})
+            if messages[-1]["role"] == "assistant" and messages[-1]["content"] == blank_token:
+                messages[-1]["content"] = content
+            elif messages[-1]["role"] == "assistant":
+                messages[-1]["content"] += " " + content
+            else:
+                messages.append({"role": "assistant", "content": content})
 
     return messages
 
@@ -636,6 +671,16 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             )
         self.blank_id = blank_ids[0]
 
+        # For dynamic chunking (chunk_size=0): cache the first token of the
+        # user footer sequence (e.g. <|im_end|>).  This is the target the model
+        # predicts at the last audio frame of each chunk to signal "ready to transcribe".
+        if self.cfg.chunk_size == 0:
+            hf_tok = self.tokenizer.tokenizer
+            _, user_footer_and_asst_header_ids, _ = parse_chat_template_ids(hf_tok)
+            self._user_footer_first_id = user_footer_and_asst_header_ids[0]
+        else:
+            self._user_footer_first_id = None
+
     def __getitem__(self, cuts: CutSet) -> StreamingSTTBatch | None:
         try:
             audios, audio_lens, cuts = collate_audio(cuts, fault_tolerant=True)
@@ -696,18 +741,24 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             # We match the full chunk (audio_tag * chunk_size) as a unit because BPE
             # may merge tokens across adjacent audio tags.
             if self.audio_chunk_ids is not None:
-                audio_chunk_ids = self.audio_chunk_ids
-                chunk_size = self.cfg.chunk_size
+                # Fixed chunking: single pre-computed pattern
+                input_ids, assistant_mask = _replace_audio_chunks(
+                    input_ids, self.audio_chunk_ids, self.cfg.chunk_size, mask=assistant_mask
+                )
             else:
-                # Offline mode (chunk_size=-1): each sample has a different num_frames.
-                # Compute audio_chunk_ids per sample from the user turn's audio tag count.
-                num_frames = math.ceil(audio_durations_secs[sample_idx] / self.cfg.frame_length_in_secs)
-                audio_chunk_str = self.cfg.audio_tag * num_frames
-                audio_chunk_ids = self.tokenizer.tokenizer.encode(audio_chunk_str, add_special_tokens=False)
-                chunk_size = num_frames
-            input_ids, assistant_mask = _replace_audio_chunks(
-                input_ids, audio_chunk_ids, chunk_size, mask=assistant_mask
-            )
+                # Offline (chunk_size=-1) or dynamic (chunk_size=0): variable audio tag
+                # counts per user turn.  Replace each user turn's audio tags separately.
+                hf_tok = self.tokenizer.tokenizer
+                for msg in messages:
+                    if msg["role"] != "user":
+                        continue
+                    n_tags = msg["content"].count(self.cfg.audio_tag)
+                    if n_tags == 0:
+                        continue
+                    chunk_ids = hf_tok.encode(self.cfg.audio_tag * n_tags, add_special_tokens=False)
+                    input_ids, assistant_mask = _replace_audio_chunks(
+                        input_ids, chunk_ids, n_tags, mask=assistant_mask
+                    )
 
             # Build targets: next-token prediction with loss only on assistant content.
             # target[i] corresponds to input[i] and holds the token at position i+1.
@@ -716,16 +767,26 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             target_mask = assistant_mask[1:] + [0]
             target_ids = [tid if m else IGNORE_INDEX for tid, m in zip(target_ids, target_mask)]
 
+            # Dynamic chunking: train the model to predict at audio positions.
+            # Non-final audio frames → target = blank_id ("need more audio")
+            # Final audio frame (before user footer) → target = user_footer first token ("ready")
+            if self.cfg.chunk_size == 0:
+                user_footer_id = self._user_footer_first_id
+                for i in range(len(input_ids)):
+                    if input_ids[i] != AUDIO_TOKEN_IDX:
+                        continue
+                    next_is_audio = i + 1 < len(input_ids) and input_ids[i + 1] == AUDIO_TOKEN_IDX
+                    target_ids[i] = self.blank_id if next_is_audio else user_footer_id
+
             all_input_ids.append(torch.tensor(input_ids, dtype=torch.long))
             all_target_ids.append(torch.tensor(target_ids, dtype=torch.long))
 
-        if self.cfg.chunk_size > 0:
+        if self.cfg.chunk_size >= 0:  # fixed chunking or dynamic chunking: right-pad
             input_tokens = right_collate_vectors(all_input_ids, padding_value=self.tokenizer.pad_id)
             target_tokens = right_collate_vectors(all_target_ids, padding_value=IGNORE_INDEX)
             input_token_lens = torch.tensor([len(ids) for ids in all_input_ids], dtype=torch.long)
             target_token_lens = torch.tensor([len(ids) for ids in all_target_ids], dtype=torch.long)
-        else:
-            # Left-pad to uniform length within the batch
+        else:  # offline mode: left-pad
             input_tokens = left_collate_vectors(all_input_ids, padding_value=self.tokenizer.pad_id)
             target_tokens = left_collate_vectors(all_target_ids, padding_value=IGNORE_INDEX)
             # length is the same size as input_tokens.shape[1] since they're left-padded

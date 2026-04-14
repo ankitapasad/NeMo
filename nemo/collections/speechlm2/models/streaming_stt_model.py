@@ -672,6 +672,15 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 f"Streaming turn template ({len(turn_ids)} tokens, "
                 f"{n_audio} audio slots, chunk_size={chunk_size}): {turn_ids}"
             )
+        elif chunk_size == 0:
+            # Dynamic chunking: no fixed turn template. Audio frames are fed
+            # incrementally; the user header/footer are appended on demand.
+            self._turn_template_ids = None
+            self._user_footer_first_id = user_footer_and_asst_header_ids[0]
+            logging.info(
+                f"Dynamic chunking mode: user_footer_first_id={self._user_footer_first_id}, "
+                f"user_header_ids={user_header_ids}"
+            )
         else:
             self._turn_template_ids = None
             logging.info(f"Offline mode (chunk_size={chunk_size}): no fixed turn template")
@@ -926,15 +935,28 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
         return generated, cache, footer_consumed, num_feed_steps
 
-    def get_audio_feature_buffer(self, batch_size: int) -> BatchedCacheFeatureBufferer:
-        """Get the audio feature buffer for the streaming state."""
+    def get_audio_feature_buffer(
+        self,
+        batch_size: int,
+        chunk_size_override: Optional[int] = None,
+    ) -> BatchedCacheFeatureBufferer:
+        """Get the audio feature buffer for the streaming state.
+
+        Args:
+            batch_size: Number of parallel streams.
+            chunk_size_override: If provided, use this chunk size (in frames)
+                instead of ``self.core_cfg.chunk_size``.  Used by dynamic
+                chunking inference where the inference step size differs
+                from the config chunk_size.
+        """
         preprocessor_cfg: DictConfig = self.perception.cfg.preprocessor
         window_stride_in_secs = preprocessor_cfg.window_stride
         pre_encode_cache_size = self.perception.encoder.streaming_cfg.pre_encode_cache_size
         if isinstance(pre_encode_cache_size, list):
             pre_encode_cache_size = pre_encode_cache_size[1]
         pre_encode_cache_size_in_secs = pre_encode_cache_size * window_stride_in_secs
-        chunk_size_in_secs = self.core_cfg.chunk_size * self.core_cfg.frame_length_in_secs
+        cs = chunk_size_override if chunk_size_override is not None else max(self.core_cfg.chunk_size, 1)
+        chunk_size_in_secs = cs * self.core_cfg.frame_length_in_secs
         buffer_size_in_secs = pre_encode_cache_size_in_secs + chunk_size_in_secs
 
         audio_feature_buffer = BatchedCacheFeatureBufferer(
@@ -1336,6 +1358,212 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         # 8. Decode tokens to text
         return [decode_with_blank(toks, self.blank_token, self.tokenizer) for toks in generated_per_stream]
 
+    def _generate_dynamic_streaming(
+        self,
+        audios: Tensor,
+        n_samples_list: list[int],
+        system_prompt: Union[str, List[str]],
+        max_new_tokens: int,
+        generation_config: Optional[GenerationConfig] = None,
+        inference_chunk_size: int = 1,
+        **generation_kwargs,
+    ) -> list[str]:
+        """Dynamic-chunking generation: feed N frames at a time, let the model
+        decide when to switch from listening to transcribing.
+
+        Batch size is limited to 1 because different streams can be in
+        different modes (audio feeding vs text generating) at the same time.
+
+        Args:
+            audios: ``(B, T_samples)`` raw waveforms.
+            n_samples_list: List of B valid sample counts.
+            system_prompt: System prompt string or list.
+            max_new_tokens: Max tokens per text generation segment.
+            generation_config: Optional HuggingFace ``GenerationConfig``.
+            inference_chunk_size: Number of encoder frames to feed per step
+                (default 1).  Perception processes this many frames at a time.
+            generation_kwargs: Per-call overrides.
+        """
+        B = len(n_samples_list)
+        results = []
+
+        for b in range(B):
+            result = self._generate_dynamic_single(
+                audios[b, : n_samples_list[b]],
+                n_samples_list[b],
+                system_prompt if isinstance(system_prompt, str) else system_prompt[b],
+                max_new_tokens,
+                generation_config,
+                inference_chunk_size,
+                **generation_kwargs,
+            )
+            results.append(result)
+
+        return results
+
+    def _generate_dynamic_single(
+        self,
+        audio: Tensor,
+        n_samples: int,
+        system_prompt: str,
+        max_new_tokens: int,
+        generation_config: Optional[GenerationConfig] = None,
+        inference_chunk_size: int = 1,
+        **generation_kwargs,
+    ) -> str:
+        """Dynamic streaming generation for a single sample.
+
+        Feeds ``inference_chunk_size`` encoder frames at a time.  After each
+        step the model's next-token prediction is checked:
+
+        - ``<blank>`` → need more audio, continue feeding.
+        - ``<user_footer>`` first token → ready to transcribe.  Append the
+          user footer + assistant header, decode text until EOS, then
+          feed the next user header and resume audio feeding.
+        """
+        device = audio.device
+        chunk_size = inference_chunk_size
+        chunk_samples = math.ceil(chunk_size * self.core_cfg.frame_length_in_secs * self.core_cfg.sample_rate)
+
+        # --- Init state (B=1) ---
+        state = self.get_init_streaming_state(system_prompt, device=device, batch_size=1)
+        # Override the audio feature buffer for the dynamic chunk size
+        state.audio_feature_buffer = self.get_audio_feature_buffer(
+            batch_size=1,
+            chunk_size_override=chunk_size,
+        )
+
+        all_token_ids: list[int] = []
+
+        # Pre-embed template components
+        user_header_embs = self.embed_tokens(
+            torch.tensor(self._user_header_ids, device=device, dtype=torch.long).unsqueeze(0)
+        )  # (1, L_uh, H)
+        uf_ah_embs = self.embed_tokens(
+            torch.tensor(self._user_footer_and_asst_header_ids, device=device, dtype=torch.long).unsqueeze(0)
+        )  # (1, L_uf_ah, H)
+
+        user_footer_first_id = self._user_footer_first_id
+        num_chunk_steps = math.ceil(n_samples / chunk_samples) if n_samples > 0 else 0
+
+        def _feed_embeds(embs):
+            """Forward embeddings through LLM, update state, return LLM output."""
+            llm_kwargs = dict(
+                inputs_embeds=embs,
+                past_key_values=state.cache,
+                use_cache=True,
+                return_dict=True,
+            )
+            if state.attention_mask is not None:
+                state.attention_mask = torch.cat(
+                    [
+                        state.attention_mask,
+                        torch.ones(1, embs.shape[1], dtype=state.attention_mask.dtype, device=device),
+                    ],
+                    dim=1,
+                )
+                llm_kwargs["attention_mask"] = state.attention_mask
+            out = self.llm(**llm_kwargs)
+            state.cache = out.past_key_values
+            state.seq_lens[0] += embs.shape[1]
+            return out
+
+        # --- Feed first user header ---
+        _feed_embeds(user_header_embs)
+
+        # --- Frame-by-frame loop ---
+        for step_idx in range(num_chunk_steps):
+            # Build audio chunk (N frames)
+            start = step_idx * chunk_samples
+            end = min(start + chunk_samples, n_samples)
+            wav = audio[start:end]
+            if wav.shape[0] < chunk_samples:
+                wav = F.pad(wav, (0, chunk_samples - wav.shape[0]))
+
+            # Encode through streaming perception
+            frames = [Frame(samples=wav, length=end - start, stream_id=0)]
+            features, right_paddings = state.audio_feature_buffer.update(frames)
+            processed_signal = torch.stack(features).type_as(self.embed_tokens.weight)
+            processed_signal_length = torch.tensor(
+                [processed_signal.shape[-1] - int(right_paddings[0])],
+                device=device,
+            ).long()
+
+            outputs = self.perception(
+                processed_signal=processed_signal,
+                processed_signal_length=processed_signal_length,
+                cache_last_channel=state.audio_cache.cache_last_channel,
+                cache_last_time=state.audio_cache.cache_last_time,
+                cache_last_channel_len=state.audio_cache.cache_last_channel_len,
+                streaming=True,
+            )
+            audio_embs, _, new_cache = outputs
+            if new_cache is not None:
+                state.audio_cache.cache_last_channel = new_cache['cache_last_channel']
+                state.audio_cache.cache_last_time = new_cache['cache_last_time']
+                state.audio_cache.cache_last_channel_len = new_cache['cache_last_channel_len']
+
+            # Pad/trim to chunk_size frames
+            n_enc = audio_embs.shape[1]
+            if n_enc < chunk_size:
+                audio_embs = F.pad(audio_embs, (0, 0, 0, chunk_size - n_enc))
+            elif n_enc > chunk_size:
+                audio_embs = audio_embs[:, :chunk_size, :]
+
+            # Feed audio embeddings to LLM
+            out = _feed_embeds(audio_embs)
+
+            # Check prediction at the last frame position
+            next_token = self._sample_token(
+                out.logits[:, -1:, :],
+                None,
+                generation_config,
+                **generation_kwargs,
+            ).item()
+
+            if next_token == user_footer_first_id:
+                # Model says "ready to transcribe":
+                # 1. Feed user_footer + assistant_header
+                out = _feed_embeds(uf_ah_embs)
+
+                # 2. Decode text autoregressively until EOS/footer/max_tokens
+                generated, state.cache, footer_consumed, num_feed_steps = self._autoregressive_decode(
+                    out.logits,
+                    state.cache,
+                    state,
+                    max_new_tokens,
+                    generation_config,
+                    attention_mask=state.attention_mask,
+                    **generation_kwargs,
+                )
+                all_token_ids.extend(generated[0])
+
+                # Update attention mask for tokens fed during decode
+                if state.attention_mask is not None and num_feed_steps > 0:
+                    state.attention_mask = torch.cat(
+                        [
+                            state.attention_mask,
+                            torch.ones(1, num_feed_steps, dtype=state.attention_mask.dtype, device=device),
+                        ],
+                        dim=1,
+                    )
+
+                # 3. Feed assistant footer if not consumed during decode
+                if not footer_consumed[0] and self._asst_footer_ids:
+                    asst_footer_embs = self.embed_tokens(
+                        torch.tensor(self._asst_footer_ids, device=device, dtype=torch.long).unsqueeze(0)
+                    )
+                    _feed_embeds(asst_footer_embs)
+
+                # 4. Feed next user header for the next audio segment
+                if step_idx < num_chunk_steps - 1:
+                    _feed_embeds(user_header_embs)
+
+            # If blank: do nothing — just continue to next frame.
+            # The blank prediction is NOT fed to LLM (it's discarded).
+
+        return decode_with_blank(all_token_ids, self.blank_token, self.tokenizer)
+
     def _generate_streaming_samples(
         self,
         audios: Tensor,
@@ -1470,6 +1698,15 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
             if self.core_cfg.chunk_size < 0:
                 results = self._generate_offline(
+                    audios,
+                    n_samples_list,
+                    system_prompt,
+                    max_new_tokens,
+                    generation_config,
+                    **generation_kwargs,
+                )
+            elif self.core_cfg.chunk_size == 0:
+                results = self._generate_dynamic_streaming(
                     audios,
                     n_samples_list,
                     system_prompt,

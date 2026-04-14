@@ -1066,10 +1066,280 @@ class TestOfflineSingleChunk:
         user_large = [m["content"] for m in msgs_large if m["role"] == "user"]
         assert user_offline == user_large
 
-    def test_chunk_size_zero_raises(self):
-        """chunk_size=0 should raise an assertion error."""
-        with pytest.raises(AssertionError):
-            _make_messages(chunk_size=0)
+    def test_chunk_size_zero_is_dynamic(self):
+        """chunk_size=0 is dynamic chunking — should not raise."""
+        msgs = _make_messages(chunk_size=0)
+        # Dynamic chunking with the docstring alignments should produce
+        # user turns with variable frame counts (not fixed chunk_size).
+        user_msgs = [m for m in msgs if m["role"] == "user"]
+        assert len(user_msgs) >= 1
+
+
+# ===========================================================================
+# Tests: chunk_size=0 (dynamic chunking)
+# ===========================================================================
+class TestDynamicChunking:
+    """Verify chunk_size=0 creates variable-size chunks aligned to word boundaries."""
+
+    def test_docstring_example(self):
+        """The plan example: Hello at 0.48s, World at 0.80s, 1s audio."""
+        alignments = [
+            WordAlignment(text="Hello", start_time=0.16, end_time=0.48),
+            WordAlignment(text="World", start_time=0.60, end_time=0.80),
+        ]
+        msgs = _make_messages(chunk_size=0, alignments=alignments, audio_duration_secs=1.0)
+
+        user_msgs = [m for m in msgs if m["role"] == "user"]
+        asst_msgs = [m for m in msgs if m["role"] == "assistant"]
+
+        # 3 user turns: 6 frames (0-0.48s), 4 frames (0.48-0.80s), 3 frames (0.80-1.04s trailing)
+        assert len(user_msgs) == 3
+        assert user_msgs[0]["content"] == AUDIO_TAG * 6
+        assert user_msgs[1]["content"] == AUDIO_TAG * 4
+        assert user_msgs[2]["content"] == AUDIO_TAG * 3  # trailing silence
+
+        # 2 assistant turns (no assistant for trailing silence)
+        assert len(asst_msgs) == 2
+        assert asst_msgs[0]["content"] == "Hello"
+        assert asst_msgs[1]["content"] == "World"
+
+    def test_single_word(self):
+        """One word → 1 user+assistant turn + trailing silence user turn."""
+        alignments = [WordAlignment(text="Hi", start_time=0.0, end_time=0.16)]
+        msgs = _make_messages(chunk_size=0, alignments=alignments, audio_duration_secs=0.32)
+
+        user_msgs = [m for m in msgs if m["role"] == "user"]
+        asst_msgs = [m for m in msgs if m["role"] == "assistant"]
+
+        assert len(user_msgs) == 2  # word chunk + trailing silence
+        assert user_msgs[0]["content"] == AUDIO_TAG * 2  # 0.16s / 0.08s = 2 frames
+        assert user_msgs[1]["content"] == AUDIO_TAG * 2  # trailing: 0.16-0.32s = 2 frames
+        assert len(asst_msgs) == 1
+        assert asst_msgs[0]["content"] == "Hi"
+
+    def test_no_trailing_silence(self):
+        """Word ends exactly at audio duration → no trailing user turn."""
+        # 0.16s audio, word ends at 0.16s → 2 frames, no trailing
+        alignments = [WordAlignment(text="Hi", start_time=0.0, end_time=0.16)]
+        msgs = _make_messages(chunk_size=0, alignments=alignments, audio_duration_secs=0.16)
+
+        user_msgs = [m for m in msgs if m["role"] == "user"]
+        assert len(user_msgs) == 1  # no trailing silence
+        assert user_msgs[0]["content"] == AUDIO_TAG * 2
+
+    def test_empty_alignments(self):
+        """No words → single user turn with all frames, no assistant."""
+        msgs = _make_messages(chunk_size=0, alignments=[], audio_duration_secs=0.32)
+
+        user_msgs = [m for m in msgs if m["role"] == "user"]
+        asst_msgs = [m for m in msgs if m["role"] == "assistant"]
+
+        assert len(user_msgs) == 1
+        assert user_msgs[0]["content"] == AUDIO_TAG * 4
+        assert len(asst_msgs) == 0  # no words → no assistant
+
+    def test_adjacent_words_same_boundary(self):
+        """Two words ending at same frame → both in same assistant turn."""
+        alignments = [
+            WordAlignment(text="A", start_time=0.0, end_time=0.08),
+            WordAlignment(text="B", start_time=0.08, end_time=0.08),  # ends at same frame
+        ]
+        msgs = _make_messages(chunk_size=0, alignments=alignments, audio_duration_secs=0.16)
+
+        asst_msgs = [m for m in msgs if m["role"] == "assistant"]
+        # B ends at same frame as A → both should be in the same turn
+        assert any("A" in m["content"] and "B" in m["content"] for m in asst_msgs)
+
+    def test_with_transcript_preserves_punctuation(self):
+        """Transcript punctuation is preserved in dynamic chunks."""
+        alignments = [
+            WordAlignment(text="hello", start_time=0.0, end_time=0.16),
+            WordAlignment(text="world", start_time=0.20, end_time=0.32),
+        ]
+        msgs = _make_messages(
+            chunk_size=0,
+            alignments=alignments,
+            audio_duration_secs=0.32,
+            transcript="Hello, World!",
+        )
+        asst_msgs = [m for m in msgs if m["role"] == "assistant"]
+        assert asst_msgs[0]["content"] == "Hello, "
+        assert asst_msgs[1]["content"] == "World!"
+
+    def test_with_delay(self):
+        """Delay frames shift chunk boundaries."""
+        alignments = [WordAlignment(text="Hello", start_time=0.0, end_time=0.16)]
+        # Word ends at frame 2, delay=2 → ready at frame 4
+        msgs = _make_messages(
+            chunk_size=0,
+            alignments=alignments,
+            audio_duration_secs=0.48,
+            num_delay_frames=2,
+        )
+        user_msgs = [m for m in msgs if m["role"] == "user"]
+        # Word chunk: frames 0-3 (4 frames = end_frame 2 + delay 2)
+        assert user_msgs[0]["content"] == AUDIO_TAG * 4
+
+    def test_trailing_turn_has_no_assistant(self):
+        """Trailing silence user turn should NOT have a paired assistant turn."""
+        alignments = [WordAlignment(text="Hi", start_time=0.0, end_time=0.08)]
+        msgs = _make_messages(chunk_size=0, alignments=alignments, audio_duration_secs=0.32)
+
+        # Last message should be a user turn (trailing silence), not assistant
+        assert msgs[-1]["role"] == "user"
+
+
+class TestDynamicChunkTargets:
+    """Verify target construction for dynamic chunking (chunk_size=0)."""
+
+    def test_audio_targets_blank_and_footer(self):
+        """Audio positions get blank (non-final) or user_footer (final) targets."""
+        from nemo.collections.speechlm2.data.streaming_stt_dataset import (
+            _replace_audio_chunks,
+            _tokenize_with_assistant_mask,
+        )
+
+        # Use the mock tokenizer
+        tok = _MockHFTokenizerNoGeneration()
+        nemo_tok = _MockNemoTokenizer(tok)
+
+        alignments = [
+            WordAlignment(text="Hello", start_time=0.16, end_time=0.48),
+            WordAlignment(text="World", start_time=0.60, end_time=0.80),
+        ]
+        msgs = _make_messages(chunk_size=0, alignments=alignments, audio_duration_secs=1.0)
+
+        # Tokenize
+        input_ids, mask = _tokenize_with_assistant_mask(msgs, nemo_tok)
+
+        # Replace audio chunks (variable sizes per turn)
+        for msg in msgs:
+            if msg["role"] != "user":
+                continue
+            n_tags = msg["content"].count(AUDIO_TAG)
+            if n_tags == 0:
+                continue
+            chunk_ids = tok.encode(AUDIO_TAG * n_tags, add_special_tokens=False)
+            input_ids, mask = _replace_audio_chunks(input_ids, chunk_ids, n_tags, mask=mask)
+
+        # Build targets
+        target_ids = input_ids[1:] + [IGNORE_INDEX]
+        target_mask = mask[1:] + [0]
+        target_ids = [tid if m else IGNORE_INDEX for tid, m in zip(target_ids, target_mask)]
+
+        # Simulate dynamic chunk target override
+        blank_id = _MockHFTokenizer.BLANK_ID
+        footer_id = _MockHFTokenizer.FOOTER  # first token of user footer
+        for i in range(len(input_ids)):
+            if input_ids[i] != AUDIO_TOKEN_IDX:
+                continue
+            next_is_audio = i + 1 < len(input_ids) and input_ids[i + 1] == AUDIO_TOKEN_IDX
+            target_ids[i] = blank_id if next_is_audio else footer_id
+
+        # Verify: audio positions should have blank or footer targets, never IGNORE_INDEX
+        audio_positions = [i for i in range(len(input_ids)) if input_ids[i] == AUDIO_TOKEN_IDX]
+        assert len(audio_positions) > 0, "Should have audio positions"
+
+        for i in audio_positions:
+            assert target_ids[i] in (blank_id, footer_id), f"Audio position {i} has unexpected target {target_ids[i]}"
+
+        # The last audio frame before each assistant turn should have footer target
+        footer_positions = [i for i in audio_positions if target_ids[i] == footer_id]
+        assert (
+            len(footer_positions) >= 2
+        ), f"Expected at least 2 footer targets (Hello + World boundaries), got {len(footer_positions)}"
+
+    def test_no_audio_token_idx_in_targets(self):
+        """AUDIO_TOKEN_IDX (-200) must never appear in target_ids."""
+        tok = _MockHFTokenizerNoGeneration()
+        nemo_tok = _MockNemoTokenizer(tok)
+
+        alignments = [WordAlignment(text="Hello", start_time=0.16, end_time=0.48)]
+        msgs = _make_messages(chunk_size=0, alignments=alignments, audio_duration_secs=1.0)
+
+        input_ids, mask = _tokenize_with_assistant_mask(msgs, nemo_tok)
+
+        for msg in msgs:
+            if msg["role"] != "user":
+                continue
+            n_tags = msg["content"].count(AUDIO_TAG)
+            if n_tags == 0:
+                continue
+            chunk_ids = tok.encode(AUDIO_TAG * n_tags, add_special_tokens=False)
+            input_ids, mask = _replace_audio_chunks(input_ids, chunk_ids, n_tags, mask=mask)
+
+        target_ids = input_ids[1:] + [IGNORE_INDEX]
+        target_mask = mask[1:] + [0]
+        target_ids = [tid if m else IGNORE_INDEX for tid, m in zip(target_ids, target_mask)]
+
+        # Apply dynamic chunk override
+        blank_id = _MockHFTokenizer.BLANK_ID
+        footer_id = _MockHFTokenizer.FOOTER
+        for i in range(len(input_ids)):
+            if input_ids[i] != AUDIO_TOKEN_IDX:
+                continue
+            next_is_audio = i + 1 < len(input_ids) and input_ids[i + 1] == AUDIO_TOKEN_IDX
+            target_ids[i] = blank_id if next_is_audio else footer_id
+
+        assert AUDIO_TOKEN_IDX not in target_ids, "AUDIO_TOKEN_IDX leaked into targets"
+
+    def test_trailing_silence_all_blank(self):
+        """Trailing silence audio frames should all have blank targets."""
+        tok = _MockHFTokenizerNoGeneration()
+        nemo_tok = _MockNemoTokenizer(tok)
+
+        alignments = [WordAlignment(text="Hi", start_time=0.0, end_time=0.08)]
+        msgs = _make_messages(chunk_size=0, alignments=alignments, audio_duration_secs=0.32)
+
+        input_ids, mask = _tokenize_with_assistant_mask(msgs, nemo_tok)
+
+        for msg in msgs:
+            if msg["role"] != "user":
+                continue
+            n_tags = msg["content"].count(AUDIO_TAG)
+            if n_tags == 0:
+                continue
+            chunk_ids = tok.encode(AUDIO_TAG * n_tags, add_special_tokens=False)
+            input_ids, mask = _replace_audio_chunks(input_ids, chunk_ids, n_tags, mask=mask)
+
+        target_ids = input_ids[1:] + [IGNORE_INDEX]
+        target_mask = mask[1:] + [0]
+        target_ids = [tid if m else IGNORE_INDEX for tid, m in zip(target_ids, target_mask)]
+
+        blank_id = _MockHFTokenizer.BLANK_ID
+        footer_id = _MockHFTokenizer.FOOTER
+        for i in range(len(input_ids)):
+            if input_ids[i] != AUDIO_TOKEN_IDX:
+                continue
+            next_is_audio = i + 1 < len(input_ids) and input_ids[i + 1] == AUDIO_TOKEN_IDX
+            target_ids[i] = blank_id if next_is_audio else footer_id
+
+        # Find trailing silence: audio positions in the last user turn
+        # (after the last assistant turn)
+        last_asst_idx = max((i for i, m in enumerate(msgs) if m["role"] == "assistant"), default=-1)
+        # Trailing silence audio positions should all be blank (not footer)
+        # since there's no word boundary after them (except the very last one
+        # which transitions to the next non-audio token)
+        trailing_audio = []
+        in_trailing = False
+        for i in range(len(input_ids)):
+            if input_ids[i] == AUDIO_TOKEN_IDX:
+                if in_trailing:
+                    trailing_audio.append(i)
+            else:
+                in_trailing = False
+        # The last contiguous run of audio tokens is the trailing silence
+        last_run_start = None
+        for i in range(len(input_ids) - 1, -1, -1):
+            if input_ids[i] == AUDIO_TOKEN_IDX:
+                last_run_start = i
+            elif last_run_start is not None:
+                break
+        if last_run_start is not None:
+            trailing_positions = [i for i in range(last_run_start, len(input_ids)) if input_ids[i] == AUDIO_TOKEN_IDX]
+            # All trailing except the very last should be blank
+            for i in trailing_positions[:-1]:
+                assert target_ids[i] == blank_id, f"Trailing position {i} should be blank"
 
 
 # ===========================================================================
