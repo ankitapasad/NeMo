@@ -142,6 +142,7 @@ class StreamingSTTModelConfig:
     audio_pad_to: Optional[int] = None
     sample_rate: int = 16000
     frame_length_in_secs: float = 0.08
+    blank_loss_weight: float = 1.0
     log_every_n_steps: int = 10
     dtype: str = "bfloat16"
 
@@ -444,16 +445,26 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 reduction="none",
                 ignore_index=IGNORE_INDEX,
             )
-        loss = per_token_loss.sum() / num_targets
 
         # --- Blank vs non-blank loss breakdown ---
+        blank_id = self.blank_token_id
+        valid_mask = flat_targets != IGNORE_INDEX
+        is_blank = valid_mask & (flat_targets == blank_id)
+        is_nonblank = valid_mask & (flat_targets != blank_id)
+        num_blank = is_blank.sum()
+        num_nonblank = is_nonblank.sum()
+
+        # Apply blank loss weight (< 1.0 to down-weight easy blank predictions)
+        blank_weight = self.core_cfg.blank_loss_weight
+        if blank_weight != 1.0:
+            effective_num_targets = num_blank * blank_weight + num_nonblank
+            loss = (
+                per_token_loss[is_nonblank].sum() + per_token_loss[is_blank].sum() * blank_weight
+            ) / effective_num_targets
+        else:
+            loss = per_token_loss.sum() / num_targets
+
         with torch.no_grad():
-            blank_id = self.blank_token_id
-            valid_mask = flat_targets != IGNORE_INDEX
-            is_blank = valid_mask & (flat_targets == blank_id)
-            is_nonblank = valid_mask & (flat_targets != blank_id)
-            num_blank = is_blank.sum()
-            num_nonblank = is_nonblank.sum()
             loss_blank = per_token_loss[is_blank].sum() / num_blank.clamp(min=1)
             loss_nonblank = per_token_loss[is_nonblank].sum() / num_nonblank.clamp(min=1)
 
