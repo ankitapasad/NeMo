@@ -870,9 +870,10 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     continue
                 tid = next_tokens[b].item()
 
-                # EOS: stop WITHOUT feeding to LLM (matches old behavior exactly)
+                # EOS: stop WITHOUT feeding to LLM. Append blank separator.
                 if self._eos_id is not None and tid == self._eos_id:
                     finished[b] = True
+                    generated[b].append(self.blank_token_id)
                     continue
 
                 # All other tokens get appended and fed to LLM
@@ -1368,11 +1369,13 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         inference_chunk_size: int = 1,
         **generation_kwargs,
     ) -> list[str]:
-        """Dynamic-chunking generation: feed N frames at a time, let the model
-        decide when to switch from listening to transcribing.
+        """Batched dynamic-chunking generation.
 
-        Batch size is limited to 1 because different streams can be in
-        different modes (audio feeding vs text generating) at the same time.
+        All B streams are processed in lockstep: each step feeds exactly 1
+        embedding per stream to the LLM (audio frame, template token, or
+        generated text token).  Perception runs with ``inference_chunk_size``
+        frames and the resulting embeddings are buffered per-stream so the
+        LLM still consumes them one at a time.
 
         Args:
             audios: ``(B, T_samples)`` raw waveforms.
@@ -1380,189 +1383,299 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             system_prompt: System prompt string or list.
             max_new_tokens: Max tokens per text generation segment.
             generation_config: Optional HuggingFace ``GenerationConfig``.
-            inference_chunk_size: Number of encoder frames to feed per step
-                (default 1).  Perception processes this many frames at a time.
+            inference_chunk_size: Number of encoder frames per perception call
+                (default 1).  Embeddings are buffered and fed to the LLM one
+                at a time.
             generation_kwargs: Per-call overrides.
         """
         B = len(n_samples_list)
-        results = []
+        if B == 0:
+            return []
+        device = audios.device
+        N = inference_chunk_size
+        chunk_samples = math.ceil(N * self.core_cfg.frame_length_in_secs * self.core_cfg.sample_rate)
 
-        for b in range(B):
-            result = self._generate_dynamic_single(
-                audios[b, : n_samples_list[b]],
-                n_samples_list[b],
-                system_prompt if isinstance(system_prompt, str) else system_prompt[b],
-                max_new_tokens,
-                generation_config,
-                inference_chunk_size,
-                **generation_kwargs,
-            )
-            results.append(result)
-
-        return results
-
-    def _generate_dynamic_single(
-        self,
-        audio: Tensor,
-        n_samples: int,
-        system_prompt: str,
-        max_new_tokens: int,
-        generation_config: Optional[GenerationConfig] = None,
-        inference_chunk_size: int = 1,
-        **generation_kwargs,
-    ) -> str:
-        """Dynamic streaming generation for a single sample.
-
-        Feeds ``inference_chunk_size`` encoder frames at a time.  After each
-        step the model's next-token prediction is checked:
-
-        - ``<blank>`` → need more audio, continue feeding.
-        - ``<user_footer>`` first token → ready to transcribe.  Append the
-          user footer + assistant header, decode text until EOS, then
-          feed the next user header and resume audio feeding.
-        """
-        device = audio.device
-        chunk_size = inference_chunk_size
-        chunk_samples = math.ceil(chunk_size * self.core_cfg.frame_length_in_secs * self.core_cfg.sample_rate)
-
-        # --- Init state (B=1) ---
-        state = self.get_init_streaming_state(system_prompt, device=device, batch_size=1)
-        # Override the audio feature buffer for the dynamic chunk size
+        # --- Init state ---
+        state = self.get_init_streaming_state(system_prompt, device=device, batch_size=B)
         state.audio_feature_buffer = self.get_audio_feature_buffer(
-            batch_size=1,
-            chunk_size_override=chunk_size,
+            batch_size=B,
+            chunk_size_override=N,
         )
 
-        all_token_ids: list[int] = []
+        # --- Per-stream state machine ---
+        HEADER, LISTENING, FOOTER, GENERATING, ASST_FOOTER, DONE = range(6)
+        stream_state = [HEADER] * B
+        template_pos = [0] * B  # position within current template seq
+        audio_sample_idx = [0] * B  # next audio sample offset for perception
+        gen_token_count = [0] * B  # tokens generated in current GENERATING phase
+        last_gen_token = [self.text_pad_id] * B  # last generated token per stream
+        all_tokens: list[list[int]] = [[] for _ in range(B)]
 
-        # Pre-embed template components
-        user_header_embs = self.embed_tokens(
-            torch.tensor(self._user_header_ids, device=device, dtype=torch.long).unsqueeze(0)
-        )  # (1, L_uh, H)
-        uf_ah_embs = self.embed_tokens(
-            torch.tensor(self._user_footer_and_asst_header_ids, device=device, dtype=torch.long).unsqueeze(0)
-        )  # (1, L_uf_ah, H)
+        # Per-stream audio embedding buffer (filled by perception, consumed 1 at a time)
+        audio_emb_buf: list[list[Tensor]] = [[] for _ in range(B)]
 
+        uf_ah_ids = self._user_footer_and_asst_header_ids
+        uh_ids = self._user_header_ids
+        af_ids = self._asst_footer_ids
         user_footer_first_id = self._user_footer_first_id
-        num_chunk_steps = math.ceil(n_samples / chunk_samples) if n_samples > 0 else 0
+        H = self.embed_tokens.weight.shape[-1]
+        dtype = self.embed_tokens.weight.dtype
 
-        def _feed_embeds(embs):
-            """Forward embeddings through LLM, update state, return LLM output."""
+        # Max steps safeguard: audio frames + generous overhead for templates + generation
+        max_audio_frames = (
+            max(
+                math.ceil(ns / (self.core_cfg.frame_length_in_secs * self.core_cfg.sample_rate))
+                for ns in n_samples_list
+            )
+            if n_samples_list
+            else 0
+        )
+        max_steps = max_audio_frames * 3 + 1000  # generous upper bound
+
+        # Padding embedding for DONE streams and empty-buffer LISTENING streams.
+        # Use the blank token embedding (a real token the model knows).
+        pad_emb = self.embed_tokens(torch.tensor([self.blank_token_id], device=device)).squeeze(0)  # (H,)
+
+        for _step in range(max_steps):
+            # --- Refill audio embedding buffers for LISTENING streams ---
+            needs_refill = [
+                b
+                for b in range(B)
+                if stream_state[b] == LISTENING
+                and len(audio_emb_buf[b]) == 0
+                and audio_sample_idx[b] < n_samples_list[b]
+            ]
+            if needs_refill:
+                # Run perception only for streams that need refill.
+                # The feature buffer selectively updates via stream_id.
+                # The encoder cache is sliced to the subset, then scattered back.
+                idx_t = torch.tensor(needs_refill, device=device)
+
+                # Build frames (only for refill streams)
+                frames = []
+                for b in needs_refill:
+                    start = audio_sample_idx[b]
+                    end = min(start + chunk_samples, n_samples_list[b])
+                    wav = audios[b, start:end]
+                    if wav.shape[0] < chunk_samples:
+                        wav = F.pad(wav, (0, chunk_samples - wav.shape[0]))
+                    frames.append(Frame(samples=wav, stream_id=b, length=end - start))
+                    audio_sample_idx[b] = end
+
+                # Feature buffer selectively updates only the submitted stream_ids
+                features, right_paddings = state.audio_feature_buffer.update(frames)
+                processed_signal = torch.stack(features).type_as(self.embed_tokens.weight)  # (S, D, T)
+                processed_signal_length = torch.tensor(
+                    [processed_signal.shape[-1] - int(rp) for rp in right_paddings],
+                    device=device,
+                ).long()
+
+                # Slice encoder cache to the subset
+                sub_cache_lc = state.audio_cache.cache_last_channel.index_select(1, idx_t)
+                sub_cache_lt = state.audio_cache.cache_last_time.index_select(1, idx_t)
+                sub_cache_lcl = state.audio_cache.cache_last_channel_len[idx_t]
+
+                outputs = self.perception(
+                    processed_signal=processed_signal,
+                    processed_signal_length=processed_signal_length,
+                    cache_last_channel=sub_cache_lc,
+                    cache_last_time=sub_cache_lt,
+                    cache_last_channel_len=sub_cache_lcl,
+                    streaming=True,
+                )
+                batch_embs, _, new_cache = outputs
+
+                # Scatter updated cache back into the full B-sized cache
+                if new_cache is not None:
+                    for i, b in enumerate(needs_refill):
+                        state.audio_cache.cache_last_channel[:, b] = new_cache['cache_last_channel'][:, i]
+                        state.audio_cache.cache_last_time[:, b] = new_cache['cache_last_time'][:, i]
+                        state.audio_cache.cache_last_channel_len[b] = new_cache['cache_last_channel_len'][i]
+
+                # Distribute embeddings into per-stream buffers
+                for i, b in enumerate(needs_refill):
+                    n_enc = batch_embs[i].shape[0]
+                    for f in range(min(n_enc, N)):
+                        audio_emb_buf[b].append(batch_embs[i, f])
+
+            # --- Build (B, 1, H) input embeddings based on per-stream state ---
+            # Each entry is (H,); we stack → (B, H) then unsqueeze → (B, 1, H).
+            embs_list = []
+            for b in range(B):
+                if stream_state[b] == LISTENING:
+                    if audio_emb_buf[b]:
+                        embs_list.append(audio_emb_buf[b].pop(0))  # (H,)
+                    else:
+                        embs_list.append(pad_emb)
+                elif stream_state[b] == FOOTER:
+                    tid = uf_ah_ids[template_pos[b]]
+                    embs_list.append(self.embed_tokens(torch.tensor([tid], device=device)).squeeze(0))  # (H,)
+                elif stream_state[b] == GENERATING:
+                    embs_list.append(
+                        self.embed_tokens(torch.tensor([last_gen_token[b]], device=device)).squeeze(0)  # (H,)
+                    )
+                elif stream_state[b] == ASST_FOOTER:
+                    tid = af_ids[template_pos[b]]
+                    embs_list.append(self.embed_tokens(torch.tensor([tid], device=device)).squeeze(0))  # (H,)
+                elif stream_state[b] == HEADER:
+                    tid = uh_ids[template_pos[b]]
+                    embs_list.append(self.embed_tokens(torch.tensor([tid], device=device)).squeeze(0))  # (H,)
+                else:  # DONE
+                    embs_list.append(pad_emb)
+
+            input_embs = torch.stack(embs_list).unsqueeze(1)  # (B, H) → (B, 1, H)
+
+            # --- Single LLM forward ---
             llm_kwargs = dict(
-                inputs_embeds=embs,
+                inputs_embeds=input_embs,
                 past_key_values=state.cache,
                 use_cache=True,
                 return_dict=True,
             )
             if state.attention_mask is not None:
                 state.attention_mask = torch.cat(
-                    [
-                        state.attention_mask,
-                        torch.ones(1, embs.shape[1], dtype=state.attention_mask.dtype, device=device),
-                    ],
+                    [state.attention_mask, torch.ones(B, 1, dtype=state.attention_mask.dtype, device=device)],
                     dim=1,
                 )
                 llm_kwargs["attention_mask"] = state.attention_mask
             out = self.llm(**llm_kwargs)
             state.cache = out.past_key_values
-            state.seq_lens[0] += embs.shape[1]
-            return out
+            for b in range(B):
+                state.seq_lens[b] += 1
 
-        # --- Feed first user header ---
-        _feed_embeds(user_header_embs)
+            # --- Per-stream state transitions ---
+            for b in range(B):
+                if stream_state[b] == DONE:
+                    continue
 
-        # --- Frame-by-frame loop ---
-        for step_idx in range(num_chunk_steps):
-            # Build audio chunk (N frames)
-            start = step_idx * chunk_samples
-            end = min(start + chunk_samples, n_samples)
-            wav = audio[start:end]
-            if wav.shape[0] < chunk_samples:
-                wav = F.pad(wav, (0, chunk_samples - wav.shape[0]))
+                if stream_state[b] == LISTENING:
+                    token = self._sample_token(
+                        out.logits[b : b + 1, -1, :],
+                        None,
+                        generation_config,
+                        **generation_kwargs,
+                    ).item()
+                    if token == user_footer_first_id:
+                        # Ready to transcribe — keep buffered frames for next listening
+                        stream_state[b] = FOOTER
+                        template_pos[b] = 0
+                    elif not audio_emb_buf[b] and audio_sample_idx[b] >= n_samples_list[b]:
+                        # No more audio and buffer empty
+                        stream_state[b] = DONE
 
-            # Encode through streaming perception
-            frames = [Frame(samples=wav, length=end - start, stream_id=0)]
-            features, right_paddings = state.audio_feature_buffer.update(frames)
-            processed_signal = torch.stack(features).type_as(self.embed_tokens.weight)
-            processed_signal_length = torch.tensor(
-                [processed_signal.shape[-1] - int(right_paddings[0])],
-                device=device,
-            ).long()
+                elif stream_state[b] == FOOTER:
+                    template_pos[b] += 1
+                    if template_pos[b] >= len(uf_ah_ids):
+                        stream_state[b] = GENERATING
+                        gen_token_count[b] = 0
+                        # Use the logit from this step as the first generation logit
+                        first_token = self._sample_token(
+                            out.logits[b : b + 1, -1, :],
+                            None,
+                            generation_config,
+                            **generation_kwargs,
+                        ).item()
+                        first_is_stop = (
+                            self._eos_id is not None and first_token == self._eos_id
+                        ) or first_token == self.blank_token_id
+                        if first_is_stop:
+                            # Immediately done generating — append blank separator, feed asst footer
+                            all_tokens[b].append(self.blank_token_id)
+                            if af_ids:
+                                stream_state[b] = ASST_FOOTER
+                                template_pos[b] = 0
+                            else:
+                                self._dynamic_finish_generating(
+                                    b,
+                                    stream_state,
+                                    template_pos,
+                                    audio_emb_buf,
+                                    audio_sample_idx,
+                                    n_samples_list,
+                                    HEADER,
+                                    DONE,
+                                )
+                        else:
+                            all_tokens[b].append(first_token)
+                            last_gen_token[b] = first_token
+                            gen_token_count[b] = 1
 
-            outputs = self.perception(
-                processed_signal=processed_signal,
-                processed_signal_length=processed_signal_length,
-                cache_last_channel=state.audio_cache.cache_last_channel,
-                cache_last_time=state.audio_cache.cache_last_time,
-                cache_last_channel_len=state.audio_cache.cache_last_channel_len,
-                streaming=True,
-            )
-            audio_embs, _, new_cache = outputs
-            if new_cache is not None:
-                state.audio_cache.cache_last_channel = new_cache['cache_last_channel']
-                state.audio_cache.cache_last_time = new_cache['cache_last_time']
-                state.audio_cache.cache_last_channel_len = new_cache['cache_last_channel_len']
+                elif stream_state[b] == GENERATING:
+                    token = self._sample_token(
+                        out.logits[b : b + 1, -1, :],
+                        None,
+                        generation_config,
+                        **generation_kwargs,
+                    ).item()
+                    # Stop on EOS, blank, or max tokens (matching _autoregressive_decode)
+                    is_eos = self._eos_id is not None and token == self._eos_id
+                    is_blank = token == self.blank_token_id
+                    is_max = gen_token_count[b] >= max_new_tokens
+                    if is_eos or is_blank or is_max:
+                        # Always append blank as separator (decode_with_blank needs it)
+                        all_tokens[b].append(self.blank_token_id)
+                        # Feed assistant footer before next user header
+                        if af_ids:
+                            stream_state[b] = ASST_FOOTER
+                            template_pos[b] = 0
+                        else:
+                            self._dynamic_finish_generating(
+                                b,
+                                stream_state,
+                                template_pos,
+                                audio_emb_buf,
+                                audio_sample_idx,
+                                n_samples_list,
+                                HEADER,
+                                DONE,
+                            )
+                    else:
+                        all_tokens[b].append(token)
+                        last_gen_token[b] = token
+                        gen_token_count[b] += 1
 
-            # Pad/trim to chunk_size frames
-            n_enc = audio_embs.shape[1]
-            if n_enc < chunk_size:
-                audio_embs = F.pad(audio_embs, (0, 0, 0, chunk_size - n_enc))
-            elif n_enc > chunk_size:
-                audio_embs = audio_embs[:, :chunk_size, :]
+                elif stream_state[b] == ASST_FOOTER:
+                    template_pos[b] += 1
+                    if template_pos[b] >= len(af_ids):
+                        self._dynamic_finish_generating(
+                            b,
+                            stream_state,
+                            template_pos,
+                            audio_emb_buf,
+                            audio_sample_idx,
+                            n_samples_list,
+                            HEADER,
+                            DONE,
+                        )
 
-            # Feed audio embeddings to LLM
-            out = _feed_embeds(audio_embs)
+                elif stream_state[b] == HEADER:
+                    template_pos[b] += 1
+                    if template_pos[b] >= len(uh_ids):
+                        stream_state[b] = LISTENING
 
-            # Check prediction at the last frame position
-            next_token = self._sample_token(
-                out.logits[:, -1:, :],
-                None,
-                generation_config,
-                **generation_kwargs,
-            ).item()
+            if all(s == DONE for s in stream_state):
+                break
 
-            if next_token == user_footer_first_id:
-                # Model says "ready to transcribe":
-                # 1. Feed user_footer + assistant_header
-                out = _feed_embeds(uf_ah_embs)
+        return [decode_with_blank(toks, self.blank_token, self.tokenizer) for toks in all_tokens]
 
-                # 2. Decode text autoregressively until EOS/footer/max_tokens
-                generated, state.cache, footer_consumed, num_feed_steps = self._autoregressive_decode(
-                    out.logits,
-                    state.cache,
-                    state,
-                    max_new_tokens,
-                    generation_config,
-                    attention_mask=state.attention_mask,
-                    **generation_kwargs,
-                )
-                all_token_ids.extend(generated[0])
-
-                # Update attention mask for tokens fed during decode
-                if state.attention_mask is not None and num_feed_steps > 0:
-                    state.attention_mask = torch.cat(
-                        [
-                            state.attention_mask,
-                            torch.ones(1, num_feed_steps, dtype=state.attention_mask.dtype, device=device),
-                        ],
-                        dim=1,
-                    )
-
-                # 3. Feed assistant footer if not consumed during decode
-                if not footer_consumed[0] and self._asst_footer_ids:
-                    asst_footer_embs = self.embed_tokens(
-                        torch.tensor(self._asst_footer_ids, device=device, dtype=torch.long).unsqueeze(0)
-                    )
-                    _feed_embeds(asst_footer_embs)
-
-                # 4. Feed next user header for the next audio segment
-                if step_idx < num_chunk_steps - 1:
-                    _feed_embeds(user_header_embs)
-
-            # If blank: do nothing — just continue to next frame.
-            # The blank prediction is NOT fed to LLM (it's discarded).
-
-        return decode_with_blank(all_token_ids, self.blank_token, self.tokenizer)
+    @staticmethod
+    def _dynamic_finish_generating(
+        b,
+        stream_state,
+        template_pos,
+        audio_emb_buf,
+        audio_sample_idx,
+        n_samples_list,
+        HEADER,
+        DONE,
+    ):
+        """Transition stream b from GENERATING to HEADER or DONE."""
+        has_more_audio = bool(audio_emb_buf[b]) or audio_sample_idx[b] < n_samples_list[b]
+        if has_more_audio:
+            stream_state[b] = HEADER
+            template_pos[b] = 0
+        else:
+            stream_state[b] = DONE
 
     def _generate_streaming_samples(
         self,
