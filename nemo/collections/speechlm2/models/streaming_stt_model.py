@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
-import re
 import warnings
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -808,7 +807,6 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         state: Optional['StreamingState'],
         max_new_tokens: int,
         generation_config: Optional[GenerationConfig] = None,
-        attention_mask: Optional[Tensor] = None,
         stop_on_blank: Union[bool, str] = True,
         **generation_kwargs,
     ) -> tuple[list[list[int]], tuple, list[bool], int]:
@@ -831,11 +829,6 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             cache: HF ``past_key_values`` with batch dim B.
             max_new_tokens: Maximum tokens to generate per stream.
             generation_config: Optional HuggingFace ``GenerationConfig``.
-            attention_mask: Optional ``(B, seq_len)`` attention mask.  When
-                provided, it is extended by one column on each decode step
-                and passed to the LLM.  Required when the prefill used
-                left-padding (e.g. offline mode).  When ``None`` (streaming
-                path), no mask is passed — fully backward-compatible.
             stop_on_blank: Controls blank-token stopping behavior:
                 - ``True`` (default): stop whenever blank is predicted.
                   Use with dedicated ``<blank>`` special tokens.
@@ -913,19 +906,21 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     state.seq_lens[b] += 1
 
             token_emb = self.embed_tokens(tokens_to_feed.unsqueeze(1))  # (B, 1, H)
-            llm_kwargs = dict(
+
+            state.attention_mask = torch.cat(
+                [
+                    state.attention_mask,
+                    torch.ones(B, 1, dtype=state.attention_mask.dtype, device=state.attention_mask.device),
+                ],
+                dim=1,
+            )
+            out = self.llm(
                 inputs_embeds=token_emb,
                 past_key_values=cache,
+                attention_mask=state.attention_mask,
                 use_cache=True,
                 return_dict=True,
             )
-            if attention_mask is not None:
-                attention_mask = torch.cat(
-                    [attention_mask, torch.ones(B, 1, dtype=attention_mask.dtype, device=attention_mask.device)],
-                    dim=1,
-                )
-                llm_kwargs["attention_mask"] = attention_mask
-            out = self.llm(**llm_kwargs)
             cache = out.past_key_values
             num_feed_steps += 1
 
@@ -1011,8 +1006,13 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             sys_embs = self.embed_tokens(
                 torch.tensor(all_sys_ids[0], device=device, dtype=torch.long).unsqueeze(0)
             ).expand(batch_size, -1, -1)
-            out = self.llm(inputs_embeds=sys_embs, use_cache=True, return_dict=True)
-            attention_mask = None
+            attention_mask = torch.ones(batch_size, sys_lens[0], dtype=torch.long, device=device)
+            out = self.llm(
+                inputs_embeds=sys_embs,
+                attention_mask=attention_mask,
+                use_cache=True,
+                return_dict=True,
+            )
             max_sys_len = sys_lens[0]
         else:
             # Per-sample prompts with different lengths: left-pad and use attention mask
@@ -1145,39 +1145,30 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
         # 5. Forward through LLM with cache
         input_len = input_embeds.shape[1]
-        llm_kwargs = dict(
+        state.attention_mask = torch.cat(
+            [state.attention_mask, torch.ones(B, input_len, dtype=state.attention_mask.dtype, device=device)],
+            dim=1,
+        )
+        out = self.llm(
             inputs_embeds=input_embeds,
             past_key_values=state.cache,
+            attention_mask=state.attention_mask,
             use_cache=True,
             return_dict=True,
         )
-        if state.attention_mask is not None:
-            state.attention_mask = torch.cat(
-                [state.attention_mask, torch.ones(B, input_len, dtype=state.attention_mask.dtype, device=device)],
-                dim=1,
-            )
-            llm_kwargs["attention_mask"] = state.attention_mask
-        out = self.llm(**llm_kwargs)
         state.cache = out.past_key_values
         for b in range(B):
             state.seq_lens[b] += input_len
 
         # 6. Autoregressive generation loop
-        generated_per_stream, state.cache, footer_consumed, num_feed_steps = self._autoregressive_decode(
+        generated_per_stream, state.cache, footer_consumed, _ = self._autoregressive_decode(
             out.logits,
             state.cache,
             state,
             max_new_tokens,
             generation_config,
-            attention_mask=state.attention_mask,
             **generation_kwargs,
         )
-        # Update attention_mask for tokens fed during decode
-        if state.attention_mask is not None and num_feed_steps > 0:
-            state.attention_mask = torch.cat(
-                [state.attention_mask, torch.ones(B, num_feed_steps, dtype=state.attention_mask.dtype, device=device)],
-                dim=1,
-            )
 
         # 7. Finalize turn — ensure end-of-turn tokens are in the cache.
         any_needs_footer = any(not fc for fc in footer_consumed)
@@ -1186,19 +1177,17 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             asst_footer_embs = self.embed_tokens(
                 torch.tensor(self._asst_footer_ids, device=device).unsqueeze(0).expand(B, -1)
             )
-            footer_llm_kwargs = dict(
+            state.attention_mask = torch.cat(
+                [state.attention_mask, torch.ones(B, flen, dtype=state.attention_mask.dtype, device=device)],
+                dim=1,
+            )
+            out = self.llm(
                 inputs_embeds=asst_footer_embs,
                 past_key_values=state.cache,
+                attention_mask=state.attention_mask,
                 use_cache=True,
                 return_dict=True,
             )
-            if state.attention_mask is not None:
-                state.attention_mask = torch.cat(
-                    [state.attention_mask, torch.ones(B, flen, dtype=state.attention_mask.dtype, device=device)],
-                    dim=1,
-                )
-                footer_llm_kwargs["attention_mask"] = state.attention_mask
-            out = self.llm(**footer_llm_kwargs)
             state.cache = out.past_key_values
             for b in range(B):
                 state.seq_lens[b] += flen
@@ -1344,6 +1333,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             cache=out.past_key_values,
             generated_tokens=[[] for _ in range(B)],
             seq_lens=[max_len] * B,
+            attention_mask=attention_mask,
             batch_size=B,
         )
         generated_per_stream, _, _, _ = self._autoregressive_decode(
@@ -1352,7 +1342,6 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             state,
             max_new_tokens,
             generation_config,
-            attention_mask=attention_mask,
             **generation_kwargs,
         )
 

@@ -33,6 +33,7 @@ The model's ``generate()`` method returns ``list[str]`` directly.
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from functools import partial
@@ -106,8 +107,6 @@ def main(cfg: StreamingSTTEvalConfig):
     logging.info(f"Hydra config:\n{OmegaConf.to_yaml(cfg)}")
 
     if cfg.seed is not None:
-        import os
-
         logging.warning(f"Setting random seed to {cfg.seed}, this will slow down the inference")
         torch.manual_seed(cfg.seed)
         torch.cuda.manual_seed_all(cfg.seed)
