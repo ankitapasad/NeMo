@@ -92,7 +92,7 @@ def decode_with_blank(
     replace_blank: Optional[str] = None,
     strip_whitespace: bool = False,
     collapse_whitespace: bool = True,
-    join_with: Optional[str] = None,
+    join_with: Optional[str] = " ",
 ) -> str:
     """Decode token IDs, treating blank tokens as segment boundaries.
 
