@@ -1418,19 +1418,10 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         uh_ids = self._user_header_ids
         af_ids = self._asst_footer_ids
         user_footer_first_id = self._user_footer_first_id
-        H = self.embed_tokens.weight.shape[-1]
-        dtype = self.embed_tokens.weight.dtype
 
-        # Max steps safeguard: audio frames + generous overhead for templates + generation
-        max_audio_frames = (
-            max(
-                math.ceil(ns / (self.core_cfg.frame_length_in_secs * self.core_cfg.sample_rate))
-                for ns in n_samples_list
-            )
-            if n_samples_list
-            else 0
-        )
-        max_steps = max_audio_frames * 3 + 1000  # generous upper bound
+        # Max steps: LLM's max context length minus the system prompt already in KV cache.
+        max_model_len = getattr(self.llm.config, 'max_position_embeddings', 40960)
+        max_steps = max_model_len - max(state.seq_lens)
 
         # Padding embedding for DONE streams and empty-buffer LISTENING streams.
         # Use the blank token embedding (a real token the model knows).
