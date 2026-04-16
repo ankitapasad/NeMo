@@ -99,6 +99,9 @@ class StreamingSTTEvalConfig:
     use_offline_embs: bool = False
     seed: Optional[int] = None  # Set for deterministic results
     pad_extra_duration: Optional[float] = 0.0
+    use_state_machine_inference: bool = (
+        False  # recommended turned off for chunk_size > 0, no effect for chunk_size <= 0
+    )
     generation_config: StreamingSTTGenerationConfig = field(default_factory=StreamingSTTGenerationConfig)
 
 
@@ -158,6 +161,7 @@ def main(cfg: StreamingSTTEvalConfig):
             max_new_tokens=cfg.max_new_tokens,
             generation_config=generation_config,
             use_offline_embs=cfg.use_offline_embs,
+            use_state_machine_inference=cfg.use_state_machine_inference,
         )
         batch_infer_duration = perf_counter() - ts
 

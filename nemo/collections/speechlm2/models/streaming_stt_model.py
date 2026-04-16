@@ -663,6 +663,10 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         self._user_footer_and_asst_header_ids = user_footer_and_asst_header_ids
         self._asst_footer_ids = asst_footer_ids
 
+        # Always cache user_footer_first_id — needed by state machine inference
+        # for both dynamic (chunk_size=0) and fixed chunking (use_state_machine_inference).
+        self._user_footer_first_id = user_footer_and_asst_header_ids[0] if user_footer_and_asst_header_ids else None
+
         if chunk_size > 0:
             turn_ids = user_header_ids + [AUDIO_TOKEN_IDX] * chunk_size + user_footer_and_asst_header_ids
             self._turn_template_ids = turn_ids
@@ -675,7 +679,6 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             # Dynamic chunking: no fixed turn template. Audio frames are fed
             # incrementally; the user header/footer are appended on demand.
             self._turn_template_ids = None
-            self._user_footer_first_id = user_footer_and_asst_header_ids[0]
             logging.info(
                 f"Dynamic chunking mode: user_footer_first_id={self._user_footer_first_id}, "
                 f"user_header_ids={user_header_ids}"
@@ -1355,7 +1358,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         system_prompt: Union[str, List[str]],
         max_new_tokens: int,
         generation_config: Optional[GenerationConfig] = None,
-        inference_chunk_size: int = 1,
+        inference_chunk_size: Optional[int] = None,
         **generation_kwargs,
     ) -> list[str]:
         """Batched dynamic-chunking generation.
@@ -1381,7 +1384,12 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         if B == 0:
             return []
         device = audios.device
-        N = inference_chunk_size
+        # Default inference_chunk_size: use chunk_size for fixed chunking (matches
+        # training perception), 1 for dynamic chunking (frame-by-frame).
+        if inference_chunk_size is None:
+            N = max(self.core_cfg.chunk_size, 1)
+        else:
+            N = inference_chunk_size
         chunk_samples = math.ceil(N * self.core_cfg.frame_length_in_secs * self.core_cfg.sample_rate)
 
         # --- Init state ---
@@ -1392,7 +1400,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         )
 
         # --- Per-stream state machine ---
-        HEADER, LISTENING, FOOTER, GENERATING, ASST_FOOTER, DONE = range(6)
+        HEADER, LISTENING, FOOTER, GENERATING, BLANK_FEED, ASST_FOOTER, DONE = range(7)
         stream_state = [HEADER] * B
         template_pos = [0] * B  # position within current template seq
         audio_sample_idx = [0] * B  # next audio sample offset for perception
@@ -1402,6 +1410,12 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
         # Per-stream audio embedding buffer (filled by perception, consumed 1 at a time)
         audio_emb_buf: list[list[Tensor]] = [[] for _ in range(B)]
+
+        # Fixed-chunk mode: count frames consumed per segment to transition
+        # after exactly chunk_size frames (ignoring model predictions).
+        fixed_chunk_mode = self.core_cfg.chunk_size > 0
+        fixed_chunk_size = self.core_cfg.chunk_size if fixed_chunk_mode else 0
+        frames_in_segment = [0] * B  # frames consumed in current LISTENING segment
 
         uf_ah_ids = self._user_footer_and_asst_header_ids
         uh_ids = self._user_header_ids
@@ -1472,11 +1486,16 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                         state.audio_cache.cache_last_time[:, b] = new_cache['cache_last_time'][:, i]
                         state.audio_cache.cache_last_channel_len[b] = new_cache['cache_last_channel_len'][i]
 
-                # Distribute embeddings into per-stream buffers
+                # Distribute embeddings into per-stream buffers.
+                # Pad to exactly N frames (matching fast path's pad/trim behavior).
+                H_enc = batch_embs.shape[-1]
                 for i, b in enumerate(needs_refill):
                     n_enc = batch_embs[i].shape[0]
-                    for f in range(min(n_enc, N)):
+                    for f in range(n_enc):
                         audio_emb_buf[b].append(batch_embs[i, f])
+                    # Pad with zeros if encoder returned fewer than N frames
+                    for _ in range(N - n_enc):
+                        audio_emb_buf[b].append(torch.zeros(H_enc, device=device, dtype=batch_embs.dtype))
 
             # --- Build (B, 1, H) input embeddings based on per-stream state ---
             # Each entry is (H,); we stack → (B, H) then unsqueeze → (B, 1, H).
@@ -1493,6 +1512,10 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 elif stream_state[b] == GENERATING:
                     embs_list.append(
                         self.embed_tokens(torch.tensor([last_gen_token[b]], device=device)).squeeze(0)  # (H,)
+                    )
+                elif stream_state[b] == BLANK_FEED:
+                    embs_list.append(
+                        self.embed_tokens(torch.tensor([self.blank_token_id], device=device)).squeeze(0)  # (H,)
                     )
                 elif stream_state[b] == ASST_FOOTER:
                     tid = af_ids[template_pos[b]]
@@ -1529,19 +1552,29 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     continue
 
                 if stream_state[b] == LISTENING:
-                    token = self._sample_token(
-                        out.logits[b : b + 1, -1, :],
-                        None,
-                        generation_config,
-                        **generation_kwargs,
-                    ).item()
-                    if token == user_footer_first_id:
-                        # Ready to transcribe — keep buffered frames for next listening
-                        stream_state[b] = FOOTER
-                        template_pos[b] = 0
-                    elif not audio_emb_buf[b] and audio_sample_idx[b] >= n_samples_list[b]:
-                        # No more audio and buffer empty
-                        stream_state[b] = DONE
+                    frames_in_segment[b] += 1
+                    if fixed_chunk_mode:
+                        # Fixed chunking: transition after exactly chunk_size frames
+                        if frames_in_segment[b] >= fixed_chunk_size:
+                            stream_state[b] = FOOTER
+                            template_pos[b] = 0
+                            frames_in_segment[b] = 0
+                        elif not audio_emb_buf[b] and audio_sample_idx[b] >= n_samples_list[b]:
+                            stream_state[b] = DONE
+                    else:
+                        # Dynamic chunking: transition when model predicts <user_footer>
+                        token = self._sample_token(
+                            out.logits[b : b + 1, -1, :],
+                            None,
+                            generation_config,
+                            **generation_kwargs,
+                        ).item()
+                        if token == user_footer_first_id:
+                            stream_state[b] = FOOTER
+                            template_pos[b] = 0
+                            frames_in_segment[b] = 0
+                        elif not audio_emb_buf[b] and audio_sample_idx[b] >= n_samples_list[b]:
+                            stream_state[b] = DONE
 
                 elif stream_state[b] == FOOTER:
                     template_pos[b] += 1
@@ -1559,9 +1592,12 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                             self._eos_id is not None and first_token == self._eos_id
                         ) or first_token == self.blank_token_id
                         if first_is_stop:
-                            # Immediately done generating — append blank separator, feed asst footer
+                            # Immediately done generating — append blank separator
                             all_tokens[b].append(self.blank_token_id)
-                            if af_ids:
+                            if fixed_chunk_mode:
+                                # Feed blank to LLM first (matches training sequence)
+                                stream_state[b] = BLANK_FEED
+                            elif af_ids:
                                 stream_state[b] = ASST_FOOTER
                                 template_pos[b] = 0
                             else:
@@ -1594,8 +1630,12 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     if is_eos or is_blank or is_max:
                         # Always append blank as separator (decode_with_blank needs it)
                         all_tokens[b].append(self.blank_token_id)
-                        # Feed assistant footer before next user header
-                        if af_ids:
+                        # In fixed-chunk mode, blank must be fed to LLM before footer
+                        # (training sequence: ...text <blank> <asst_footer>...).
+                        # This applies for ALL stop conditions (EOS, blank, max).
+                        if fixed_chunk_mode:
+                            stream_state[b] = BLANK_FEED
+                        elif af_ids:
                             stream_state[b] = ASST_FOOTER
                             template_pos[b] = 0
                         else:
@@ -1613,6 +1653,23 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                         all_tokens[b].append(token)
                         last_gen_token[b] = token
                         gen_token_count[b] += 1
+
+                elif stream_state[b] == BLANK_FEED:
+                    # Blank was fed to LLM this step. Transition to ASST_FOOTER.
+                    if af_ids:
+                        stream_state[b] = ASST_FOOTER
+                        template_pos[b] = 0
+                    else:
+                        self._dynamic_finish_generating(
+                            b,
+                            stream_state,
+                            template_pos,
+                            audio_emb_buf,
+                            audio_sample_idx,
+                            n_samples_list,
+                            HEADER,
+                            DONE,
+                        )
 
                 elif stream_state[b] == ASST_FOOTER:
                     template_pos[b] += 1
@@ -1761,14 +1818,11 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         max_new_tokens: int = 64,
         generation_config: Optional[GenerationConfig] = None,
         use_offline_embs: bool = False,
+        use_state_machine_inference: bool = False,
         **generation_kwargs,
     ) -> list[str]:
         """
-        Transcribe full audio(s) using chunk-by-chunk streaming.
-
-        All B samples are processed in lockstep — each step, every stream
-        contributes one audio chunk, and the perception + LLM forward passes
-        are batched across streams.
+        Transcribe full audio(s).
 
         Args:
             audios: (B, T_samples) raw waveforms.
@@ -1798,7 +1852,8 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     generation_config,
                     **generation_kwargs,
                 )
-            elif self.core_cfg.chunk_size == 0:
+            elif self.core_cfg.chunk_size == 0 or use_state_machine_inference:
+                # Dynamic chunking (chunk_size=0) or state machine inference opted in.
                 results = self._generate_dynamic_streaming(
                     audios,
                     n_samples_list,
@@ -1808,6 +1863,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     **generation_kwargs,
                 )
             else:
+                # Fixed chunking: bulk prefill + _autoregressive_decode (fast path).
                 results = self._generate_streaming_samples(
                     audios,
                     n_samples_list,
