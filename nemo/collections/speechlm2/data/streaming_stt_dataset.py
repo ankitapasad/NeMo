@@ -78,6 +78,7 @@ class StreamingSTTDataConfig:
     frame_length_in_secs: float
     chunk_size: int
     num_delay_frames: int = 0
+    words_per_group: int = 1
     audio_tag: str = "<audio>"
     blank_token: str = "<blank>"
     system_role: str = "system"
@@ -195,6 +196,7 @@ def get_llm_messages_for_sample(
     frame_length_in_secs: float,
     alignments: Optional[List[WordAlignment]] = None,
     transcript: Optional[str] = None,
+    words_per_group: int = 1,
 ) -> List[dict]:
     """
     Get the LLM messages for a sample, using the alignments to determine the turns for the audio and text.
@@ -270,36 +272,43 @@ def get_llm_messages_for_sample(
         # Dynamic chunking: one user turn per word group, sized to word boundary.
         # The model learns to predict when to stop listening via audio-position targets.
         prev_end_frame = 0
+        word_buffer: list[int] = []  # indices of buffered words
+
         for word_idx, word in enumerate(alignments):
-            word_end_frame = math.ceil(word.end_time / frame_length_in_secs) + num_delay_frames
-            word_end_frame = min(word_end_frame, num_frames)  # clamp to audio duration
-            n_frames_chunk = word_end_frame - prev_end_frame
-            if n_frames_chunk <= 0:
-                # Word fits in the previous chunk (multiple words at same boundary).
-                # Append to the last assistant turn.
-                if word_spans and transcript:
-                    span = word_spans[word_idx]
-                    if span is not None:
-                        content = transcript[span[0] : span[1]]
-                    else:
-                        content = word.text
-                else:
-                    content = word.text
-                if messages[-1]["role"] == "assistant":
-                    messages[-1]["content"] += " " + content
-                else:
-                    messages.append({"role": "assistant", "content": content})
+            word_buffer.append(word_idx)
+
+            # Emit when buffer reaches words_per_group or this is the last word
+            if len(word_buffer) < words_per_group and word_idx < len(alignments) - 1:
                 continue
 
-            messages.append({"role": "user", "content": audio_tag * n_frames_chunk})
+            # Chunk boundary = end frame of the last word in this group
+            last_word = alignments[word_buffer[-1]]
+            group_end_frame = math.ceil(last_word.end_time / frame_length_in_secs) + num_delay_frames
+            group_end_frame = min(group_end_frame, num_frames)
+            n_frames_chunk = group_end_frame - prev_end_frame
 
+            if n_frames_chunk > 0:
+                messages.append({"role": "user", "content": audio_tag * n_frames_chunk})
+
+            # Build assistant content from all buffered words
             if word_spans and transcript:
-                span = word_spans[word_idx]
-                content = transcript[span[0] : span[1]] if span is not None else word.text
+                first_span = word_spans[word_buffer[0]]
+                last_span = word_spans[word_buffer[-1]]
+                if first_span is not None and last_span is not None:
+                    content = transcript[first_span[0] : last_span[1]]
+                else:
+                    content = " ".join(alignments[i].text for i in word_buffer)
             else:
-                content = word.text
-            messages.append({"role": "assistant", "content": content})
-            prev_end_frame = word_end_frame
+                content = " ".join(alignments[i].text for i in word_buffer)
+
+            if n_frames_chunk <= 0 and messages[-1]["role"] == "assistant":
+                # Words at same boundary as previous group — append
+                messages[-1]["content"] += " " + content
+            else:
+                messages.append({"role": "assistant", "content": content})
+
+            prev_end_frame = group_end_frame
+            word_buffer = []
 
         # Trailing silence frames (after last word) — user turn only, no assistant.
         if prev_end_frame < num_frames:
@@ -309,6 +318,7 @@ def get_llm_messages_for_sample(
         num_chunks = math.ceil(num_frames / chunk_size) if num_frames > 0 else 0
 
         word_idx = 0
+        word_buffer: list[int] = []  # indices of words buffered for words_per_group grouping
         for chunk_i in range(num_chunks):
             chunk_end_frame = (chunk_i + 1) * chunk_size
 
@@ -316,29 +326,30 @@ def get_llm_messages_for_sample(
             messages.append({"role": "user", "content": audio_tag * chunk_size})
 
             # Collect indices of words whose end_time (in frames) + delay <= chunk_end_frame
-            ready_indices = []
             while word_idx < len(alignments):
                 word = alignments[word_idx]
                 word_end_frame = math.ceil(word.end_time / frame_length_in_secs)
                 ready_frame = word_end_frame + num_delay_frames
                 if ready_frame <= chunk_end_frame:
-                    ready_indices.append(word_idx)
+                    word_buffer.append(word_idx)
                     word_idx += 1
                 else:
                     break
 
-            # Assistant turn: transcribed words or blank
-            if ready_indices:
+            # Emit words when buffer reaches words_per_group, or at the last chunk
+            is_last_chunk = chunk_i == num_chunks - 1
+            if word_buffer and (len(word_buffer) >= words_per_group or is_last_chunk):
                 if word_spans and transcript:
-                    first_span = word_spans[ready_indices[0]]
-                    last_span = word_spans[ready_indices[-1]]
+                    first_span = word_spans[word_buffer[0]]
+                    last_span = word_spans[word_buffer[-1]]
                     if first_span is not None and last_span is not None:
                         content = transcript[first_span[0] : last_span[1]]
                     else:
-                        content = " ".join(alignments[i].text for i in ready_indices)
+                        content = " ".join(alignments[i].text for i in word_buffer)
                 else:
-                    content = " ".join(alignments[i].text for i in ready_indices)
+                    content = " ".join(alignments[i].text for i in word_buffer)
                 messages.append({"role": "assistant", "content": content})
+                word_buffer = []
             else:
                 messages.append({"role": "assistant", "content": blank_token})
 
@@ -376,6 +387,7 @@ def get_llm_messages_for_batch(
     frame_length_in_secs: float,
     alignments: Optional[List[List[WordAlignment]]] = None,
     transcripts: Optional[List[str]] = None,
+    words_per_group: int = 1,
 ) -> List[List[dict]]:
     """
     Get the LLM messages for a batch of samples.
@@ -392,6 +404,8 @@ def get_llm_messages_for_batch(
         alignments: List of lists of WordAlignment objects for the batch.
         transcripts: Original transcription strings, one per sample.  When provided,
             assistant turn content preserves punctuation and spacing from the transcript.
+        words_per_group: Minimum number of words to buffer before emitting an
+            assistant turn (default 1 = emit each word immediately).
     """
     if transcripts is None:
         transcripts = [None] * len(audio_durations_secs)
@@ -414,6 +428,7 @@ def get_llm_messages_for_batch(
                 frame_length_in_secs=frame_length_in_secs,
                 alignments=sample_alignments,
                 transcript=transcript,
+                words_per_group=words_per_group,
             )
         )
     return batch_messages
@@ -728,6 +743,7 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             frame_length_in_secs=self.cfg.frame_length_in_secs,
             alignments=alignments,
             transcripts=text,
+            words_per_group=self.cfg.words_per_group,
         )
 
         all_input_ids = []

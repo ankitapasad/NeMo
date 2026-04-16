@@ -1189,6 +1189,129 @@ class TestDynamicChunking:
         assert msgs[-1]["role"] == "user"
 
 
+# ===========================================================================
+# Tests: words_per_group > 1 (word grouping)
+# ===========================================================================
+class TestWordsPerChunk:
+    """Verify words_per_group groups words into larger assistant turns."""
+
+    FIVE_WORD_ALIGNMENTS = [
+        WordAlignment(text="Hello", start_time=0.16, end_time=0.48),
+        WordAlignment(text="World", start_time=0.60, end_time=0.80),
+        WordAlignment(text="How", start_time=0.90, end_time=1.00),
+        WordAlignment(text="Are", start_time=1.10, end_time=1.20),
+        WordAlignment(text="You", start_time=1.30, end_time=1.50),
+    ]
+
+    def test_dynamic_wpc2_groups_words(self):
+        """Dynamic chunking with words_per_group=2 groups pairs."""
+        msgs = _make_messages(
+            chunk_size=0,
+            alignments=self.FIVE_WORD_ALIGNMENTS,
+            audio_duration_secs=2.0,
+            words_per_group=2,
+        )
+        asst = [m["content"] for m in msgs if m["role"] == "assistant"]
+        assert asst[0] == "Hello World"
+        assert asst[1] == "How Are"
+        assert asst[2] == "You"  # remainder
+
+    def test_dynamic_wpc3_groups_words(self):
+        """Dynamic chunking with words_per_group=3."""
+        msgs = _make_messages(
+            chunk_size=0,
+            alignments=self.FIVE_WORD_ALIGNMENTS,
+            audio_duration_secs=2.0,
+            words_per_group=3,
+        )
+        asst = [m["content"] for m in msgs if m["role"] == "assistant"]
+        assert asst[0] == "Hello World How"
+        assert asst[1] == "Are You"  # remainder
+
+    def test_dynamic_wpc1_is_default(self):
+        """words_per_group=1 produces one word per turn (same as default)."""
+        msgs = _make_messages(
+            chunk_size=0,
+            alignments=self.FIVE_WORD_ALIGNMENTS,
+            audio_duration_secs=2.0,
+            words_per_group=1,
+        )
+        asst = [m["content"] for m in msgs if m["role"] == "assistant"]
+        assert len(asst) == 5
+
+    def test_dynamic_wpc_larger_than_words(self):
+        """words_per_group larger than total words → all in one turn."""
+        msgs = _make_messages(
+            chunk_size=0,
+            alignments=self.FIVE_WORD_ALIGNMENTS,
+            audio_duration_secs=2.0,
+            words_per_group=10,
+        )
+        asst = [m["content"] for m in msgs if m["role"] == "assistant"]
+        assert len(asst) == 1
+        assert "Hello" in asst[0] and "You" in asst[0]
+
+    def test_dynamic_wpc2_audio_frames(self):
+        """Audio frame counts match word group boundaries."""
+        msgs = _make_messages(
+            chunk_size=0,
+            alignments=self.FIVE_WORD_ALIGNMENTS,
+            audio_duration_secs=2.0,
+            words_per_group=2,
+        )
+        user_msgs = [m for m in msgs if m["role"] == "user"]
+        # Group 1: Hello+World → end at frame ceil(0.80/0.08) = 10
+        assert user_msgs[0]["content"] == AUDIO_TAG * 10
+        # Group 2: How+Are → frames 10 to ceil(1.20/0.08) = 15, so 5 frames
+        assert user_msgs[1]["content"] == AUDIO_TAG * 5
+
+    def test_fixed_chunk_wpc3_buffers_words(self):
+        """Fixed chunking with words_per_group=3 buffers words across chunks."""
+        msgs = _make_messages(
+            chunk_size=2,
+            alignments=self.FIVE_WORD_ALIGNMENTS,
+            audio_duration_secs=2.0,
+            words_per_group=3,
+        )
+        asst = [m["content"] for m in msgs if m["role"] == "assistant"]
+        text_turns = [a for a in asst if a != BLANK_TOKEN]
+        # First text turn should have 3 words
+        assert "Hello" in text_turns[0] and "How" in text_turns[0]
+        # Second text turn should have remaining 2 words
+        assert "Are" in text_turns[1] and "You" in text_turns[1]
+
+    def test_fixed_chunk_wpc1_is_default(self):
+        """Fixed chunking with words_per_group=1 emits words immediately."""
+        msgs = _make_messages(
+            chunk_size=2,
+            alignments=self.FIVE_WORD_ALIGNMENTS,
+            audio_duration_secs=2.0,
+            words_per_group=1,
+        )
+        asst = [m["content"] for m in msgs if m["role"] == "assistant"]
+        text_turns = [a for a in asst if a != BLANK_TOKEN]
+        # Each word in its own turn (possibly grouped if in same chunk)
+        assert len(text_turns) >= 3  # some words may share a chunk naturally
+
+    def test_dynamic_wpc_with_transcript(self):
+        """Transcript punctuation preserved with word grouping."""
+        alignments = [
+            WordAlignment(text="hello", start_time=0.0, end_time=0.16),
+            WordAlignment(text="world", start_time=0.20, end_time=0.32),
+            WordAlignment(text="how", start_time=0.40, end_time=0.48),
+        ]
+        msgs = _make_messages(
+            chunk_size=0,
+            alignments=alignments,
+            audio_duration_secs=0.56,
+            transcript="Hello, World! How?",
+            words_per_group=2,
+        )
+        asst = [m["content"] for m in msgs if m["role"] == "assistant"]
+        assert asst[0] == "Hello, World! "  # preserve_whitespace includes trailing space
+        assert asst[1] == "How?"
+
+
 class TestDynamicChunkTargets:
     """Verify target construction for dynamic chunking (chunk_size=0)."""
 
