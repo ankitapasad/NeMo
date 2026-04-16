@@ -1059,7 +1059,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         )
 
     @torch.no_grad()
-    def generate_streaming(
+    def _chunked_streaming_step(
         self,
         audio_chunks: Tensor,
         audio_chunk_lens: Optional[Tensor] = None,
@@ -1714,7 +1714,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         else:
             stream_state[b] = DONE
 
-    def _generate_streaming_samples(
+    def _generate_chunked_streaming(
         self,
         audios: Tensor,
         n_samples_list: list[int],
@@ -1793,7 +1793,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                         emb_chunks.append(torch.zeros(1, chunk_size, H, device=device, dtype=audios.dtype))
                 extra_kwargs["_audio_embs"] = torch.cat(emb_chunks, dim=0)
 
-            chunk_tokens = self.generate_streaming(
+            chunk_tokens = self._chunked_streaming_step(
                 audio_batch,
                 lens_batch,
                 state,
@@ -1853,7 +1853,8 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     **generation_kwargs,
                 )
             elif self.core_cfg.chunk_size == 0 or use_state_machine_inference:
-                # Dynamic chunking (chunk_size=0) or state machine inference opted in.
+                # Dynamic chunking (chunk_size=0) or state machine inference opted in for chunk_size > 0.
+                # Note that for chunk_size > 0, use_state_machine_inference is not recommended.
                 results = self._generate_dynamic_streaming(
                     audios,
                     n_samples_list,
@@ -1863,8 +1864,8 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     **generation_kwargs,
                 )
             else:
-                # Fixed chunking: bulk prefill + _autoregressive_decode (fast path).
-                results = self._generate_streaming_samples(
+                # Static chunking (chunk_size > 0): bulk prefill + auto-regressive decode.
+                results = self._generate_chunked_streaming(
                     audios,
                     n_samples_list,
                     system_prompt,
