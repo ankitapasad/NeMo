@@ -1359,6 +1359,8 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         max_new_tokens: int,
         generation_config: Optional[GenerationConfig] = None,
         inference_chunk_size: Optional[int] = None,
+        dynamic_min_chunk_size: int = 0,
+        dynamic_max_chunk_size: Optional[int] = None,
         **generation_kwargs,
     ) -> list[str]:
         """Batched dynamic-chunking generation.
@@ -1378,6 +1380,10 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             inference_chunk_size: Number of encoder frames per perception call
                 (default 1).  Embeddings are buffered and fed to the LLM one
                 at a time.
+            dynamic_min_chunk_size: Minimum frames before the model is allowed
+                to trigger generation (default 0, no minimum).
+            dynamic_max_chunk_size: Maximum frames before forcing generation.
+                ``None`` means no upper bound (default).
             generation_kwargs: Per-call overrides.
         """
         B = len(n_samples_list)
@@ -1562,19 +1568,34 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                         elif not audio_emb_buf[b] and audio_sample_idx[b] >= n_samples_list[b]:
                             stream_state[b] = DONE
                     else:
-                        # Dynamic chunking: transition when model predicts <user_footer>
-                        token = self._sample_token(
-                            out.logits[b : b + 1, -1, :],
-                            None,
-                            generation_config,
-                            **generation_kwargs,
-                        ).item()
-                        if token == user_footer_first_id:
+                        # Dynamic chunking: transition when model predicts <user_footer>,
+                        # subject to [min_chunk_size, max_chunk_size] bounds.
+                        if dynamic_max_chunk_size is not None and frames_in_segment[b] >= dynamic_max_chunk_size:
+                            # Forced transition — hit upper bound
                             stream_state[b] = FOOTER
                             template_pos[b] = 0
                             frames_in_segment[b] = 0
-                        elif not audio_emb_buf[b] and audio_sample_idx[b] >= n_samples_list[b]:
-                            stream_state[b] = DONE
+                        elif frames_in_segment[b] < dynamic_min_chunk_size:
+                            # Below minimum — ignore model prediction, keep listening
+                            if not audio_emb_buf[b] and audio_sample_idx[b] >= n_samples_list[b]:
+                                # Audio exhausted before reaching min — still emit
+                                stream_state[b] = FOOTER
+                                template_pos[b] = 0
+                                frames_in_segment[b] = 0
+                        else:
+                            # In [min, max] window — use model prediction
+                            token = self._sample_token(
+                                out.logits[b : b + 1, -1, :],
+                                None,
+                                generation_config,
+                                **generation_kwargs,
+                            ).item()
+                            if token == user_footer_first_id:
+                                stream_state[b] = FOOTER
+                                template_pos[b] = 0
+                                frames_in_segment[b] = 0
+                            elif not audio_emb_buf[b] and audio_sample_idx[b] >= n_samples_list[b]:
+                                stream_state[b] = DONE
 
                 elif stream_state[b] == FOOTER:
                     template_pos[b] += 1
@@ -1819,6 +1840,8 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         generation_config: Optional[GenerationConfig] = None,
         use_offline_embs: bool = False,
         use_state_machine_inference: bool = False,
+        dynamic_min_chunk_size: int = 0,
+        dynamic_max_chunk_size: Optional[int] = None,
         **generation_kwargs,
     ) -> list[str]:
         """
@@ -1832,6 +1855,10 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             generation_config: Optional HuggingFace GenerationConfig object.
             use_offline_embs: When True, bypass streaming perception with
                 offline embeddings. Diagnostic use only.
+            dynamic_min_chunk_size: For dynamic chunking — minimum frames before
+                the model is allowed to trigger generation (default 0).
+            dynamic_max_chunk_size: For dynamic chunking — maximum frames before
+                forcing generation. ``None`` means no upper bound (default).
             generation_kwargs: Per-call overrides for generation parameters.
 
         Returns:
@@ -1861,6 +1888,8 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     system_prompt,
                     max_new_tokens,
                     generation_config,
+                    dynamic_min_chunk_size=dynamic_min_chunk_size,
+                    dynamic_max_chunk_size=dynamic_max_chunk_size,
                     **generation_kwargs,
                 )
             else:

@@ -102,6 +102,8 @@ class StreamingSTTEvalConfig:
     use_state_machine_inference: bool = (
         False  # recommended turned off for chunk_size > 0, no effect for chunk_size <= 0
     )
+    dynamic_min_chunk_size: int = 0  # dynamic chunking: min frames before allowing generation
+    dynamic_max_chunk_size: Optional[int] = None  # dynamic chunking: max frames before forcing generation
     generation_config: StreamingSTTGenerationConfig = field(default_factory=StreamingSTTGenerationConfig)
 
 
@@ -162,6 +164,8 @@ def main(cfg: StreamingSTTEvalConfig):
             generation_config=generation_config,
             use_offline_embs=cfg.use_offline_embs,
             use_state_machine_inference=cfg.use_state_machine_inference,
+            dynamic_min_chunk_size=cfg.dynamic_min_chunk_size,
+            dynamic_max_chunk_size=cfg.dynamic_max_chunk_size,
         )
         batch_infer_duration = perf_counter() - ts
 
