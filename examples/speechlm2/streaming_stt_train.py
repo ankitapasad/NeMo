@@ -54,7 +54,7 @@ def train(cfg):
             dataset_cls=StreamingSTTDataset,
         )
 
-    dataset = StreamingSTTDataset(cfg=dataset_cfg, tokenizer=model.tokenizer, defer_get_batch=defer_get_batch)
+    dataset = StreamingSTTDataset(cfg=dataset_cfg, tokenizer=model.tokenizer, defer_get_batch=defer_get_batch, model_cfg=cfg.model)
     datamodule = DataModule(cfg.data, tokenizer=model.tokenizer, dataset=dataset)
 
     trainer.fit(model, datamodule)

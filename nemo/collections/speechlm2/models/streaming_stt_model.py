@@ -144,6 +144,10 @@ class StreamingSTTModelConfig:
     blank_loss_weight: float = 1.0
     log_every_n_steps: int = 10
     dtype: str = "bfloat16"
+    strip_chat_delimiters: bool = False
+    text_start_token: str = "<text_start>"
+    text_end_token: str = "<text_end>"
+    loss_on_text_start: bool = False
 
 
 @dataclass
@@ -199,12 +203,37 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         # loads YAML strings literally without interpreting backslash escapes.
         self.blank_token = self.core_cfg.blank_token.encode().decode('unicode_escape')
 
+        new_special_tokens = []
         if not token_in_vocab(self.blank_token, self.tokenizer):
-            self.tokenizer.add_special_tokens({"additional_special_tokens": [self.blank_token]})
-            self.llm.resize_token_embeddings(len(self.tokenizer.tokenizer))
-            logging.info(f"Added blank token `{self.blank_token}` to tokenizer: {self.blank_token_id}")
+            new_special_tokens.append(self.blank_token)
+
+        if self.core_cfg.strip_chat_delimiters:
+            self.text_start_token = self.core_cfg.text_start_token
+            self.text_end_token = self.core_cfg.text_end_token
+            for tok in [self.text_start_token, self.text_end_token]:
+                if not token_in_vocab(tok, self.tokenizer):
+                    new_special_tokens.append(tok)
         else:
-            logging.info(f"Blank token `{str(self.blank_token)}` already in tokenizer: {self.blank_token_id}")
+            # Inference from checkpoint: tokens may already be in vocab
+            ts_cand, te_cand = "<text_start>", "<text_end>"
+            if token_in_vocab(ts_cand, self.tokenizer) and token_in_vocab(te_cand, self.tokenizer):
+                self.text_start_token = ts_cand
+                self.text_end_token = te_cand
+            else:
+                self.text_start_token = None
+                self.text_end_token = None
+
+        if new_special_tokens:
+            self.tokenizer.add_special_tokens({"additional_special_tokens": new_special_tokens})
+            self.llm.resize_token_embeddings(len(self.tokenizer.tokenizer))
+            logging.info(f"Added special tokens to tokenizer: {new_special_tokens}")
+
+        logging.info(f"blank_token=`{self.blank_token}`, id={self.blank_token_id}")
+        if self.text_start_token:
+            logging.info(
+                f"text_start_token=`{self.text_start_token}`, id={self.text_start_token_id}; "
+                f"text_end_token=`{self.text_end_token}`, id={self.text_end_token_id}"
+            )
 
         # Separate embedding layer to avoid FSDP/TP conflicts (same pattern as SALM)
         self.embed_tokens = self.llm.model.embed_tokens
@@ -236,7 +265,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             assert data_cfg is not None, "Dataset config is required for online forced alignment"
             assert dataset_cls is not None, "Dataset class is required for online forced alignment"
             self.forced_aligner = forced_aligner
-            self.dataset = dataset_cls(cfg=data_cfg, tokenizer=self.tokenizer)
+            self.dataset = dataset_cls(cfg=data_cfg, tokenizer=self.tokenizer, model_cfg=cfg)
         else:
             self.forced_aligner = None
             self.dataset = None
@@ -322,6 +351,18 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
     @property
     def blank_token_id(self) -> int:
         return self.tokenizer.text_to_ids(self.blank_token)[0]
+
+    @property
+    def text_start_token_id(self) -> Optional[int]:
+        if self.text_start_token is None:
+            return None
+        return self.tokenizer.text_to_ids(self.text_start_token)[0]
+
+    @property
+    def text_end_token_id(self) -> Optional[int]:
+        if self.text_end_token is None:
+            return None
+        return self.tokenizer.text_to_ids(self.text_end_token)[0]
 
     # ------------------------------------------------------------------
     # Core: efficient audio-text embedding interleaving
@@ -654,38 +695,63 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
         hf_tok = self.tokenizer.tokenizer
         chunk_size = self.core_cfg.chunk_size
+        strip = self.core_cfg.strip_chat_delimiters
 
         # --- Build turn template ---
         user_header_ids, user_footer_and_asst_header_ids, asst_footer_ids = parse_chat_template_ids(
             hf_tok, last_turn=(chunk_size < 0)
         )
-        self._user_header_ids = user_header_ids
-        self._user_footer_and_asst_header_ids = user_footer_and_asst_header_ids
-        self._asst_footer_ids = asst_footer_ids
 
-        # Always cache user_footer_first_id — needed by state machine inference
-        # for both dynamic (chunk_size=0) and fixed chunking (use_state_machine_inference).
-        self._user_footer_first_id = user_footer_and_asst_header_ids[0] if user_footer_and_asst_header_ids else None
+        if strip:
+            # Custom delimiters: no chat template overhead in inference sequences.
+            ts_id = self.text_start_token_id
+            te_id = self.text_end_token_id
+            self._user_header_ids = []
+            self._user_footer_and_asst_header_ids = [ts_id]
+            self._asst_footer_ids = [te_id]
+            # Always cache user_footer_first_id — needed by state machine inference
+            # for both dynamic (chunk_size=0) and fixed chunking (use_state_machine_inference).
+            self._user_footer_first_id = ts_id
 
-        if chunk_size > 0:
-            turn_ids = user_header_ids + [AUDIO_TOKEN_IDX] * chunk_size + user_footer_and_asst_header_ids
-            self._turn_template_ids = turn_ids
-            n_audio = turn_ids.count(AUDIO_TOKEN_IDX)
-            logging.info(
-                f"Streaming turn template ({len(turn_ids)} tokens, "
-                f"{n_audio} audio slots, chunk_size={chunk_size}): {turn_ids}"
-            )
-        elif chunk_size == 0:
-            # Dynamic chunking: no fixed turn template. Audio frames are fed
-            # incrementally; the user header/footer are appended on demand.
-            self._turn_template_ids = None
-            logging.info(
-                f"Dynamic chunking mode: user_footer_first_id={self._user_footer_first_id}, "
-                f"user_header_ids={user_header_ids}"
-            )
+            if chunk_size > 0:
+                turn_ids = [AUDIO_TOKEN_IDX] * chunk_size + [ts_id]
+                self._turn_template_ids = turn_ids
+                logging.info(
+                    f"Streaming turn template (strip_chat_delimiters, {len(turn_ids)} tokens, "
+                    f"chunk_size={chunk_size}): {turn_ids}"
+                )
+            elif chunk_size == 0:
+                self._turn_template_ids = None
+                logging.info(f"Dynamic chunking mode (strip_chat_delimiters): ready_id={ts_id}")
+            else:
+                self._turn_template_ids = None
+                logging.info(f"Offline mode (strip_chat_delimiters, chunk_size={chunk_size})")
         else:
-            self._turn_template_ids = None
-            logging.info(f"Offline mode (chunk_size={chunk_size}): no fixed turn template")
+            # Original chat template delimiters.
+            self._user_header_ids = user_header_ids
+            self._user_footer_and_asst_header_ids = user_footer_and_asst_header_ids
+            self._asst_footer_ids = asst_footer_ids
+            self._user_footer_first_id = (
+                user_footer_and_asst_header_ids[0] if user_footer_and_asst_header_ids else None
+            )
+
+            if chunk_size > 0:
+                turn_ids = user_header_ids + [AUDIO_TOKEN_IDX] * chunk_size + user_footer_and_asst_header_ids
+                self._turn_template_ids = turn_ids
+                n_audio = turn_ids.count(AUDIO_TOKEN_IDX)
+                logging.info(
+                    f"Streaming turn template ({len(turn_ids)} tokens, "
+                    f"{n_audio} audio slots, chunk_size={chunk_size}): {turn_ids}"
+                )
+            elif chunk_size == 0:
+                self._turn_template_ids = None
+                logging.info(
+                    f"Dynamic chunking mode: user_footer_first_id={self._user_footer_first_id}, "
+                    f"user_header_ids={user_header_ids}"
+                )
+            else:
+                self._turn_template_ids = None
+                logging.info(f"Offline mode (chunk_size={chunk_size}): no fixed turn template")
 
         self._eos_id = getattr(hf_tok, 'eos_token_id', None)
 
@@ -694,11 +760,15 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         # early-stop shortcut that avoids generating the remaining footer
         # tokens.  When eos_token_id is NOT in the footer it serves as a
         # safety-net stop only.
-        self._eos_in_footer = self._eos_id is not None and self._eos_id in self._asst_footer_ids
+        if strip:
+            self._eos_in_footer = False
+        else:
+            self._eos_in_footer = self._eos_id is not None and self._eos_id in self._asst_footer_ids
+
         logging.info(
             f"Assistant footer IDs: {self._asst_footer_ids}, "
             f"blank ID: {self.blank_token_id}, EOS ID: {self._eos_id}, "
-            f"EOS in footer: {self._eos_in_footer}"
+            f"EOS in footer: {self._eos_in_footer}, strip_chat_delimiters: {strip}"
         )
         self._inference_cache_ready = True
 
@@ -1407,7 +1477,8 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
         # --- Per-stream state machine ---
         HEADER, LISTENING, FOOTER, GENERATING, BLANK_FEED, ASST_FOOTER, DONE = range(7)
-        stream_state = [HEADER] * B
+        initial_state = LISTENING if not uh_ids else HEADER
+        stream_state = [initial_state] * B
         template_pos = [0] * B  # position within current template seq
         audio_sample_idx = [0] * B  # next audio sample offset for perception
         gen_token_count = [0] * B  # tokens generated in current GENERATING phase

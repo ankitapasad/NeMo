@@ -24,7 +24,7 @@ import torch.nn.functional as F
 import torch.utils.data
 from lhotse import CutSet
 from lhotse.dataset.collation import collate_audio
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from torch.nn import CrossEntropyLoss
 from torch.nn.utils.rnn import pad_sequence
 
@@ -140,6 +140,69 @@ def decode_with_blank(
     if collapse_whitespace:
         text = re.sub(r'\s+', ' ', text)
     return text
+
+
+def _debug_dump_sequence(messages, input_ids, target_ids, assistant_mask, tokenizer, blank_id):
+    """Print a readable dump of the full input/target sequence for debugging."""
+    hf_tok = tokenizer.tokenizer
+    sep = "=" * 100
+
+    print(f"\n{sep}")
+    print("DEBUG: SEQUENCE DUMP (first sample)")
+    print(sep)
+
+    # 1) Raw messages
+    print("\n--- MESSAGES (role: content) ---")
+    for i, m in enumerate(messages):
+        content = m["content"]
+        if len(content) > 80:
+            content = content[:40] + f"...({len(content)} chars)..." + content[-20:]
+        print(f"  [{i:3d}] {m['role']:>9s}: {repr(content)}")
+
+    # 2) Token-by-token table
+    print(f"\n--- TOKEN TABLE (len={len(input_ids)}) ---")
+    print(f"  {'pos':>5s}  {'input_id':>9s}  {'target_id':>9s}  {'mask':>4s}  {'input_tok':<20s}  {'target_tok':<20s}")
+    print(f"  {'-'*5}  {'-'*9}  {'-'*9}  {'-'*4}  {'-'*20}  {'-'*20}")
+
+    for i in range(len(input_ids)):
+        inp_id = input_ids[i]
+        tgt_id = target_ids[i] if i < len(target_ids) else None
+        mask = assistant_mask[i] if i < len(assistant_mask) else 0
+
+        if inp_id == AUDIO_TOKEN_IDX:
+            inp_tok = "[AUDIO]"
+        else:
+            inp_tok = repr(hf_tok.decode([inp_id]))
+
+        if tgt_id is None or tgt_id == IGNORE_INDEX:
+            tgt_tok = "---"
+            tgt_id_str = "IGNORE"
+        elif tgt_id == AUDIO_TOKEN_IDX:
+            tgt_tok = "[AUDIO]"
+            tgt_id_str = str(tgt_id)
+        else:
+            tgt_tok = repr(hf_tok.decode([tgt_id]))
+            tgt_id_str = str(tgt_id)
+
+        mask_str = "*" if mask else "."
+
+        print(f"  {i:5d}  {str(inp_id):>9s}  {tgt_id_str:>9s}  {mask_str:>4s}  {inp_tok:<20s}  {tgt_tok:<20s}")
+
+    # 3) Summary stats
+    n_audio = sum(1 for x in input_ids if x == AUDIO_TOKEN_IDX)
+    n_blank_tgt = sum(1 for x in target_ids if x == blank_id)
+    n_loss = sum(1 for x in target_ids if x != IGNORE_INDEX)
+    n_mask = sum(assistant_mask)
+    print(f"\n--- SUMMARY ---")
+    print(f"  Total tokens:       {len(input_ids)}")
+    print(f"  Audio frames:       {n_audio}")
+    print(f"  Assistant mask sum: {n_mask} ({n_mask/len(input_ids):.3f})")
+    print(f"  Loss positions:     {n_loss} ({n_loss/len(input_ids):.3f})")
+    print(f"  Blank targets:      {n_blank_tgt}")
+    print(f"  blank_id={blank_id}, AUDIO_TOKEN_IDX={AUDIO_TOKEN_IDX}, IGNORE_INDEX={IGNORE_INDEX}")
+    print(sep + "\n")
+
+    # breakpoint()
 
 
 def compute_word_spans(
@@ -600,6 +663,86 @@ def _tokenize_with_assistant_mask(
     return input_ids, assistant_mask
 
 
+def _strip_chat_delimiters(
+    input_ids: list[int],
+    user_header_ids: list[int],
+    uf_ah_ids: list[int],
+    asst_footer_ids: list[int],
+    text_start_id: int,
+    text_end_id: int,
+    hf_tok,
+    loss_on_text_start: bool = False,
+) -> tuple[list[int], list[int]]:
+    """Strip chat template delimiters and replace with custom tokens.
+
+    Keeps the system prompt (everything before the first ``user_header_ids``).
+    For each subsequent turn pair:
+      - ``user_header_ids`` is removed
+      - ``user_footer_and_asst_header_ids`` is replaced with ``text_start_id``
+      - ``asst_footer_ids`` is replaced with ``text_end_id``
+      - thinking tags (``<think>\\n\\n</think>\\n\\n``) are stripped
+
+    Returns ``(new_ids, assistant_mask)`` where the mask covers content tokens
+    and ``text_end_id`` (always), and optionally ``text_start_id``.
+    """
+    uh_len = len(user_header_ids)
+    ufah_len = len(uf_ah_ids)
+    af_len = len(asst_footer_ids)
+
+    # Build think-tag pattern to strip (e.g. Qwen3: <think>\n\n</think>\n\n)
+    think_ids = hf_tok.encode("<think>\n\n</think>\n\n", add_special_tokens=False)
+    think_len = len(think_ids)
+
+    def _matches(ids, pos, pattern):
+        plen = len(pattern)
+        return pos + plen <= len(ids) and ids[pos : pos + plen] == pattern
+
+    # Find start of first user header (end of system prompt)
+    first_uh = None
+    for k in range(len(input_ids) - uh_len + 1):
+        if input_ids[k : k + uh_len] == user_header_ids:
+            first_uh = k
+            break
+
+    new_ids = []
+    if first_uh is not None:
+        new_ids.extend(input_ids[:first_uh])
+        i = first_uh
+    else:
+        i = 0
+
+    while i < len(input_ids):
+        if _matches(input_ids, i, user_header_ids):
+            i += uh_len
+        elif _matches(input_ids, i, uf_ah_ids):
+            new_ids.append(text_start_id)
+            i += ufah_len
+        elif af_len > 0 and _matches(input_ids, i, asst_footer_ids):
+            new_ids.append(text_end_id)
+            i += af_len
+        elif think_len > 0 and _matches(input_ids, i, think_ids):
+            i += think_len
+        else:
+            new_ids.append(input_ids[i])
+            i += 1
+
+    # Build assistant mask from <text_start>/<text_end> positions
+    mask = [0] * len(new_ids)
+    in_assistant = False
+    for j, tid in enumerate(new_ids):
+        if tid == text_start_id:
+            in_assistant = True
+            if loss_on_text_start:
+                mask[j] = 1
+        elif tid == text_end_id:
+            mask[j] = 1
+            in_assistant = False
+        elif in_assistant:
+            mask[j] = 1
+
+    return new_ids, mask
+
+
 def _replace_audio_chunks(
     token_ids: list[int],
     chunk_ids: list[int],
@@ -645,13 +788,20 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
     Operates directly on Lhotse Cuts (no NeMoMultimodalConversation wrapper).
     """
 
-    def __init__(self, cfg: DictConfig | dict, tokenizer: AutoTokenizer, defer_get_batch: bool = False):
+    def __init__(
+        self,
+        cfg: DictConfig | dict,
+        tokenizer: AutoTokenizer,
+        defer_get_batch: bool = False,
+        model_cfg: DictConfig | dict | None = None,
+    ):
         """
         Args:
             cfg: Configuration for the dataset.
             tokenizer: Tokenizer for the dataset.
             defer_get_batch: If True, defer the get_batch_data call to the __getitem__ method and let the model do it.
                 This is used in online forced alignment mode.
+            model_cfg: Model configuration (provides strip_chat_delimiters, token names, loss_on_text_start).
         """
         self.defer_get_batch = defer_get_batch
         self.tokenizer = tokenizer
@@ -686,13 +836,44 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             )
         self.blank_id = blank_ids[0]
 
-        # For dynamic chunking (chunk_size=0): cache the first token of the
-        # user footer sequence (e.g. <|im_end|>).  This is the target the model
-        # predicts at the last audio frame of each chunk to signal "ready to transcribe".
+        # Read custom delimiter settings from model config (single source of truth).
+        _mcfg = model_cfg or {}
+        if isinstance(_mcfg, DictConfig):
+            _mcfg = OmegaConf.to_container(_mcfg, resolve=True)
+        self._strip_chat_delimiters = _mcfg.get("strip_chat_delimiters", False)
+        self._loss_on_text_start = _mcfg.get("loss_on_text_start", False)
+
+        # Cache structural token sequences for chat template processing.
+        hf_tok = self.tokenizer.tokenizer
+        user_header_ids, user_footer_and_asst_header_ids, asst_footer_ids = parse_chat_template_ids(hf_tok)
+
+        if self._strip_chat_delimiters:
+            self._user_header_ids = user_header_ids
+            self._uf_ah_ids = user_footer_and_asst_header_ids
+            self._asst_footer_ids = asst_footer_ids
+            ts_token = _mcfg.get("text_start_token", "<text_start>")
+            te_token = _mcfg.get("text_end_token", "<text_end>")
+            self._text_start_id = hf_tok.convert_tokens_to_ids(ts_token)
+            self._text_end_id = hf_tok.convert_tokens_to_ids(te_token)
+            logging.info(
+                f"strip_chat_delimiters=True: text_start_id={self._text_start_id}, "
+                f"text_end_id={self._text_end_id}"
+            )
+        else:
+            self._user_header_ids = None
+            self._uf_ah_ids = None
+            self._asst_footer_ids = None
+            self._text_start_id = None
+            self._text_end_id = None
+
+        # For dynamic chunking (chunk_size=0): cache the "ready" target token.
+        # With custom delimiters this is text_start_id; otherwise it's the first
+        # token of the user footer (e.g. <|im_end|>).
         if self.cfg.chunk_size == 0:
-            hf_tok = self.tokenizer.tokenizer
-            _, user_footer_and_asst_header_ids, _ = parse_chat_template_ids(hf_tok)
-            self._user_footer_first_id = user_footer_and_asst_header_ids[0]
+            if self._strip_chat_delimiters:
+                self._user_footer_first_id = self._text_start_id
+            else:
+                self._user_footer_first_id = user_footer_and_asst_header_ids[0]
         else:
             self._user_footer_first_id = None
 
@@ -776,6 +957,19 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
                         input_ids, chunk_ids, n_tags, mask=assistant_mask
                     )
 
+            # Strip chat template delimiters and replace with custom tokens.
+            if self._strip_chat_delimiters:
+                input_ids, assistant_mask = _strip_chat_delimiters(
+                    input_ids,
+                    self._user_header_ids,
+                    self._uf_ah_ids,
+                    self._asst_footer_ids,
+                    self._text_start_id,
+                    self._text_end_id,
+                    self.tokenizer.tokenizer,
+                    loss_on_text_start=self._loss_on_text_start,
+                )
+
             # Build targets: next-token prediction with loss only on assistant content.
             # target[i] corresponds to input[i] and holds the token at position i+1.
             # Loss is applied only where assistant_mask[i+1] is True.
@@ -793,6 +987,11 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
                         continue
                     next_is_audio = i + 1 < len(input_ids) and input_ids[i + 1] == AUDIO_TOKEN_IDX
                     target_ids[i] = self.blank_id if next_is_audio else user_footer_id
+
+            # === DEBUG: dump first sample's full sequence ===
+            if sample_idx == 0:
+                _debug_dump_sequence(messages, input_ids, target_ids, assistant_mask, self.tokenizer, self.blank_id)
+            # === END DEBUG ===
 
             all_input_ids.append(torch.tensor(input_ids, dtype=torch.long))
             all_target_ids.append(torch.tensor(target_ids, dtype=torch.long))
