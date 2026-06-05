@@ -30,6 +30,43 @@ class WordAlignment:
     text: str
     start_time: float
     end_time: float
+    delay_frames: Optional[int] = None
+
+
+def add_utterance_boundary_alignments(
+    alignments: List[WordAlignment],
+    audio_duration_secs: float,
+    start_token: str,
+    end_token: str,
+    margin_secs: float = 0.16,
+    delay_frames: int = 0,
+) -> List[WordAlignment]:
+    """Add proxy SoU/EoU alignments derived from first/last word timestamps."""
+    if not alignments:
+        return alignments
+
+    first_word = alignments[0]
+    last_word = alignments[-1]
+    sou_end = min(audio_duration_secs, max(0.0, first_word.start_time))
+    sou_start = sou_end
+    eou_start = min(audio_duration_secs, max(0.0, last_word.end_time + margin_secs))
+    eou_end = eou_start
+
+    return [
+        WordAlignment(
+            text=start_token,
+            start_time=sou_start,
+            end_time=sou_end,
+            delay_frames=delay_frames,
+        ),
+        *alignments,
+        WordAlignment(
+            text=end_token,
+            start_time=eou_start,
+            end_time=eou_end,
+            delay_frames=delay_frames,
+        ),
+    ]
 
 
 class ForcedAligner(ABC):

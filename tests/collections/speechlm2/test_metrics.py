@@ -15,8 +15,121 @@ import pytest
 import torch
 
 from nemo.collections.speechlm2.parts.metrics import BLEU, WER, Intelligibility
+from nemo.collections.speechlm2.parts.metrics.boundary import compute_boundary_token_metrics, count_boundary_collar_hits
 from nemo.collections.speechlm2.parts.metrics.empty_text import EmptyTextMetric
 from nemo.collections.speechlm2.parts.metrics.perplexity import Perplexity
+
+
+def test_boundary_token_metrics_collar_hits():
+    audio = -200
+    ignore = -100
+    sou = 10
+    eou = 11
+    other = 99
+    input_tokens = torch.tensor(
+        [
+            [audio, audio, 1, audio, 2, 3],
+            [audio, 7, audio, 8, audio, 9],
+        ]
+    )
+    target_ids = torch.tensor(
+        [
+            [other, sou, ignore, eou, other, ignore],
+            [ignore, sou, other, other, eou, ignore],
+        ]
+    )
+    pred_ids = torch.tensor(
+        [
+            [sou, other, other, other, eou, other],
+            [other, sou, other, other, eou, sou],
+        ]
+    )
+
+    metrics = compute_boundary_token_metrics(
+        pred_ids=pred_ids,
+        target_ids=target_ids,
+        input_tokens=input_tokens,
+        sou_id=sou,
+        eou_id=eou,
+        ignore_index=ignore,
+        audio_token_idx=audio,
+    )
+
+    assert metrics["num_samples"].item() == 2
+    assert metrics["sou_target_count"].item() == 2
+    assert metrics["eou_target_count"].item() == 2
+    assert metrics["sou_pred_count"].item() == 2
+    assert metrics["eou_pred_count"].item() == 2
+    assert metrics["sou_collar_hit"].item() == 2
+    assert metrics["eou_collar_hit"].item() == 2
+    assert "boundary_collar_hit" not in metrics
+
+
+def test_boundary_token_metrics_ignore_positions_do_not_count_predictions():
+    audio = -200
+    ignore = -100
+    sou = 10
+    eou = 11
+    input_tokens = torch.tensor([[audio, audio, audio]])
+    target_ids = torch.tensor([[ignore, ignore, ignore]])
+    pred_ids = torch.tensor([[sou, eou, sou]])
+
+    metrics = compute_boundary_token_metrics(
+        pred_ids=pred_ids,
+        target_ids=target_ids,
+        input_tokens=input_tokens,
+        sou_id=sou,
+        eou_id=eou,
+        ignore_index=ignore,
+        audio_token_idx=audio,
+    )
+
+    assert metrics["sou_target_count"].item() == 0
+    assert metrics["eou_target_count"].item() == 0
+    assert metrics["sou_pred_count"].item() == 0
+    assert metrics["eou_pred_count"].item() == 0
+    assert metrics["sou_collar_hit"].item() == 0
+    assert metrics["eou_collar_hit"].item() == 0
+
+
+def test_count_boundary_collar_hits_counts_each_target_once():
+    target_mask = torch.tensor([[False, True, False, True]])
+    pred_mask = torch.tensor([[True, True, True, True]])
+    frame_idx = torch.tensor([[1, 2, 2, 3]])
+
+    hits = count_boundary_collar_hits(
+        target_mask=target_mask,
+        pred_mask=pred_mask,
+        frame_idx=frame_idx,
+        before_frames=4,
+        after_frames=4,
+    )
+
+    assert hits.item() == 2
+
+
+def test_boundary_token_metrics_default_collars():
+    audio = -200
+    ignore = -100
+    sou = 10
+    eou = 11
+    other = 99
+    input_tokens = torch.tensor([[audio, audio, audio, audio, audio, audio, audio]])
+    target_ids = torch.tensor([[other, sou, other, other, eou, other, other]])
+    pred_ids = torch.tensor([[other, other, eou, other, other, sou, other]])
+
+    metrics = compute_boundary_token_metrics(
+        pred_ids=pred_ids,
+        target_ids=target_ids,
+        input_tokens=input_tokens,
+        sou_id=sou,
+        eou_id=eou,
+        ignore_index=ignore,
+        audio_token_idx=audio,
+    )
+
+    assert metrics["sou_collar_hit"].item() == 1
+    assert metrics["eou_collar_hit"].item() == 1
 
 
 def test_bleu():

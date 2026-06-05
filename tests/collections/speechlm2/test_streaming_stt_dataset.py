@@ -29,12 +29,15 @@ The primary reference is the docstring example in get_llm_messages_for_sample:
 """
 
 import math
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 from nemo.collections.speechlm2.data.streaming_stt_dataset import (
     AUDIO_TOKEN_IDX,
     IGNORE_INDEX,
+    StreamingSTTDataset,
     _replace_audio_chunks,
     _tokenize_compact_with_assistant_mask,
     _tokenize_with_assistant_mask,
@@ -44,7 +47,7 @@ from nemo.collections.speechlm2.data.streaming_stt_dataset import (
     get_llm_messages_for_batch,
     get_llm_messages_for_sample,
 )
-from nemo.collections.speechlm2.parts.alignments import WordAlignment
+from nemo.collections.speechlm2.parts.alignments import WordAlignment, add_utterance_boundary_alignments
 
 # ---------------------------------------------------------------------------
 # Shared constants & helpers matching the docstring example
@@ -186,7 +189,9 @@ class _MockHFTokenizer:
             input_ids.extend(footer)
             assistant_masks.extend([0] * len(footer))
 
-        return {"input_ids": input_ids, "assistant_masks": assistant_masks}
+        if kwargs.get("return_dict", False):
+            return {"input_ids": input_ids, "assistant_masks": assistant_masks}
+        return input_ids
 
 
 class _MockHFTokenizerMultiToken(_MockHFTokenizer):
@@ -245,6 +250,7 @@ class _MockNemoTokenizer:
 
     def __init__(self, hf_tok):
         self.tokenizer = hf_tok
+        self.pad_id = 0
 
 
 def _run_pipeline(messages, mock_hf_tok, chunk_size=CHUNK_SIZE):
@@ -318,6 +324,70 @@ class TestGetLlmMessagesForSample:
         asst = [m["content"] for m in msgs if m["role"] == "assistant"]
         assert asst[:3] == [BLANK_TOKEN, BLANK_TOKEN, BLANK_TOKEN]
         assert asst[3] == "Hello"
+
+    def test_per_alignment_delay_overrides_default_delay(self):
+        alignments = [
+            WordAlignment(text="<sou>", start_time=0.0, end_time=0.16, delay_frames=0),
+            WordAlignment(text="Hello", start_time=0.16, end_time=0.48),
+        ]
+        msgs = _make_messages(num_delay_frames=2, alignments=alignments)
+        asst = [m["content"] for m in msgs if m["role"] == "assistant"]
+        assert asst[:4] == ["<sou>", BLANK_TOKEN, BLANK_TOKEN, "Hello"]
+
+    def test_boundary_alignment_flushes_before_words_per_group(self):
+        alignments = [
+            WordAlignment(text="<sou>", start_time=0.0, end_time=0.16, delay_frames=0),
+            WordAlignment(text="Hello", start_time=0.16, end_time=0.48),
+        ]
+        msgs = _make_messages(alignments=alignments, words_per_group=2)
+        emitted = [m["content"] for m in msgs if m["role"] == "assistant" and m["content"] != BLANK_TOKEN]
+        assert emitted == ["<sou>", "Hello"]
+
+    def test_eou_waits_for_delayed_final_word(self):
+        alignments = [
+            WordAlignment(text="Hello", start_time=0.16, end_time=0.48),
+            WordAlignment(text="<eou>", start_time=0.48, end_time=0.48, delay_frames=0),
+        ]
+        msgs = _make_messages(num_delay_frames=2, alignments=alignments)
+        emitted = [m["content"] for m in msgs if m["role"] == "assistant" and m["content"] != BLANK_TOKEN]
+        assert emitted == ["Hello <eou>"]
+
+    def test_boundary_tokens_preserve_transcript_punctuation(self):
+        alignments = [
+            WordAlignment(text="Hello", start_time=0.16, end_time=0.48),
+            WordAlignment(text="<eou>", start_time=0.48, end_time=0.48, delay_frames=0),
+        ]
+        msgs = _make_messages(num_delay_frames=2, alignments=alignments, transcript="Hello!")
+        emitted = [m["content"] for m in msgs if m["role"] == "assistant" and m["content"] != BLANK_TOKEN]
+        assert emitted == ["Hello! <eou>"]
+
+    def test_add_utterance_boundary_alignments_uses_word_proxy(self):
+        alignments = add_utterance_boundary_alignments(
+            DOCSTRING_ALIGNMENTS,
+            audio_duration_secs=1.0,
+            start_token="<sou>",
+            end_token="<eou>",
+            margin_secs=0.16,
+            delay_frames=0,
+        )
+        assert [a.text for a in alignments] == ["<sou>", "Hello", "World", "<eou>"]
+        assert alignments[0].start_time == 0.16
+        assert alignments[0].end_time == 0.16
+        assert alignments[-1].start_time == pytest.approx(0.96)
+        assert alignments[-1].end_time == pytest.approx(0.96)
+        assert alignments[0].delay_frames == 0
+        assert alignments[-1].delay_frames == 0
+
+    def test_add_utterance_boundary_alignments_empty_is_noop(self):
+        assert (
+            add_utterance_boundary_alignments(
+                [],
+                audio_duration_secs=1.0,
+                start_token="<sou>",
+                end_token="<eou>",
+            )
+            == []
+        )
 
     def test_empty_alignments_all_blank(self):
         msgs = _make_messages(alignments=[])
@@ -819,6 +889,74 @@ class TestGetLlmMessagesForBatch:
         )
         assert batch[0][0] == {"role": SYSTEM_ROLE, "content": "Transcribe in English."}
         assert batch[1][0] == {"role": SYSTEM_ROLE, "content": "Transcribe in French."}
+
+
+# ===========================================================================
+# Tests: StreamingSTTDataset boundary-token integration
+# ===========================================================================
+class TestStreamingSTTDatasetBoundaryIntegration:
+
+    def _make_dataset(self, add_boundaries=True):
+        tok = _MockNemoTokenizer(_MockHFTokenizer())
+        cfg = {
+            "sample_rate": 16000,
+            "frame_length_in_secs": FRAME_LEN,
+            "chunk_size": CHUNK_SIZE,
+            "num_delay_frames": 2,
+            "audio_tag": AUDIO_TAG,
+            "blank_token": BLANK_TOKEN,
+            "system_role": SYSTEM_ROLE,
+            "system_prompt": SYSTEM_PROMPT,
+            "add_utterance_boundary_tokens": add_boundaries,
+            "utterance_start_token": "<sou>",
+            "utterance_end_token": "<eou>",
+            "utterance_boundary_margin_secs": 0.16,
+            "utterance_boundary_delay_frames": 0,
+        }
+        return StreamingSTTDataset(cfg=cfg, tokenizer=tok)
+
+    def test_get_batch_data_inserts_boundary_targets(self):
+        dataset = self._make_dataset(add_boundaries=True)
+        hf = dataset.tokenizer.tokenizer
+        cuts = [SimpleNamespace(custom={})]
+        audios = torch.zeros(1, 16000)
+        audio_lens = torch.tensor([16000])
+        alignments = [[WordAlignment(text="Hello", start_time=0.16, end_time=0.48)]]
+
+        batch = dataset.get_batch_data(
+            cuts=cuts,
+            audios=audios,
+            audio_lens=audio_lens,
+            alignments=alignments,
+            text=["Hello"],
+        )
+
+        valid_targets = [tid for tid in batch.target_tokens[0].tolist() if tid != IGNORE_INDEX]
+        sou_id = hf._content_cache["<sou>"][0]
+        eou_id = hf._content_cache["Hello <eou>"][1]
+        assert sou_id in valid_targets
+        assert eou_id in valid_targets
+
+    def test_get_batch_data_leaves_targets_unchanged_when_disabled(self):
+        dataset = self._make_dataset(add_boundaries=False)
+        hf = dataset.tokenizer.tokenizer
+        cuts = [SimpleNamespace(custom={})]
+        audios = torch.zeros(1, 16000)
+        audio_lens = torch.tensor([16000])
+        alignments = [[WordAlignment(text="Hello", start_time=0.16, end_time=0.48)]]
+
+        batch = dataset.get_batch_data(
+            cuts=cuts,
+            audios=audios,
+            audio_lens=audio_lens,
+            alignments=alignments,
+            text=["Hello"],
+        )
+
+        valid_targets = [tid for tid in batch.target_tokens[0].tolist() if tid != IGNORE_INDEX]
+        assert "<sou>" not in hf._content_cache
+        assert "Hello <eou>" not in hf._content_cache
+        assert hf._content_cache["Hello"][0] in valid_targets
 
 
 # ===========================================================================
@@ -1848,6 +1986,42 @@ class TestCompactTemplate:
         """A write_token that tokenizes to >1 piece should fail loudly."""
         with pytest.raises(ValueError, match="must encode to exactly 1 token"):
             build_compact_turn_markers(qwen3_hf, "this is definitely not one token")
+
+    def test_build_compact_turn_markers_custom_end_token(self):
+        hf = _MockHFTokenizer()
+        start_id = hf.encode("<|te_start|>", add_special_tokens=False)[0]
+        end_id = hf.encode("<|te_end|>", add_special_tokens=False)[0]
+
+        uh, ufah, af = build_compact_turn_markers(hf, "<|te_start|>", end_token="<|te_end|>")
+
+        assert uh == []
+        assert ufah == [start_id]
+        assert af == [end_id]
+
+    def test_build_compact_turn_markers_multi_token_end_raises(self):
+        hf = _MockHFTokenizer()
+
+        with pytest.raises(ValueError, match="end_token .* exactly 1 token"):
+            build_compact_turn_markers(hf, "<|te_start|>", end_token="not one")
+
+    def test_tokenize_compact_custom_end_token_masked(self):
+        hf = _MockHFTokenizer()
+        tok = _MockNemoTokenizer(hf)
+        write_id = hf.encode("<|te_start|>", add_special_tokens=False)[0]
+        end_id = hf.encode("<|te_end|>", add_special_tokens=False)[0]
+        messages = [
+            {"role": "system", "content": "S."},
+            {"role": "user", "content": "<audio><audio>"},
+            {"role": "assistant", "content": "hello"},
+        ]
+
+        input_ids, mask = _tokenize_compact_with_assistant_mask(messages, tok, write_id, end_id)
+
+        assert input_ids[-1] == end_id
+        assert mask[-1] == 1
+        inserted_write_positions = [idx for idx, token_id in enumerate(input_ids) if token_id == write_id and mask[idx]]
+        assert len(inserted_write_positions) == 1
+        assert mask[inserted_write_positions[0]] == 1
 
     def test_tokenize_compact_structure(self, qwen3_tok):
         """Sequence shape: [system_wrapped] [<audio>*N <|im_start|> text <|im_end|>] * K."""

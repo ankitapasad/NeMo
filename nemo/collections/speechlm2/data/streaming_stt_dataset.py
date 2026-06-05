@@ -14,6 +14,7 @@
 
 import logging
 import math
+import os
 import re
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Union
@@ -30,11 +31,80 @@ from torch.nn.utils.rnn import pad_sequence
 
 from nemo.collections.common.tokenizers import AutoTokenizer
 from nemo.collections.speechlm2.data.salm_dataset import left_collate_vectors
-from nemo.collections.speechlm2.parts.alignments import WordAlignment, get_word_alignments_for_batch
+from nemo.collections.speechlm2.parts.alignments import (
+    WordAlignment,
+    add_utterance_boundary_alignments,
+    get_word_alignments_for_batch,
+)
 from nemo.collections.speechlm2.parts.utils import to_dataclass
 
 AUDIO_TOKEN_IDX = -200
 IGNORE_INDEX = -100
+
+
+def _debug_dump_sequence(
+    messages, input_ids, target_ids, assistant_mask, tokenizer, blank_id, transcript=None, do_breakpoint=False
+):
+    """Print a readable dump of the full input/target sequence for debugging."""
+    hf_tok = tokenizer.tokenizer
+    sep = "=" * 100
+
+    print(f"\n{sep}")
+    print("DEBUG: SEQUENCE DUMP (first sample)")
+    print(sep)
+
+    # print("\n--- MESSAGES (role: content) ---")
+    # for i, msg in enumerate(messages):
+    #     content = msg["content"]
+    #     if len(content) > 80:
+    #         content = content[:40] + f"...({len(content)} chars)..." + content[-20:]
+    #     print(f"  [{i:3d}] {msg['role']:>9s}: {repr(content)}")
+
+    if transcript is not None:
+        print(f"\n--- TRANSCRIPT ---\n{repr(transcript)}")
+
+    print(f"\n--- TOKEN TABLE (len={len(input_ids)}) ---")
+    print(f"  {'pos':>5s}  {'input_id':>9s}  {'target_id':>9s}  {'mask':>4s}  {'input_tok':<20s}  {'target_tok':<20s}")
+    print(f"  {'-' * 5}  {'-' * 9}  {'-' * 9}  {'-' * 4}  {'-' * 20}  {'-' * 20}")
+
+    for i in range(len(input_ids)):
+        inp_id = input_ids[i]
+        tgt_id = target_ids[i] if i < len(target_ids) else None
+        mask = assistant_mask[i] if i < len(assistant_mask) else 0
+
+        if inp_id == AUDIO_TOKEN_IDX:
+            inp_tok = "[AUDIO]"
+        else:
+            inp_tok = repr(hf_tok.decode([inp_id]))
+
+        if tgt_id is None or tgt_id == IGNORE_INDEX:
+            tgt_tok = "---"
+            tgt_id_str = "IGNORE"
+        elif tgt_id == AUDIO_TOKEN_IDX:
+            tgt_tok = "[AUDIO]"
+            tgt_id_str = str(tgt_id)
+        else:
+            tgt_tok = repr(hf_tok.decode([tgt_id]))
+            tgt_id_str = str(tgt_id)
+
+        mask_str = "*" if mask else "."
+        print(f"  {i:5d}  {str(inp_id):>9s}  {tgt_id_str:>9s}  {mask_str:>4s}  {inp_tok:<20s}  {tgt_tok:<20s}")
+
+    n_audio = sum(1 for token_id in input_ids if token_id == AUDIO_TOKEN_IDX)
+    n_blank_tgt = sum(1 for token_id in target_ids if token_id == blank_id)
+    n_loss = sum(1 for token_id in target_ids if token_id != IGNORE_INDEX)
+    n_mask = sum(assistant_mask)
+    print("\n--- SUMMARY ---")
+    print(f"  Total tokens:       {len(input_ids)}")
+    print(f"  Audio frames:       {n_audio}")
+    print(f"  Assistant mask sum: {n_mask} ({n_mask / len(input_ids):.3f})")
+    print(f"  Loss positions:     {n_loss} ({n_loss / len(input_ids):.3f})")
+    print(f"  Blank targets:      {n_blank_tgt}")
+    print(f"  blank_id={blank_id}, AUDIO_TOKEN_IDX={AUDIO_TOKEN_IDX}, IGNORE_INDEX={IGNORE_INDEX}")
+    print(sep + "\n")
+
+    if do_breakpoint:
+        breakpoint()
 
 
 def right_collate_vectors(
@@ -86,6 +156,14 @@ class StreamingSTTDataConfig:
     prompt_field: str = "system_prompt"
     compact_template: bool = False
     write_token: str = "<|im_start|>"
+    use_te_tokens: bool = False
+    te_start_token: str = "<|te_start|>"
+    te_end_token: str = "<|te_end|>"
+    add_utterance_boundary_tokens: bool = False
+    utterance_start_token: str = "<sou>"
+    utterance_end_token: str = "<eou>"
+    utterance_boundary_margin_secs: float = 0.16
+    utterance_boundary_delay_frames: int = 0
     # K — only effective in dynamic chunking (chunk_size == 0). Each audio
     # segment is rounded UP to a multiple of K frames (and total audio is
     # padded to K-multiple). The model implicitly learns to emit only at
@@ -224,6 +302,43 @@ def compute_word_spans(
     return spans
 
 
+def _alignment_delay_frames(word: WordAlignment, default_delay_frames: int) -> int:
+    return default_delay_frames if word.delay_frames is None else word.delay_frames
+
+
+def _alignment_ready_frame(word: WordAlignment, frame_length_in_secs: float, default_delay_frames: int) -> int:
+    return math.ceil(word.end_time / frame_length_in_secs) + _alignment_delay_frames(word, default_delay_frames)
+
+
+def _append_alignment_text(content: str, text: str) -> str:
+    if not content:
+        return text
+    if text.startswith(" ") or content.endswith(" "):
+        return content + text
+    return content + " " + text
+
+
+def _build_alignment_content(
+    alignments: List[WordAlignment],
+    indices: List[int],
+    word_spans: Optional[List[tuple[int, int] | None]],
+    transcript: Optional[str],
+) -> str:
+    content = ""
+    for idx in indices:
+        span = word_spans[idx] if word_spans and transcript else None
+        if span is not None:
+            piece = transcript[span[0] : span[1]]
+        else:
+            piece = alignments[idx].text
+        content = _append_alignment_text(content, piece)
+    return content
+
+
+def _buffer_has_forced_alignment(alignments: List[WordAlignment], indices: List[int]) -> bool:
+    return any(alignments[i].delay_frames is not None for i in indices)
+
+
 def get_llm_messages_for_sample(
     system_role: str,
     system_prompt: str,
@@ -321,14 +436,19 @@ def get_llm_messages_for_sample(
             word_buffer.append(word_idx)
 
             # Emit when buffer reaches words_per_group or this is the last word
-            if len(word_buffer) < words_per_group and word_idx < len(alignments) - 1:
+            if (
+                len(word_buffer) < words_per_group
+                and word_idx < len(alignments) - 1
+                and not _buffer_has_forced_alignment(alignments, word_buffer)
+            ):
                 continue
 
             # Chunk boundary = end frame of the last word in this group, snapped
             # UP to the next multiple of K. num_frames here is already K-padded
             # (caller guarantees this), so the clamp keeps things K-aligned.
-            last_word = alignments[word_buffer[-1]]
-            group_end_frame = math.ceil(last_word.end_time / frame_length_in_secs) + num_delay_frames
+            group_end_frame = max(
+                _alignment_ready_frame(alignments[i], frame_length_in_secs, num_delay_frames) for i in word_buffer
+            )
             if K > 1:
                 group_end_frame = ((group_end_frame + K - 1) // K) * K
             group_end_frame = min(group_end_frame, num_frames)
@@ -337,16 +457,8 @@ def get_llm_messages_for_sample(
             if n_frames_chunk > 0:
                 messages.append({"role": "user", "content": audio_tag * n_frames_chunk})
 
-            # Build assistant content from all buffered words
-            if word_spans and transcript:
-                first_span = word_spans[word_buffer[0]]
-                last_span = word_spans[word_buffer[-1]]
-                if first_span is not None and last_span is not None:
-                    content = transcript[first_span[0] : last_span[1]]
-                else:
-                    content = " ".join(alignments[i].text for i in word_buffer)
-            else:
-                content = " ".join(alignments[i].text for i in word_buffer)
+            # Build assistant content from all buffered words.
+            content = _build_alignment_content(alignments, word_buffer, word_spans, transcript)
 
             if n_frames_chunk <= 0 and messages[-1]["role"] == "assistant":
                 # Words at same boundary as previous group — append
@@ -375,8 +487,7 @@ def get_llm_messages_for_sample(
             # Collect indices of words whose end_time (in frames) + delay <= chunk_end_frame
             while word_idx < len(alignments):
                 word = alignments[word_idx]
-                word_end_frame = math.ceil(word.end_time / frame_length_in_secs)
-                ready_frame = word_end_frame + num_delay_frames
+                ready_frame = _alignment_ready_frame(word, frame_length_in_secs, num_delay_frames)
                 if ready_frame <= chunk_end_frame:
                     word_buffer.append(word_idx)
                     word_idx += 1
@@ -385,16 +496,12 @@ def get_llm_messages_for_sample(
 
             # Emit words when buffer reaches words_per_group, or at the last chunk
             is_last_chunk = chunk_i == num_chunks - 1
-            if word_buffer and (len(word_buffer) >= words_per_group or is_last_chunk):
-                if word_spans and transcript:
-                    first_span = word_spans[word_buffer[0]]
-                    last_span = word_spans[word_buffer[-1]]
-                    if first_span is not None and last_span is not None:
-                        content = transcript[first_span[0] : last_span[1]]
-                    else:
-                        content = " ".join(alignments[i].text for i in word_buffer)
-                else:
-                    content = " ".join(alignments[i].text for i in word_buffer)
+            if word_buffer and (
+                len(word_buffer) >= words_per_group
+                or is_last_chunk
+                or _buffer_has_forced_alignment(alignments, word_buffer)
+            ):
+                content = _build_alignment_content(alignments, word_buffer, word_spans, transcript)
                 messages.append({"role": "assistant", "content": content})
                 word_buffer = []
             else:
@@ -404,15 +511,7 @@ def get_llm_messages_for_sample(
         # them past the last chunk boundary, or alignment end_time > audio_duration).
         if word_idx < len(alignments):
             residual_indices = list(range(word_idx, len(alignments)))
-            if word_spans and transcript:
-                first_span = word_spans[residual_indices[0]]
-                last_span = word_spans[residual_indices[-1]]
-                if first_span is not None and last_span is not None:
-                    content = transcript[first_span[0] : last_span[1]]
-                else:
-                    content = " ".join(alignments[i].text for i in residual_indices)
-            else:
-                content = " ".join(alignments[i].text for i in residual_indices)
+            content = _build_alignment_content(alignments, residual_indices, word_spans, transcript)
             if messages[-1]["role"] == "assistant" and messages[-1]["content"] == blank_token:
                 messages[-1]["content"] = content
             elif messages[-1]["role"] == "assistant":
@@ -565,13 +664,17 @@ def parse_chat_template_ids(hf_tok, last_turn: bool = False) -> tuple[list[int],
     return user_header_ids, user_footer_and_asst_header_ids, asst_footer_ids
 
 
-def build_compact_turn_markers(hf_tok, write_token: str) -> tuple[list[int], list[int], list[int]]:
+def build_compact_turn_markers(
+    hf_tok,
+    write_token: str,
+    end_token: Optional[str] = None,
+) -> tuple[list[int], list[int], list[int]]:
     """Return the compact-format analogue of ``parse_chat_template_ids``.
 
     Compact format drops the user/assistant role delimiters: turns look like
-    ``<audio>*N <write_token> TEXT <eos>`` with no header before audio and only
+    ``<audio>*N <write_token> TEXT <end_token>`` with no header before audio and
     the ``write_token`` marking the audio→text transition.  The turn-end is
-    the tokenizer's native EOS.
+    the tokenizer's native EOS when ``end_token`` is not provided.
 
     ``write_token`` should be an existing vocab token the LLM saw pretraining
     as a turn-boundary marker (e.g. ``"<|im_start|>"`` for Qwen3,
@@ -583,10 +686,19 @@ def build_compact_turn_markers(hf_tok, write_token: str) -> tuple[list[int], lis
             f"write_token {write_token!r} must encode to exactly 1 token, got {write_ids}. "
             f"Pick a tokenizer-native turn-boundary token or override via config."
         )
-    eos_id = getattr(hf_tok, "eos_token_id", None)
-    if eos_id is None:
-        raise ValueError("tokenizer.eos_token_id is required for compact_template=True")
-    return [], [write_ids[0]], [eos_id]
+    if end_token is None:
+        end_id = getattr(hf_tok, "eos_token_id", None)
+        if end_id is None:
+            raise ValueError("tokenizer.eos_token_id is required for compact_template=True without end_token")
+    else:
+        end_ids = hf_tok.encode(end_token, add_special_tokens=False)
+        if len(end_ids) != 1:
+            raise ValueError(
+                f"end_token {end_token!r} must encode to exactly 1 token, got {end_ids}. "
+                f"Pick a tokenizer-native turn-boundary token or add it as a special token."
+            )
+        end_id = end_ids[0]
+    return [], [write_ids[0]], [end_id]
 
 
 def _tokenize_compact_with_assistant_mask(
@@ -846,12 +958,14 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
         # call since we derive the markers directly from config.
         if self.cfg.compact_template:
             hf_tok = self.tokenizer.tokenizer
-            _, ufah_ids, af_ids = build_compact_turn_markers(hf_tok, self.cfg.write_token)
+            write_token = self.cfg.te_start_token if self.cfg.use_te_tokens else self.cfg.write_token
+            end_token = self.cfg.te_end_token if self.cfg.use_te_tokens else None
+            _, ufah_ids, af_ids = build_compact_turn_markers(hf_tok, write_token, end_token=end_token)
             self._write_id = ufah_ids[0]
             self._compact_eos_id = af_ids[0]
             logging.info(
-                f"compact_template enabled: write_token={self.cfg.write_token!r} "
-                f"(id={self._write_id}), eos_id={self._compact_eos_id}"
+                f"compact_template enabled: write_token={write_token!r} "
+                f"(id={self._write_id}), end_token={end_token!r}, end_id={self._compact_eos_id}"
             )
         else:
             self._write_id = None
@@ -923,6 +1037,19 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             audio_lens = torch.tensor(new_lens, dtype=audio_lens.dtype, device=audio_lens.device)
             audio_durations_secs = (audio_lens.float() / self.cfg.sample_rate).tolist()
 
+        if self.cfg.add_utterance_boundary_tokens:
+            alignments = [
+                add_utterance_boundary_alignments(
+                    sample_alignments,
+                    audio_duration_secs=duration_secs,
+                    start_token=self.cfg.utterance_start_token,
+                    end_token=self.cfg.utterance_end_token,
+                    margin_secs=self.cfg.utterance_boundary_margin_secs,
+                    delay_frames=self.cfg.utterance_boundary_delay_frames,
+                )
+                for sample_alignments, duration_secs in zip(alignments, audio_durations_secs)
+            ]
+
         system_prompts = [cut.custom.get(self.cfg.prompt_field, self.cfg.system_prompt) for cut in cuts]
 
         batch_messages = get_llm_messages_for_batch(
@@ -981,6 +1108,28 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             target_ids = input_ids[1:] + [IGNORE_INDEX]
             target_mask = assistant_mask[1:] + [0]
             target_ids = [tid if m else IGNORE_INDEX for tid, m in zip(target_ids, target_mask)]
+
+            # Optional sequence curation debug:
+            #   STREAMING_STT_DEBUG_SEQUENCE=1 dumps the first sample's messages/input/target table.
+            #   STREAMING_STT_DEBUG_BREAKPOINT=1 also drops into pdb after the dump.
+            debug_sequence = os.environ.get("STREAMING_STT_DEBUG_SEQUENCE", "").lower() in {"1", "true", "yes", "y"}
+            debug_breakpoint = os.environ.get("STREAMING_STT_DEBUG_BREAKPOINT", "").lower() in {
+                "1",
+                "true",
+                "yes",
+                "y",
+            }
+            if sample_idx == 0 and (debug_sequence or debug_breakpoint):
+                _debug_dump_sequence(
+                    messages,
+                    input_ids,
+                    target_ids,
+                    assistant_mask,
+                    self.tokenizer,
+                    self.blank_id,
+                    transcript=text[sample_idx],
+                    do_breakpoint=debug_breakpoint,
+                )
 
             # Dynamic chunking: train the model to predict at audio positions.
             # Non-final audio frames → target = blank_id ("need more audio")

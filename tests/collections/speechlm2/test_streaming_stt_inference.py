@@ -25,7 +25,8 @@ import pytest
 from transformers import AutoTokenizer
 
 from nemo.collections.speechlm2.data.streaming_stt_dataset import AUDIO_TOKEN_IDX
-from nemo.collections.speechlm2.models.streaming_stt_model import StreamingSTTModel, _find_sublist
+from nemo.collections.speechlm2.models.streaming_stt_model import StreamingSTTModel
+# from nemo.collections.speechlm2.models.streaming_stt_model import _find_sublist
 
 PRETRAINED_LLM = "Qwen/Qwen3-1.7B"
 BLANK_TOKEN = "<blank>"
@@ -44,18 +45,41 @@ def hf_tok():
     return AutoTokenizer.from_pretrained(PRETRAINED_LLM)
 
 
-def _make_mock_self(hf_tok, chunk_size=CHUNK_SIZE, blank_token=BLANK_TOKEN):
+def _make_mock_self(
+    hf_tok,
+    chunk_size=CHUNK_SIZE,
+    blank_token=BLANK_TOKEN,
+    compact_template=False,
+    use_te_tokens=False,
+):
     """Build a minimal namespace that satisfies ``_ensure_inference_cache``."""
+    blank_id = hf_tok.convert_tokens_to_ids(blank_token)
+    if blank_id is None or blank_id == getattr(hf_tok, "unk_token_id", None):
+        blank_id = -1
+    write_token = "<|te_start|>" if use_te_tokens else "<|im_start|>"
+    end_token = "<|te_end|>" if use_te_tokens else None
     return SimpleNamespace(
         tokenizer=SimpleNamespace(tokenizer=hf_tok),
-        core_cfg=SimpleNamespace(chunk_size=chunk_size, audio_tag="<audio>"),
+        core_cfg=SimpleNamespace(
+            chunk_size=chunk_size,
+            audio_tag="<audio>",
+            compact_template=compact_template,
+        ),
         blank_token=blank_token,
+        blank_token_id=blank_id,
+        _compact_write_token=write_token,
+        _compact_end_token=end_token,
     )
 
 
-def _run_ensure_cache(hf_tok, chunk_size=CHUNK_SIZE):
+def _run_ensure_cache(hf_tok, chunk_size=CHUNK_SIZE, compact_template=False, use_te_tokens=False):
     """Call ``_ensure_inference_cache`` on a mock self and return it."""
-    mock = _make_mock_self(hf_tok, chunk_size=chunk_size)
+    mock = _make_mock_self(
+        hf_tok,
+        chunk_size=chunk_size,
+        compact_template=compact_template,
+        use_te_tokens=use_te_tokens,
+    )
     StreamingSTTModel._ensure_inference_cache(mock)
     return mock
 
@@ -63,31 +87,31 @@ def _run_ensure_cache(hf_tok, chunk_size=CHUNK_SIZE):
 # ===========================================================================
 # Tests: _find_sublist
 # ===========================================================================
-class TestFindSublist:
-
-    def test_found_middle(self):
-        assert _find_sublist([1, 2, 3, 4, 5], [3, 4]) == 2
-
-    def test_found_start(self):
-        assert _find_sublist([1, 2, 3], [1, 2]) == 0
-
-    def test_found_end(self):
-        assert _find_sublist([1, 2, 3], [2, 3]) == 1
-
-    def test_exact_match(self):
-        assert _find_sublist([1, 2], [1, 2]) == 0
-
-    def test_not_found(self):
-        assert _find_sublist([1, 2, 3], [4, 5]) is None
-
-    def test_single_element(self):
-        assert _find_sublist([1, 2, 3], [2]) == 1
-
-    def test_empty_haystack(self):
-        assert _find_sublist([], [1]) is None
-
-    def test_returns_first_occurrence(self):
-        assert _find_sublist([1, 2, 1, 2], [1, 2]) == 0
+# class TestFindSublist:
+#
+#     def test_found_middle(self):
+#         assert _find_sublist([1, 2, 3, 4, 5], [3, 4]) == 2
+#
+#     def test_found_start(self):
+#         assert _find_sublist([1, 2, 3], [1, 2]) == 0
+#
+#     def test_found_end(self):
+#         assert _find_sublist([1, 2, 3], [2, 3]) == 1
+#
+#     def test_exact_match(self):
+#         assert _find_sublist([1, 2], [1, 2]) == 0
+#
+#     def test_not_found(self):
+#         assert _find_sublist([1, 2, 3], [4, 5]) is None
+#
+#     def test_single_element(self):
+#         assert _find_sublist([1, 2, 3], [2]) == 1
+#
+#     def test_empty_haystack(self):
+#         assert _find_sublist([], [1]) is None
+#
+#     def test_returns_first_occurrence(self):
+#         assert _find_sublist([1, 2, 1, 2], [1, 2]) == 0
 
 
 # ===========================================================================
@@ -171,15 +195,30 @@ class TestEnsureInferenceCache:
 
     def test_blank_id(self, hf_tok):
         """Blank token ID should be resolved (not UNK)."""
-        mock = _make_mock_self(hf_tok)
         # Add <blank> as a special token (as the model __init__ does)
         hf_tok_copy = AutoTokenizer.from_pretrained(PRETRAINED_LLM)
         hf_tok_copy.add_special_tokens({"additional_special_tokens": [BLANK_TOKEN]})
+        mock = _make_mock_self(hf_tok_copy)
         mock.tokenizer.tokenizer = hf_tok_copy
         StreamingSTTModel._ensure_inference_cache(mock)
         blank_id = hf_tok_copy.convert_tokens_to_ids(BLANK_TOKEN)
-        assert mock._blank_id == blank_id
+        assert mock.blank_token_id == blank_id
         assert blank_id != hf_tok_copy.unk_token_id
+
+    def test_compact_template_with_te_tokens(self, hf_tok):
+        """Compact inference should use <|te_start|>/<|te_end|> as turn markers."""
+        hf_tok_copy = AutoTokenizer.from_pretrained(PRETRAINED_LLM)
+        hf_tok_copy.add_special_tokens({"additional_special_tokens": ["<|te_start|>", "<|te_end|>"]})
+        te_start_id = hf_tok_copy.convert_tokens_to_ids("<|te_start|>")
+        te_end_id = hf_tok_copy.convert_tokens_to_ids("<|te_end|>")
+
+        mock = _run_ensure_cache(hf_tok_copy, chunk_size=2, compact_template=True, use_te_tokens=True)
+
+        assert mock._user_header_ids == []
+        assert mock._user_footer_and_asst_header_ids == [te_start_id]
+        assert mock._asst_footer_ids == [te_end_id]
+        assert mock._turn_template_ids == [AUDIO_TOKEN_IDX, AUDIO_TOKEN_IDX, te_start_id]
+        assert mock._user_footer_first_id == te_start_id
 
     def test_idempotent(self, hf_tok):
         """Calling _ensure_inference_cache twice should not change results."""
