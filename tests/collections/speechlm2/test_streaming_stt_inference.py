@@ -50,20 +50,22 @@ def _make_mock_self(
     chunk_size=CHUNK_SIZE,
     blank_token=BLANK_TOKEN,
     compact_template=False,
-    use_te_tokens=False,
+    use_text_tokens=False,
+    compact_text_end_only_no_blank=False,
 ):
     """Build a minimal namespace that satisfies ``_ensure_inference_cache``."""
     blank_id = hf_tok.convert_tokens_to_ids(blank_token)
     if blank_id is None or blank_id == getattr(hf_tok, "unk_token_id", None):
         blank_id = -1
-    write_token = "<|te_start|>" if use_te_tokens else "<|im_start|>"
-    end_token = "<|te_end|>" if use_te_tokens else None
+    write_token = None if compact_text_end_only_no_blank else "<|text_start|>" if use_text_tokens else "<|im_start|>"
+    end_token = "<|text_end|>" if use_text_tokens else None
     return SimpleNamespace(
         tokenizer=SimpleNamespace(tokenizer=hf_tok),
         core_cfg=SimpleNamespace(
             chunk_size=chunk_size,
             audio_tag="<audio>",
             compact_template=compact_template,
+            compact_text_end_only_no_blank=compact_text_end_only_no_blank,
         ),
         blank_token=blank_token,
         blank_token_id=blank_id,
@@ -72,13 +74,13 @@ def _make_mock_self(
     )
 
 
-def _run_ensure_cache(hf_tok, chunk_size=CHUNK_SIZE, compact_template=False, use_te_tokens=False):
+def _run_ensure_cache(hf_tok, chunk_size=CHUNK_SIZE, compact_template=False, use_text_tokens=False):
     """Call ``_ensure_inference_cache`` on a mock self and return it."""
     mock = _make_mock_self(
         hf_tok,
         chunk_size=chunk_size,
         compact_template=compact_template,
-        use_te_tokens=use_te_tokens,
+        use_text_tokens=use_text_tokens,
     )
     StreamingSTTModel._ensure_inference_cache(mock)
     return mock
@@ -205,20 +207,42 @@ class TestEnsureInferenceCache:
         assert mock.blank_token_id == blank_id
         assert blank_id != hf_tok_copy.unk_token_id
 
-    def test_compact_template_with_te_tokens(self, hf_tok):
-        """Compact inference should use <|te_start|>/<|te_end|> as turn markers."""
+    def test_compact_template_with_text_tokens(self, hf_tok):
+        """Compact inference should use <|text_start|>/<|text_end|> as turn markers."""
         hf_tok_copy = AutoTokenizer.from_pretrained(PRETRAINED_LLM)
-        hf_tok_copy.add_special_tokens({"additional_special_tokens": ["<|te_start|>", "<|te_end|>"]})
-        te_start_id = hf_tok_copy.convert_tokens_to_ids("<|te_start|>")
-        te_end_id = hf_tok_copy.convert_tokens_to_ids("<|te_end|>")
+        hf_tok_copy.add_special_tokens({"additional_special_tokens": ["<|text_start|>", "<|text_end|>"]})
+        text_start_id = hf_tok_copy.convert_tokens_to_ids("<|text_start|>")
+        text_end_id = hf_tok_copy.convert_tokens_to_ids("<|text_end|>")
 
-        mock = _run_ensure_cache(hf_tok_copy, chunk_size=2, compact_template=True, use_te_tokens=True)
+        mock = _run_ensure_cache(hf_tok_copy, chunk_size=2, compact_template=True, use_text_tokens=True)
 
         assert mock._user_header_ids == []
-        assert mock._user_footer_and_asst_header_ids == [te_start_id]
-        assert mock._asst_footer_ids == [te_end_id]
-        assert mock._turn_template_ids == [AUDIO_TOKEN_IDX, AUDIO_TOKEN_IDX, te_start_id]
-        assert mock._user_footer_first_id == te_start_id
+        assert mock._user_footer_and_asst_header_ids == [text_start_id]
+        assert mock._asst_footer_ids == [text_end_id]
+        assert mock._turn_template_ids == [AUDIO_TOKEN_IDX, AUDIO_TOKEN_IDX, text_start_id]
+        assert mock._user_footer_first_id == text_start_id
+
+    def test_compact_template_end_only_no_blank(self, hf_tok):
+        """End-only compact inference has no text-start marker in the turn template."""
+        hf_tok_copy = AutoTokenizer.from_pretrained(PRETRAINED_LLM)
+        hf_tok_copy.add_special_tokens({"additional_special_tokens": ["<|text_end|>"]})
+        text_end_id = hf_tok_copy.convert_tokens_to_ids("<|text_end|>")
+
+        mock = _make_mock_self(
+            hf_tok_copy,
+            chunk_size=2,
+            blank_token="",
+            compact_template=True,
+            use_text_tokens=True,
+            compact_text_end_only_no_blank=True,
+        )
+        StreamingSTTModel._ensure_inference_cache(mock)
+
+        assert mock._user_header_ids == []
+        assert mock._user_footer_and_asst_header_ids == []
+        assert mock._asst_footer_ids == [text_end_id]
+        assert mock._turn_template_ids == [AUDIO_TOKEN_IDX, AUDIO_TOKEN_IDX]
+        assert mock._user_footer_first_id == text_end_id
 
     def test_idempotent(self, hf_tok):
         """Calling _ensure_inference_cache twice should not change results."""

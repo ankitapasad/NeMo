@@ -38,6 +38,7 @@ from nemo.collections.speechlm2.data.streaming_stt_dataset import (
     AUDIO_TOKEN_IDX,
     IGNORE_INDEX,
     StreamingSTTDataset,
+    _normalize_legacy_text_token_config,
     _replace_audio_chunks,
     _tokenize_compact_with_assistant_mask,
     _tokenize_with_assistant_mask,
@@ -350,7 +351,7 @@ class TestGetLlmMessagesForSample:
         ]
         msgs = _make_messages(num_delay_frames=2, alignments=alignments)
         emitted = [m["content"] for m in msgs if m["role"] == "assistant" and m["content"] != BLANK_TOKEN]
-        assert emitted == ["Hello <eou>"]
+        assert emitted == ["Hello<eou>"]
 
     def test_boundary_tokens_preserve_transcript_punctuation(self):
         alignments = [
@@ -359,7 +360,7 @@ class TestGetLlmMessagesForSample:
         ]
         msgs = _make_messages(num_delay_frames=2, alignments=alignments, transcript="Hello!")
         emitted = [m["content"] for m in msgs if m["role"] == "assistant" and m["content"] != BLANK_TOKEN]
-        assert emitted == ["Hello! <eou>"]
+        assert emitted == ["Hello!<eou>"]
 
     def test_add_utterance_boundary_alignments_uses_word_proxy(self):
         alignments = add_utterance_boundary_alignments(
@@ -933,7 +934,7 @@ class TestStreamingSTTDatasetBoundaryIntegration:
 
         valid_targets = [tid for tid in batch.target_tokens[0].tolist() if tid != IGNORE_INDEX]
         sou_id = hf._content_cache["<sou>"][0]
-        eou_id = hf._content_cache["Hello <eou>"][1]
+        eou_id = hf._content_cache["Hello<eou>"][0]
         assert sou_id in valid_targets
         assert eou_id in valid_targets
 
@@ -955,7 +956,7 @@ class TestStreamingSTTDatasetBoundaryIntegration:
 
         valid_targets = [tid for tid in batch.target_tokens[0].tolist() if tid != IGNORE_INDEX]
         assert "<sou>" not in hf._content_cache
-        assert "Hello <eou>" not in hf._content_cache
+        assert "Hello<eou>" not in hf._content_cache
         assert hf._content_cache["Hello"][0] in valid_targets
 
 
@@ -1989,26 +1990,59 @@ class TestCompactTemplate:
 
     def test_build_compact_turn_markers_custom_end_token(self):
         hf = _MockHFTokenizer()
-        start_id = hf.encode("<|te_start|>", add_special_tokens=False)[0]
-        end_id = hf.encode("<|te_end|>", add_special_tokens=False)[0]
+        start_id = hf.encode("<|text_start|>", add_special_tokens=False)[0]
+        end_id = hf.encode("<|text_end|>", add_special_tokens=False)[0]
 
-        uh, ufah, af = build_compact_turn_markers(hf, "<|te_start|>", end_token="<|te_end|>")
+        uh, ufah, af = build_compact_turn_markers(hf, "<|text_start|>", end_token="<|text_end|>")
 
         assert uh == []
         assert ufah == [start_id]
         assert af == [end_id]
 
+    def test_legacy_te_config_maps_to_text_tokens(self):
+        cfg = {
+            "use_te_tokens": True,
+            "te_start_token": "<|te_start|>",
+            "te_end_token": "<|te_end|>",
+        }
+
+        normalized = _normalize_legacy_text_token_config(cfg)
+
+        assert normalized["use_text_tokens"] is True
+        assert normalized["text_start_token"] == "<|te_start|>"
+        assert normalized["text_end_token"] == "<|te_end|>"
+        assert "use_te_tokens" not in normalized
+        assert "te_start_token" not in normalized
+        assert "te_end_token" not in normalized
+
+    def test_legacy_te_config_does_not_override_text_tokens(self):
+        cfg = {
+            "use_text_tokens": True,
+            "text_start_token": "<|text_start|>",
+            "text_end_token": "<|text_end|>",
+            "use_te_tokens": True,
+            "te_start_token": "<|te_start|>",
+            "te_end_token": "<|te_end|>",
+        }
+
+        normalized = _normalize_legacy_text_token_config(cfg)
+
+        assert normalized["text_start_token"] == "<|text_start|>"
+        assert normalized["text_end_token"] == "<|text_end|>"
+        assert "te_start_token" not in normalized
+        assert "te_end_token" not in normalized
+
     def test_build_compact_turn_markers_multi_token_end_raises(self):
         hf = _MockHFTokenizer()
 
         with pytest.raises(ValueError, match="end_token .* exactly 1 token"):
-            build_compact_turn_markers(hf, "<|te_start|>", end_token="not one")
+            build_compact_turn_markers(hf, "<|text_start|>", end_token="not one")
 
     def test_tokenize_compact_custom_end_token_masked(self):
         hf = _MockHFTokenizer()
         tok = _MockNemoTokenizer(hf)
-        write_id = hf.encode("<|te_start|>", add_special_tokens=False)[0]
-        end_id = hf.encode("<|te_end|>", add_special_tokens=False)[0]
+        write_id = hf.encode("<|text_start|>", add_special_tokens=False)[0]
+        end_id = hf.encode("<|text_end|>", add_special_tokens=False)[0]
         messages = [
             {"role": "system", "content": "S."},
             {"role": "user", "content": "<audio><audio>"},
@@ -2022,6 +2056,40 @@ class TestCompactTemplate:
         inserted_write_positions = [idx for idx, token_id in enumerate(input_ids) if token_id == write_id and mask[idx]]
         assert len(inserted_write_positions) == 1
         assert mask[inserted_write_positions[0]] == 1
+
+    def test_build_compact_turn_markers_end_only(self):
+        hf = _MockHFTokenizer()
+        end_id = hf.encode("<|text_end|>", add_special_tokens=False)[0]
+
+        uh, ufah, af = build_compact_turn_markers(hf, None, end_token="<|text_end|>")
+
+        assert uh == []
+        assert ufah == []
+        assert af == [end_id]
+
+    def test_tokenize_compact_end_only_no_blank(self):
+        hf = _MockHFTokenizer()
+        tok = _MockNemoTokenizer(hf)
+        end_id = hf.encode("<|text_end|>", add_special_tokens=False)[0]
+        blank_id = hf.encode(BLANK_TOKEN, add_special_tokens=False)[0]
+        messages = [
+            {"role": "system", "content": "S."},
+            {"role": "user", "content": "<audio><audio>"},
+            {"role": "assistant", "content": BLANK_TOKEN},
+        ]
+
+        input_ids, mask = _tokenize_compact_with_assistant_mask(
+            messages,
+            tok,
+            write_id=None,
+            eos_id=end_id,
+            blank_token=BLANK_TOKEN,
+            suppress_blank=True,
+        )
+
+        assert input_ids[-1] == end_id
+        assert mask[-1] == 1
+        assert blank_id not in input_ids
 
     def test_tokenize_compact_structure(self, qwen3_tok):
         """Sequence shape: [system_wrapped] [<audio>*N <|im_start|> text <|im_end|>] * K."""

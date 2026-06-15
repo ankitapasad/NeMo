@@ -156,9 +156,10 @@ class StreamingSTTDataConfig:
     prompt_field: str = "system_prompt"
     compact_template: bool = False
     write_token: str = "<|im_start|>"
-    use_te_tokens: bool = False
-    te_start_token: str = "<|te_start|>"
-    te_end_token: str = "<|te_end|>"
+    use_text_tokens: bool = False
+    text_start_token: str = "<|text_start|>"
+    text_end_token: str = "<|text_end|>"
+    compact_text_end_only_no_blank: bool = False
     add_utterance_boundary_tokens: bool = False
     utterance_start_token: str = "<sou>"
     utterance_end_token: str = "<eou>"
@@ -170,6 +171,20 @@ class StreamingSTTDataConfig:
     # K-aligned positions; deploy-time K' (any multiple of K_train) is set via
     # dynamic_min_chunk_size / dynamic_max_chunk_size. Default 1 = no-op.
     chunk_step: int = 1
+
+
+def _normalize_legacy_text_token_config(cfg: DictConfig | dict) -> DictConfig | dict:
+    """Map legacy te_* compact-token config keys to text_* names."""
+    if "use_text_tokens" not in cfg and "use_te_tokens" in cfg:
+        cfg["use_text_tokens"] = cfg["use_te_tokens"]
+    if "text_start_token" not in cfg and "te_start_token" in cfg:
+        cfg["text_start_token"] = cfg["te_start_token"]
+    if "text_end_token" not in cfg and "te_end_token" in cfg:
+        cfg["text_end_token"] = cfg["te_end_token"]
+    for legacy_key in ("use_te_tokens", "te_start_token", "te_end_token"):
+        if legacy_key in cfg:
+            del cfg[legacy_key]
+    return cfg
 
 
 def decode_with_blank(
@@ -313,6 +328,8 @@ def _alignment_ready_frame(word: WordAlignment, frame_length_in_secs: float, def
 def _append_alignment_text(content: str, text: str) -> str:
     if not content:
         return text
+    if text.startswith("<") and text.endswith(">"):
+        return content + text
     if text.startswith(" ") or content.endswith(" "):
         return content + text
     return content + " " + text
@@ -462,7 +479,7 @@ def get_llm_messages_for_sample(
 
             if n_frames_chunk <= 0 and messages[-1]["role"] == "assistant":
                 # Words at same boundary as previous group — append
-                messages[-1]["content"] += " " + content
+                messages[-1]["content"] = _append_alignment_text(messages[-1]["content"], content)
             else:
                 messages.append({"role": "assistant", "content": content})
 
@@ -515,7 +532,7 @@ def get_llm_messages_for_sample(
             if messages[-1]["role"] == "assistant" and messages[-1]["content"] == blank_token:
                 messages[-1]["content"] = content
             elif messages[-1]["role"] == "assistant":
-                messages[-1]["content"] += " " + content
+                messages[-1]["content"] = _append_alignment_text(messages[-1]["content"], content)
             else:
                 messages.append({"role": "assistant", "content": content})
 
@@ -666,7 +683,7 @@ def parse_chat_template_ids(hf_tok, last_turn: bool = False) -> tuple[list[int],
 
 def build_compact_turn_markers(
     hf_tok,
-    write_token: str,
+    write_token: Optional[str],
     end_token: Optional[str] = None,
 ) -> tuple[list[int], list[int], list[int]]:
     """Return the compact-format analogue of ``parse_chat_template_ids``.
@@ -680,12 +697,15 @@ def build_compact_turn_markers(
     as a turn-boundary marker (e.g. ``"<|im_start|>"`` for Qwen3,
     ``"<start_of_turn>"`` for Gemma).
     """
-    write_ids = hf_tok.encode(write_token, add_special_tokens=False)
-    if len(write_ids) != 1:
-        raise ValueError(
-            f"write_token {write_token!r} must encode to exactly 1 token, got {write_ids}. "
-            f"Pick a tokenizer-native turn-boundary token or override via config."
-        )
+    if write_token is None:
+        write_ids = []
+    else:
+        write_ids = hf_tok.encode(write_token, add_special_tokens=False)
+        if len(write_ids) != 1:
+            raise ValueError(
+                f"write_token {write_token!r} must encode to exactly 1 token, got {write_ids}. "
+                f"Pick a tokenizer-native turn-boundary token or override via config."
+            )
     if end_token is None:
         end_id = getattr(hf_tok, "eos_token_id", None)
         if end_id is None:
@@ -698,14 +718,16 @@ def build_compact_turn_markers(
                 f"Pick a tokenizer-native turn-boundary token or add it as a special token."
             )
         end_id = end_ids[0]
-    return [], [write_ids[0]], [end_id]
+    return [], write_ids, [end_id]
 
 
 def _tokenize_compact_with_assistant_mask(
     messages: List[dict],
     tokenizer: AutoTokenizer,
-    write_id: int,
+    write_id: Optional[int],
     eos_id: int,
+    blank_token: Optional[str] = None,
+    suppress_blank: bool = False,
 ) -> tuple[list[int], list[int]]:
     """Tokenize chat messages in compact format and return (input_ids, assistant_mask).
 
@@ -748,10 +770,12 @@ def _tokenize_compact_with_assistant_mask(
             # Pair with following assistant turn if present.
             if i < len(turn_msgs) and turn_msgs[i]["role"] == "assistant":
                 asst = turn_msgs[i]
-                asst_ids = hf_tok.encode(asst["content"], add_special_tokens=False) if asst["content"] else []
-                # write_id
-                input_ids.append(write_id)
-                assistant_mask.append(1)
+                asst_content = "" if suppress_blank and asst["content"] == blank_token else asst["content"]
+                asst_ids = hf_tok.encode(asst_content, add_special_tokens=False) if asst_content else []
+                # Optional text-start marker.
+                if write_id is not None:
+                    input_ids.append(write_id)
+                    assistant_mask.append(1)
                 # assistant content
                 input_ids.extend(asst_ids)
                 assistant_mask.extend([1] * len(asst_ids))
@@ -761,9 +785,11 @@ def _tokenize_compact_with_assistant_mask(
                 i += 1
         else:
             # Orphan assistant (shouldn't normally occur) — treat as standalone asst segment.
-            asst_ids = hf_tok.encode(msg["content"], add_special_tokens=False) if msg["content"] else []
-            input_ids.append(write_id)
-            assistant_mask.append(1)
+            asst_content = "" if suppress_blank and msg["content"] == blank_token else msg["content"]
+            asst_ids = hf_tok.encode(asst_content, add_special_tokens=False) if asst_content else []
+            if write_id is not None:
+                input_ids.append(write_id)
+                assistant_mask.append(1)
             input_ids.extend(asst_ids)
             assistant_mask.extend([1] * len(asst_ids))
             input_ids.append(eos_id)
@@ -912,10 +938,16 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
         """
         self.defer_get_batch = defer_get_batch
         self.tokenizer = tokenizer
-        self.cfg: StreamingSTTDataConfig = to_dataclass(StreamingSTTDataConfig, cfg)
+        self.cfg: StreamingSTTDataConfig = to_dataclass(
+            StreamingSTTDataConfig, _normalize_legacy_text_token_config(cfg)
+        )
+        if self.cfg.compact_text_end_only_no_blank and not self.cfg.compact_template:
+            raise ValueError("compact_text_end_only_no_blank=True requires compact_template=True")
         # Unescape Python escape sequences (e.g. "\\n" → "\n") because Hydra/OmegaConf
         # loads YAML strings literally without interpreting backslash escapes.
         self.cfg.blank_token = self.cfg.blank_token.encode().decode('unicode_escape')
+        if self.cfg.compact_text_end_only_no_blank:
+            self.cfg.blank_token = ""
 
         # Tokenize the full audio chunk string (audio_tag * chunk_size) to get
         # its token ID sequence.  We must encode the full chunk as a single string
@@ -958,10 +990,16 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
         # call since we derive the markers directly from config.
         if self.cfg.compact_template:
             hf_tok = self.tokenizer.tokenizer
-            write_token = self.cfg.te_start_token if self.cfg.use_te_tokens else self.cfg.write_token
-            end_token = self.cfg.te_end_token if self.cfg.use_te_tokens else None
+            write_token = (
+                None
+                if self.cfg.compact_text_end_only_no_blank
+                else self.cfg.text_start_token
+                if self.cfg.use_text_tokens
+                else self.cfg.write_token
+            )
+            end_token = self.cfg.text_end_token if self.cfg.use_text_tokens else None
             _, ufah_ids, af_ids = build_compact_turn_markers(hf_tok, write_token, end_token=end_token)
-            self._write_id = ufah_ids[0]
+            self._write_id = ufah_ids[0] if ufah_ids else None
             self._compact_eos_id = af_ids[0]
             logging.info(
                 f"compact_template enabled: write_token={write_token!r} "
@@ -977,7 +1015,7 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
         if self.cfg.chunk_size == 0:
             if self.cfg.compact_template:
                 # Compact: boundary target is write_id (<|im_start|> in Qwen3).
-                self._user_footer_first_id = self._write_id
+                self._user_footer_first_id = self._write_id if self._write_id is not None else self._compact_eos_id
             else:
                 hf_tok = self.tokenizer.tokenizer
                 _, user_footer_and_asst_header_ids, _ = parse_chat_template_ids(hf_tok)
@@ -1074,7 +1112,12 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             # Tokenize and compute assistant content mask.
             if self.cfg.compact_template:
                 input_ids, assistant_mask = _tokenize_compact_with_assistant_mask(
-                    messages, self.tokenizer, self._write_id, self._compact_eos_id
+                    messages,
+                    self.tokenizer,
+                    self._write_id,
+                    self._compact_eos_id,
+                    blank_token=self.cfg.blank_token,
+                    suppress_blank=self.cfg.compact_text_end_only_no_blank,
                 )
             else:
                 input_ids, assistant_mask = _tokenize_with_assistant_mask(messages, self.tokenizer)

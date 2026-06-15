@@ -88,16 +88,16 @@ def _minimal_cfg():
         "sample_rate": 16000,
         "frame_length_in_secs": 0.08,
         "compact_template": True,
-        "use_te_tokens": True,
-        "te_start_token": "<|te_start|>",
-        "te_end_token": "<|te_end|>",
+        "use_text_tokens": True,
+        "text_start_token": "<|text_start|>",
+        "text_end_token": "<|text_end|>",
         "add_utterance_boundary_tokens": True,
         "utterance_start_token": "<sou>",
         "utterance_end_token": "<eou>",
     }
 
 
-def test_model_init_adds_boundary_and_te_tokens(monkeypatch):
+def test_model_init_adds_boundary_and_text_tokens(monkeypatch):
     fake_tokenizer = _FakeTokenizer()
     fake_llm = _FakeLLM()
 
@@ -111,11 +111,62 @@ def test_model_init_adds_boundary_and_te_tokens(monkeypatch):
     assert fake_tokenizer.added_batches == [
         ["<blank>"],
         ["<sou>", "<eou>"],
-        ["<|te_start|>", "<|te_end|>"],
+        ["<|text_start|>", "<|text_end|>"],
     ]
     assert fake_llm.resize_sizes == [2, 4, 6]
+    assert model._compact_write_token == "<|text_start|>"
+    assert model._compact_end_token == "<|text_end|>"
+
+
+def test_model_init_maps_legacy_te_config(monkeypatch):
+    fake_tokenizer = _FakeTokenizer()
+    fake_llm = _FakeLLM()
+
+    monkeypatch.setattr(streaming_stt_model, "AutoTokenizer", lambda *args, **kwargs: fake_tokenizer)
+    monkeypatch.setattr(streaming_stt_model, "load_pretrained_hf", lambda *args, **kwargs: fake_llm)
+    monkeypatch.setattr(streaming_stt_model, "setup_perception", lambda *args, **kwargs: _fake_perception())
+    monkeypatch.setattr(streaming_stt_model, "ModelSummary", lambda *args, **kwargs: "summary")
+
+    cfg = _minimal_cfg()
+    cfg.pop("use_text_tokens")
+    cfg.pop("text_start_token")
+    cfg.pop("text_end_token")
+    cfg["use_te_tokens"] = True
+    cfg["te_start_token"] = "<|te_start|>"
+    cfg["te_end_token"] = "<|te_end|>"
+
+    model = streaming_stt_model.StreamingSTTModel(cfg)
+
+    assert fake_tokenizer.added_batches == [
+        ["<blank>"],
+        ["<sou>", "<eou>"],
+        ["<|te_start|>", "<|te_end|>"],
+    ]
     assert model._compact_write_token == "<|te_start|>"
     assert model._compact_end_token == "<|te_end|>"
+
+
+def test_model_init_end_only_no_blank_adds_only_text_end(monkeypatch):
+    fake_tokenizer = _FakeTokenizer()
+    fake_llm = _FakeLLM()
+
+    monkeypatch.setattr(streaming_stt_model, "AutoTokenizer", lambda *args, **kwargs: fake_tokenizer)
+    monkeypatch.setattr(streaming_stt_model, "load_pretrained_hf", lambda *args, **kwargs: fake_llm)
+    monkeypatch.setattr(streaming_stt_model, "setup_perception", lambda *args, **kwargs: _fake_perception())
+    monkeypatch.setattr(streaming_stt_model, "ModelSummary", lambda *args, **kwargs: "summary")
+
+    cfg = _minimal_cfg()
+    cfg["compact_text_end_only_no_blank"] = True
+    model = streaming_stt_model.StreamingSTTModel(cfg)
+
+    assert fake_tokenizer.added_batches == [
+        ["<sou>", "<eou>"],
+        ["<|text_end|>"],
+    ]
+    assert fake_llm.resize_sizes == [3, 4]
+    assert model.blank_token == ""
+    assert model._compact_write_token is None
+    assert model._compact_end_token == "<|text_end|>"
 
 
 class _ValidationLogger:
