@@ -159,6 +159,8 @@ class StreamingSTTModelConfig:
     add_utterance_boundary_tokens: bool = False
     utterance_start_token: str = "<sou>"
     utterance_end_token: str = "<eou>"
+    utterance_start_loss_weight: float = 1.0
+    utterance_end_loss_weight: float = 1.0
     # --- Aux chunk-boundary classifier head ---
     # Master switch. Only valid in dynamic-chunking mode (chunk_size == 0).
     # When True, a small K-layer transformer head is built on top of the LLM's
@@ -192,6 +194,57 @@ def _normalize_legacy_text_token_config(cfg: dict) -> dict:
         if legacy_key in cfg:
             del cfg[legacy_key]
     return cfg
+
+
+def _compute_weighted_lm_loss(
+    per_token_loss: Tensor,
+    flat_targets: Tensor,
+    blank_id: int,
+    has_blank: bool,
+    blank_loss_weight: float,
+    sou_id: Optional[int] = None,
+    eou_id: Optional[int] = None,
+    utterance_start_loss_weight: float = 1.0,
+    utterance_end_loss_weight: float = 1.0,
+) -> tuple[Tensor, dict[str, Tensor]]:
+    valid_mask = flat_targets != IGNORE_INDEX
+
+    is_blank = valid_mask & (flat_targets == blank_id)
+    is_sou = valid_mask & (flat_targets == sou_id) if sou_id is not None else torch.zeros_like(valid_mask)
+    is_eou = valid_mask & (flat_targets == eou_id) if eou_id is not None else torch.zeros_like(valid_mask)
+    is_nonblank = valid_mask & (flat_targets != blank_id)
+
+    num_targets = valid_mask.long().sum()
+    num_blank = is_blank.sum()
+    num_nonblank = is_nonblank.sum()
+    num_sou = is_sou.sum()
+    num_eou = is_eou.sum()
+
+    loss_weights = torch.ones_like(per_token_loss)
+    if num_blank > 0 and blank_loss_weight != 1.0 and has_blank:
+        loss_weights = torch.where(is_blank, torch.full_like(loss_weights, blank_loss_weight), loss_weights)
+    if sou_id is not None and utterance_start_loss_weight != 1.0:
+        loss_weights = torch.where(
+            is_sou, torch.full_like(loss_weights, utterance_start_loss_weight), loss_weights
+        )
+    if eou_id is not None and utterance_end_loss_weight != 1.0:
+        loss_weights = torch.where(is_eou, torch.full_like(loss_weights, utterance_end_loss_weight), loss_weights)
+
+    valid_weights = loss_weights[valid_mask]
+    loss = (per_token_loss[valid_mask] * valid_weights).sum() / valid_weights.sum().clamp(min=1)
+
+    with torch.no_grad():
+        metrics = {
+            "loss_blank": per_token_loss[is_blank].sum() / num_blank.clamp(min=1),
+            "loss_nonblank": per_token_loss[is_nonblank].sum() / num_nonblank.clamp(min=1),
+            "loss_sou": per_token_loss[is_sou].sum() / num_sou.clamp(min=1),
+            "loss_eou": per_token_loss[is_eou].sum() / num_eou.clamp(min=1),
+            "blank_ratio": num_blank.float() / num_targets.clamp(min=1),
+            "sou_ratio": num_sou.float() / num_targets.clamp(min=1),
+            "eou_ratio": num_eou.float() / num_targets.clamp(min=1),
+        }
+
+    return loss, metrics
 
 
 @dataclass
@@ -646,29 +699,22 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 ignore_index=IGNORE_INDEX,
             )
 
-        # --- Blank vs non-blank loss breakdown ---
+        # --- Weighted LM loss breakdown ---
         blank_id = self.blank_token_id
-        valid_mask = flat_targets != IGNORE_INDEX
-        # When blank is disabled (blank_id=-1), is_blank is always False →
-        # everything counts as non-blank, and blank_weight has no effect.
-        is_blank = valid_mask & (flat_targets == blank_id)
-        is_nonblank = valid_mask & (flat_targets != blank_id)
-        num_blank = is_blank.sum()
-        num_nonblank = is_nonblank.sum()
-
-        # Apply blank loss weight (< 1.0 to down-weight easy blank predictions)
-        blank_weight = self.core_cfg.blank_loss_weight
-        if num_blank > 0 and blank_weight != 1.0 and self.has_blank:
-            effective_num_targets = num_blank * blank_weight + num_nonblank
-            loss = (
-                per_token_loss[is_nonblank].sum() + per_token_loss[is_blank].sum() * blank_weight
-            ) / effective_num_targets
-        else:
-            loss = per_token_loss.sum() / num_targets
-
-        with torch.no_grad():
-            loss_blank = per_token_loss[is_blank].sum() / num_blank.clamp(min=1)
-            loss_nonblank = per_token_loss[is_nonblank].sum() / num_nonblank.clamp(min=1)
+        sou_id, eou_id = None, None
+        if self.core_cfg.add_utterance_boundary_tokens:
+            sou_id, eou_id = self._get_boundary_token_ids()
+        loss, loss_metrics = _compute_weighted_lm_loss(
+            per_token_loss=per_token_loss,
+            flat_targets=flat_targets,
+            blank_id=blank_id,
+            has_blank=self.has_blank,
+            blank_loss_weight=self.core_cfg.blank_loss_weight,
+            sou_id=sou_id,
+            eou_id=eou_id,
+            utterance_start_loss_weight=self.core_cfg.utterance_start_loss_weight,
+            utterance_end_loss_weight=self.core_cfg.utterance_end_loss_weight,
+        )
 
         # --- Aux chunk-boundary classifier loss ---
         # BCE on the aux head's binary "ready to emit" prediction at audio frames.
@@ -713,10 +759,14 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         self.log_dict(
             {
                 "loss": loss,
-                "loss_blank": loss_blank,
-                "loss_nonblank": loss_nonblank,
+                "loss_blank": loss_metrics["loss_blank"],
+                "loss_nonblank": loss_metrics["loss_nonblank"],
+                "loss_sou": loss_metrics["loss_sou"],
+                "loss_eou": loss_metrics["loss_eou"],
                 "loss_chunk_cls": cls_loss_log,
-                "blank_ratio": num_blank.float() / num_targets,
+                "blank_ratio": loss_metrics["blank_ratio"],
+                "sou_ratio": loss_metrics["sou_ratio"],
+                "eou_ratio": loss_metrics["eou_ratio"],
                 "learning_rate": torch.as_tensor(
                     self.trainer.optimizers[0].param_groups[0]["lr"] if self._trainer is not None else 0
                 ),

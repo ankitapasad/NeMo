@@ -163,8 +163,10 @@ class StreamingSTTDataConfig:
     add_utterance_boundary_tokens: bool = False
     utterance_start_token: str = "<sou>"
     utterance_end_token: str = "<eou>"
-    utterance_boundary_margin_secs: float = 0.16
-    utterance_boundary_delay_frames: int = 0
+    # Absolute delays from first-word onset and last-word end. Boundary
+    # alignments do not inherit num_delay_frames.
+    utterance_start_boundary_delay_frames: int = 2
+    utterance_end_boundary_delay_frames: int = 2
     # K — only effective in dynamic chunking (chunk_size == 0). Each audio
     # segment is rounded UP to a multiple of K frames (and total audio is
     # padded to K-multiple). The model implicitly learns to emit only at
@@ -172,9 +174,15 @@ class StreamingSTTDataConfig:
     # dynamic_min_chunk_size / dynamic_max_chunk_size. Default 1 = no-op.
     chunk_step: int = 1
 
+    def __post_init__(self):
+        if self.utterance_start_boundary_delay_frames < 0:
+            raise ValueError("utterance_start_boundary_delay_frames must be non-negative")
+        if self.utterance_end_boundary_delay_frames < 0:
+            raise ValueError("utterance_end_boundary_delay_frames must be non-negative")
+
 
 def _normalize_legacy_text_token_config(cfg: DictConfig | dict) -> DictConfig | dict:
-    """Map legacy te_* compact-token config keys to text_* names."""
+    """Normalize supported legacy dataset configuration keys."""
     if "use_text_tokens" not in cfg and "use_te_tokens" in cfg:
         cfg["use_text_tokens"] = cfg["use_te_tokens"]
     if "text_start_token" not in cfg and "te_start_token" in cfg:
@@ -184,6 +192,18 @@ def _normalize_legacy_text_token_config(cfg: DictConfig | dict) -> DictConfig | 
     for legacy_key in ("use_te_tokens", "te_start_token", "te_end_token"):
         if legacy_key in cfg:
             del cfg[legacy_key]
+
+    if "utterance_boundary_delay_frames" in cfg:
+        raise ValueError(
+            "utterance_boundary_delay_frames is no longer supported; configure "
+            "utterance_start_boundary_delay_frames and utterance_end_boundary_delay_frames explicitly"
+        )
+
+    if "utterance_boundary_margin_secs" in cfg:
+        raise ValueError(
+            "utterance_boundary_margin_secs is deprecated and no longer supported; convert it to "
+            "utterance_end_boundary_delay_frames in the launch configuration"
+        )
     return cfg
 
 
@@ -1082,8 +1102,8 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
                     audio_duration_secs=duration_secs,
                     start_token=self.cfg.utterance_start_token,
                     end_token=self.cfg.utterance_end_token,
-                    margin_secs=self.cfg.utterance_boundary_margin_secs,
-                    delay_frames=self.cfg.utterance_boundary_delay_frames,
+                    start_delay_frames=self.cfg.utterance_start_boundary_delay_frames,
+                    end_delay_frames=self.cfg.utterance_end_boundary_delay_frames,
                 )
                 for sample_alignments, duration_secs in zip(alignments, audio_durations_secs)
             ]

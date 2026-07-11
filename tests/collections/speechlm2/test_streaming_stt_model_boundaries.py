@@ -169,6 +169,48 @@ def test_model_init_end_only_no_blank_adds_only_text_end(monkeypatch):
     assert model._compact_end_token == "<|text_end|>"
 
 
+def test_weighted_lm_loss_applies_separate_boundary_weights():
+    per_token_loss = torch.tensor([1.0, 2.0, 3.0, 4.0, 99.0])
+    targets = torch.tensor([10, 11, 12, 13, streaming_stt_model.IGNORE_INDEX])
+
+    loss, metrics = streaming_stt_model._compute_weighted_lm_loss(
+        per_token_loss=per_token_loss,
+        flat_targets=targets,
+        blank_id=12,
+        has_blank=True,
+        blank_loss_weight=0.5,
+        sou_id=10,
+        eou_id=11,
+        utterance_start_loss_weight=2.0,
+        utterance_end_loss_weight=5.0,
+    )
+
+    expected = torch.tensor((1.0 * 2.0 + 2.0 * 5.0 + 3.0 * 0.5 + 4.0) / (2.0 + 5.0 + 0.5 + 1.0))
+    assert torch.allclose(loss, expected)
+    assert torch.allclose(metrics["loss_sou"], torch.tensor(1.0))
+    assert torch.allclose(metrics["loss_eou"], torch.tensor(2.0))
+    assert torch.allclose(metrics["loss_blank"], torch.tensor(3.0))
+    assert torch.allclose(metrics["sou_ratio"], torch.tensor(0.25))
+    assert torch.allclose(metrics["eou_ratio"], torch.tensor(0.25))
+
+
+def test_weighted_lm_loss_defaults_to_unweighted_boundary_tokens():
+    per_token_loss = torch.tensor([1.0, 2.0, 3.0])
+    targets = torch.tensor([10, 11, 13])
+
+    loss, _ = streaming_stt_model._compute_weighted_lm_loss(
+        per_token_loss=per_token_loss,
+        flat_targets=targets,
+        blank_id=12,
+        has_blank=True,
+        blank_loss_weight=1.0,
+        sou_id=10,
+        eou_id=11,
+    )
+
+    assert torch.allclose(loss, per_token_loss.mean())
+
+
 class _ValidationLogger:
     def __init__(self):
         self.logged = {}

@@ -38,10 +38,10 @@ def add_utterance_boundary_alignments(
     audio_duration_secs: float,
     start_token: str,
     end_token: str,
-    margin_secs: float = 0.16,
-    delay_frames: int = 0,
+    start_delay_frames: int = 2,
+    end_delay_frames: int = 2,
 ) -> List[WordAlignment]:
-    """Add proxy SoU/EoU alignments derived from first/last word timestamps."""
+    """Add SoU/EoU alignments with absolute delays from first-word onset and last-word end."""
     if not alignments:
         return alignments
 
@@ -49,7 +49,7 @@ def add_utterance_boundary_alignments(
     last_word = alignments[-1]
     sou_end = min(audio_duration_secs, max(0.0, first_word.start_time))
     sou_start = sou_end
-    eou_start = min(audio_duration_secs, max(0.0, last_word.end_time + margin_secs))
+    eou_start = min(audio_duration_secs, max(0.0, last_word.end_time))
     eou_end = eou_start
 
     return [
@@ -57,14 +57,14 @@ def add_utterance_boundary_alignments(
             text=start_token,
             start_time=sou_start,
             end_time=sou_end,
-            delay_frames=delay_frames,
+            delay_frames=start_delay_frames,
         ),
         *alignments,
         WordAlignment(
             text=end_token,
             start_time=eou_start,
             end_time=eou_end,
-            delay_frames=delay_frames,
+            delay_frames=end_delay_frames,
         ),
     ]
 

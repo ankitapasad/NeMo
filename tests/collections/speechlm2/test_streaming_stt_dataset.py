@@ -37,6 +37,7 @@ import torch
 from nemo.collections.speechlm2.data.streaming_stt_dataset import (
     AUDIO_TOKEN_IDX,
     IGNORE_INDEX,
+    StreamingSTTDataConfig,
     StreamingSTTDataset,
     _normalize_legacy_text_token_config,
     _replace_audio_chunks,
@@ -368,16 +369,38 @@ class TestGetLlmMessagesForSample:
             audio_duration_secs=1.0,
             start_token="<sou>",
             end_token="<eou>",
-            margin_secs=0.16,
-            delay_frames=0,
         )
         assert [a.text for a in alignments] == ["<sou>", "Hello", "World", "<eou>"]
         assert alignments[0].start_time == 0.16
         assert alignments[0].end_time == 0.16
-        assert alignments[-1].start_time == pytest.approx(0.96)
-        assert alignments[-1].end_time == pytest.approx(0.96)
-        assert alignments[0].delay_frames == 0
-        assert alignments[-1].delay_frames == 0
+        assert alignments[-1].start_time == pytest.approx(0.80)
+        assert alignments[-1].end_time == pytest.approx(0.80)
+        assert alignments[0].delay_frames == 2
+        assert alignments[-1].delay_frames == 2
+
+    def test_add_utterance_boundary_alignments_supports_independent_delays(self):
+        alignments = add_utterance_boundary_alignments(
+            DOCSTRING_ALIGNMENTS,
+            audio_duration_secs=1.0,
+            start_token="<sou>",
+            end_token="<eou>",
+            start_delay_frames=1,
+            end_delay_frames=4,
+        )
+
+        assert alignments[0].text == "<sou>"
+        assert alignments[0].delay_frames == 1
+        assert alignments[-1].text == "<eou>"
+        assert alignments[-1].delay_frames == 4
+
+    def test_delayed_sou_blocks_first_word_until_sou_is_ready(self):
+        alignments = [
+            WordAlignment(text="<sou>", start_time=0.16, end_time=0.16, delay_frames=8),
+            WordAlignment(text="Hello", start_time=0.16, end_time=0.48),
+        ]
+        msgs = _make_messages(num_delay_frames=2, alignments=alignments)
+        emitted = [m["content"] for m in msgs if m["role"] == "assistant" and m["content"] != BLANK_TOKEN]
+        assert emitted == ["<sou> Hello"]
 
     def test_add_utterance_boundary_alignments_empty_is_noop(self):
         assert (
@@ -911,8 +934,8 @@ class TestStreamingSTTDatasetBoundaryIntegration:
             "add_utterance_boundary_tokens": add_boundaries,
             "utterance_start_token": "<sou>",
             "utterance_end_token": "<eou>",
-            "utterance_boundary_margin_secs": 0.16,
-            "utterance_boundary_delay_frames": 0,
+            "utterance_start_boundary_delay_frames": 0,  # Explicitly exercise the zero-delay override; default is 2.
+            "utterance_end_boundary_delay_frames": 2,
         }
         return StreamingSTTDataset(cfg=cfg, tokenizer=tok)
 
@@ -958,6 +981,49 @@ class TestStreamingSTTDatasetBoundaryIntegration:
         assert "<sou>" not in hf._content_cache
         assert "Hello<eou>" not in hf._content_cache
         assert hf._content_cache["Hello"][0] in valid_targets
+
+
+class TestBoundaryDelayConfig:
+
+    def test_defaults_to_two_frame_boundary_delays(self):
+        cfg = StreamingSTTDataConfig(sample_rate=16000, frame_length_in_secs=FRAME_LEN, chunk_size=CHUNK_SIZE)
+        assert cfg.utterance_start_boundary_delay_frames == 2
+        assert cfg.utterance_end_boundary_delay_frames == 2
+
+    @pytest.mark.parametrize("margin_secs", [0.16, 0.32])
+    def test_rejects_deprecated_boundary_margin(self, margin_secs):
+        cfg = {
+            "sample_rate": 16000,
+            "frame_length_in_secs": FRAME_LEN,
+            "chunk_size": CHUNK_SIZE,
+            "utterance_boundary_margin_secs": margin_secs,
+        }
+        with pytest.raises(ValueError, match="deprecated and no longer supported"):
+            _normalize_legacy_text_token_config(cfg)
+
+    def test_rejects_removed_shared_boundary_delay(self):
+        cfg = {
+            "sample_rate": 16000,
+            "frame_length_in_secs": FRAME_LEN,
+            "chunk_size": CHUNK_SIZE,
+            "utterance_boundary_delay_frames": 2,
+        }
+        with pytest.raises(ValueError, match="no longer supported"):
+            _normalize_legacy_text_token_config(cfg)
+
+    @pytest.mark.parametrize(
+        "field",
+        ["utterance_start_boundary_delay_frames", "utterance_end_boundary_delay_frames"],
+    )
+    def test_rejects_negative_boundary_delays(self, field):
+        kwargs = {field: -1}
+        with pytest.raises(ValueError, match="must be non-negative"):
+            StreamingSTTDataConfig(
+                sample_rate=16000,
+                frame_length_in_secs=FRAME_LEN,
+                chunk_size=CHUNK_SIZE,
+                **kwargs,
+            )
 
 
 # ===========================================================================
