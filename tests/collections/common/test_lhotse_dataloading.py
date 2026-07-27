@@ -31,6 +31,8 @@ from lhotse.testing.random import deterministic_rng
 from omegaconf import OmegaConf
 
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
+from nemo.collections.common.data.lhotse.dataloader import pad_extra_duration
+from nemo.collections.common.data.lhotse.nemo_adapters import LazyNeMoTarredIterator
 from nemo.collections.common.data.lhotse.text_adapters import SourceTargetTextExample, TextExample
 from nemo.collections.common.tokenizers.sentencepiece_tokenizer import SentencePieceTokenizer, create_spt_model
 
@@ -216,6 +218,45 @@ def nemo_tarred_manifest_path_multi(nemo_tarred_manifest_path: tuple[str, str]) 
         for item in load_jsonl(json_p):
             mft_writer.write(item)
     return f"{json_dir}/manifest__OP_0..1_CL_.jsonl", tar_p
+
+
+@pytest.fixture(scope="session")
+def nemo_tarred_manifest_path_multi_nonzero(
+    nemo_tarred_manifest_path_multi: tuple[str, str], tmp_path_factory
+) -> Tuple[str, str]:
+    """Two tarred-manifest shards whose IDs do not start at zero."""
+    manifest_pattern, tar_pattern = nemo_tarred_manifest_path_multi
+    root = tmp_path_factory.mktemp("nemo_tar_nonzero_shards")
+
+    for source_id, target_id in zip((0, 1), (117, 118)):
+        source_manifest = Path(manifest_pattern.replace("__OP_0..1_CL_", f"_{source_id}"))
+        source_tar = Path(tar_pattern.replace("__OP_0..1_CL_", f"_{source_id}"))
+        (root / f"manifest_{target_id}.jsonl").write_bytes(source_manifest.read_bytes())
+        (root / f"audios_{target_id}.tar").hardlink_to(source_tar)
+
+    return (
+        f"{root}/manifest__OP_117..118_CL_.jsonl",
+        f"{root}/audios__OP_117..118_CL_.tar",
+    )
+
+
+def test_tarred_manifest_paths_support_nonzero_shard_ids(
+    nemo_tarred_manifest_path_multi_nonzero: tuple[str, str],
+):
+    manifest_pattern, tar_pattern = nemo_tarred_manifest_path_multi_nonzero
+    cuts = list(
+        LazyNeMoTarredIterator(
+            manifest_path=manifest_pattern,
+            tar_paths=tar_pattern,
+            shard_seed=0,
+        )
+    )
+
+    assert len(cuts) == 10
+    assert {Path(cut.manifest_origin).name for cut in cuts} == {
+        "manifest_117.jsonl",
+        "manifest_118.jsonl",
+    }
 
 
 @pytest.fixture(scope="session")
@@ -3236,3 +3277,53 @@ def test_dataloader_reweight_temperature_mixed_leaf_and_group(
     nested_total = dataset_counts["N1"] + dataset_counts["N2"]
     assert dataset_counts["N1"] / nested_total == pytest.approx(0.5, abs=0.15)
     assert dataset_counts["N2"] / nested_total == pytest.approx(0.5, abs=0.15)
+
+
+def test_pad_extra_duration_legacy_global_behavior_is_unchanged():
+    cut = dummy_recording(100, duration=1.0, with_data=True).to_cut()
+    padded = pad_extra_duration(cut, extra_duration=0.5)
+    assert padded.duration == pytest.approx(1.5)
+
+
+@pytest.mark.parametrize(
+    ("per_cut_duration", "expected_duration"),
+    [(0.0, 1.0), (0.5, 1.5)],
+)
+def test_pad_extra_duration_uses_required_per_cut_field(per_cut_duration, expected_duration):
+    cut = dummy_recording(101, duration=1.0, with_data=True).to_cut()
+    cut.custom = {"pad_extra_duration": per_cut_duration}
+    padded = pad_extra_duration(
+        cut,
+        extra_duration=9.0,
+        extra_duration_field="pad_extra_duration",
+    )
+    assert padded.duration == pytest.approx(expected_duration)
+
+
+def test_pad_extra_duration_field_is_opt_in():
+    cut = dummy_recording(102, duration=1.0, with_data=True).to_cut()
+    cut.custom = {"pad_extra_duration": 0.0}
+    padded = pad_extra_duration(cut, extra_duration=0.5)
+    assert padded.duration == pytest.approx(1.5)
+
+
+def test_pad_extra_duration_rejects_missing_per_cut_field():
+    cut = dummy_recording(103, duration=1.0, with_data=True).to_cut()
+    with pytest.raises(ValueError, match="missing required custom field 'pad_extra_duration'"):
+        pad_extra_duration(cut, extra_duration=0.5, extra_duration_field="pad_extra_duration")
+
+
+@pytest.mark.parametrize("value", [True, "0.5", -0.1])
+def test_pad_extra_duration_rejects_invalid_per_cut_value(value):
+    cut = dummy_recording(104, duration=1.0, with_data=True).to_cut()
+    cut.custom = {"pad_extra_duration": value}
+    with pytest.raises((TypeError, ValueError), match="must be (a non-negative number|non-negative)"):
+        pad_extra_duration(cut, extra_duration=0.5, extra_duration_field="pad_extra_duration")
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_pad_extra_duration_rejects_nonfinite_per_cut_value(value):
+    cut = dummy_recording(105, duration=1.0, with_data=True).to_cut()
+    cut.custom = {"pad_extra_duration": value}
+    with pytest.raises(ValueError, match="must be finite"):
+        pad_extra_duration(cut, extra_duration=0.5, extra_duration_field="pad_extra_duration")

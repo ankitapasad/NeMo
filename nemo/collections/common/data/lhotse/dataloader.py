@@ -11,12 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
 import os
 import random
 import warnings
 from copy import deepcopy
 from dataclasses import dataclass
 from functools import partial
+from numbers import Real
 from typing import Any, List, Optional, Sequence, Tuple, Union
 
 import lhotse
@@ -202,6 +204,9 @@ class LhotseDataLoadingConfig:
     #      the sample will be padded with this probability, otherwise it is always padded with the extra duration.
     pad_extra_duration: Optional[float] = None
     pad_extra_duration_prob: Optional[float] = None
+    # Optional cut.custom field containing a per-cut extra duration. When unset, the
+    # global pad_extra_duration behavior is unchanged.
+    pad_extra_duration_field: Optional[str] = None
     #   g. Bandwidth limitation via back-and-forth resampling
     lowpass_enabled: bool = False
     lowpass_frequencies_interval: Tuple[float, float] = (3500.0, 8000.0)
@@ -607,10 +612,13 @@ def get_lhotse_sampler_from_config(config, global_rank, world_size, tokenizer=No
     if config.pad_min_duration is not None:
         cuts = cuts.pad(duration=config.pad_min_duration, direction=config.pad_direction, preserve_id=True)
 
-    if config.pad_extra_duration is not None:
+    if config.pad_extra_duration is not None or config.pad_extra_duration_field is not None:
         cuts = cuts.map(
             partial(
-                pad_extra_duration, extra_duration=config.pad_extra_duration, pad_prob=config.pad_extra_duration_prob
+                pad_extra_duration,
+                extra_duration=config.pad_extra_duration,
+                pad_prob=config.pad_extra_duration_prob,
+                extra_duration_field=config.pad_extra_duration_field,
             )
         )
 
@@ -935,7 +943,38 @@ def tokenize_with_prompt(example, tokenizer, prompt_format: str | PromptFormatte
     return example
 
 
-def pad_extra_duration(cut: Cut, extra_duration: float = 0.0, pad_prob: Optional[float] = None) -> Cut:
+def pad_extra_duration(
+    cut: Cut,
+    extra_duration: float = 0.0,
+    pad_prob: Optional[float] = None,
+    extra_duration_field: Optional[str] = None,
+) -> Cut:
+    if extra_duration_field is not None:
+        custom = cut.custom or {}
+        cut_id = getattr(cut, "id", "<unknown>")
+        if extra_duration_field not in custom:
+            raise ValueError(
+                f"Cut {cut_id!r} is missing required custom field {extra_duration_field!r} "
+                "for per-cut extra-duration padding"
+            )
+        per_cut_duration = custom[extra_duration_field]
+        if isinstance(per_cut_duration, bool) or not isinstance(per_cut_duration, Real):
+            raise TypeError(
+                f"Cut {cut_id!r} custom field {extra_duration_field!r} must be a non-negative number; "
+                f"got {per_cut_duration!r}"
+            )
+        per_cut_duration = float(per_cut_duration)
+        if not math.isfinite(per_cut_duration):
+            raise ValueError(
+                f"Cut {cut_id!r} custom field {extra_duration_field!r} must be finite; " f"got {per_cut_duration!r}"
+            )
+        if per_cut_duration < 0:
+            raise ValueError(
+                f"Cut {cut_id!r} custom field {extra_duration_field!r} must be non-negative; "
+                f"got {per_cut_duration!r}"
+            )
+        extra_duration = per_cut_duration
+
     if extra_duration is None or extra_duration == 0.0:
         return cut
     curr_duration = cut.duration
