@@ -128,6 +128,19 @@ def test_model_rejects_per_sample_timestamps_without_per_sample_boundaries():
         )
 
 
+def test_model_rejects_mismatched_agent_backchannel_flags():
+    cfg = _minimal_cfg()
+    cfg["enable_agent_backchannels"] = True
+    with pytest.raises(
+        ValueError,
+        match="model.enable_agent_backchannels and data.dataset.enable_agent_backchannels must match",
+    ):
+        streaming_stt_model.StreamingSTTModel(
+            cfg,
+            data_cfg={"enable_agent_backchannels": False},
+        )
+
+
 def test_model_init_adds_boundary_and_text_tokens(monkeypatch):
     fake_tokenizer = _FakeTokenizer()
     fake_llm = _FakeLLM()
@@ -147,6 +160,69 @@ def test_model_init_adds_boundary_and_text_tokens(monkeypatch):
     assert fake_llm.resize_sizes == [2, 4, 6]
     assert model._compact_write_token == "<|text_start|>"
     assert model._compact_end_token == "<|text_end|>"
+
+
+def test_model_init_adds_agent_backchannel_tokens_only_when_enabled(monkeypatch):
+    fake_tokenizer = _FakeTokenizer()
+    fake_llm = _FakeLLM()
+
+    monkeypatch.setattr(streaming_stt_model, "AutoTokenizer", lambda *args, **kwargs: fake_tokenizer)
+    monkeypatch.setattr(streaming_stt_model, "load_pretrained_hf", lambda *args, **kwargs: fake_llm)
+    monkeypatch.setattr(streaming_stt_model, "setup_perception", lambda *args, **kwargs: _fake_perception())
+    monkeypatch.setattr(streaming_stt_model, "ModelSummary", lambda *args, **kwargs: "summary")
+
+    cfg = _minimal_cfg()
+    cfg["enable_agent_backchannels"] = True
+    model = streaming_stt_model.StreamingSTTModel(
+        cfg,
+        data_cfg={
+            "enable_agent_backchannels": True,
+            "agent_backchannel_start_token": "<soab>",
+            "agent_backchannel_end_token": "<eoab>",
+        },
+    )
+
+    assert fake_tokenizer.added_batches == [
+        ["<blank>"],
+        ["<sou>", "<eou>"],
+        ["<soab>", "<eoab>"],
+        ["<|text_start|>", "<|text_end|>"],
+    ]
+    assert fake_llm.resize_sizes == [2, 4, 6, 8]
+    assert model.core_cfg.agent_backchannel_start_loss_weight == 1.0
+    assert model.core_cfg.agent_backchannel_end_loss_weight == 1.0
+
+
+def test_model_init_ignores_inactive_agent_backchannel_config_values(monkeypatch):
+    fake_tokenizer = _FakeTokenizer()
+    fake_llm = _FakeLLM()
+
+    monkeypatch.setattr(streaming_stt_model, "AutoTokenizer", lambda *args, **kwargs: fake_tokenizer)
+    monkeypatch.setattr(streaming_stt_model, "load_pretrained_hf", lambda *args, **kwargs: fake_llm)
+    monkeypatch.setattr(streaming_stt_model, "setup_perception", lambda *args, **kwargs: _fake_perception())
+    monkeypatch.setattr(streaming_stt_model, "ModelSummary", lambda *args, **kwargs: "summary")
+
+    cfg = _minimal_cfg()
+    cfg.update(
+        enable_agent_backchannels=False,
+        agent_backchannel_start_token="",
+        agent_backchannel_end_token="",
+    )
+    streaming_stt_model.StreamingSTTModel(
+        cfg,
+        data_cfg={
+            "enable_agent_backchannels": False,
+            "agent_backchannel_start_token": "",
+            "agent_backchannel_end_token": "",
+        },
+    )
+
+    assert fake_tokenizer.added_batches == [
+        ["<blank>"],
+        ["<sou>", "<eou>"],
+        ["<|text_start|>", "<|text_end|>"],
+    ]
+    assert fake_llm.resize_sizes == [2, 4, 6]
 
 
 def test_model_init_maps_legacy_te_config(monkeypatch):
@@ -225,11 +301,11 @@ def test_weighted_lm_loss_applies_separate_boundary_weights():
     assert torch.allclose(metrics["eou_ratio"], torch.tensor(0.25))
 
 
-def test_weighted_lm_loss_defaults_to_unweighted_boundary_tokens():
+def test_weighted_lm_loss_defaults_to_unweighted_boundary_tokens_without_backchannel_metrics():
     per_token_loss = torch.tensor([1.0, 2.0, 3.0])
     targets = torch.tensor([10, 11, 13])
 
-    loss, _ = streaming_stt_model._compute_weighted_lm_loss(
+    loss, metrics = streaming_stt_model._compute_weighted_lm_loss(
         per_token_loss=per_token_loss,
         flat_targets=targets,
         blank_id=12,
@@ -240,6 +316,31 @@ def test_weighted_lm_loss_defaults_to_unweighted_boundary_tokens():
     )
 
     assert torch.allclose(loss, per_token_loss.mean())
+    assert {"loss_soab", "loss_eoab", "soab_ratio", "eoab_ratio"}.isdisjoint(metrics)
+
+
+def test_weighted_lm_loss_applies_agent_backchannel_marker_weights_only_to_markers():
+    per_token_loss = torch.tensor([1.0, 2.0, 3.0, 4.0])
+    targets = torch.tensor([20, 21, 22, 23])
+
+    loss, metrics = streaming_stt_model._compute_weighted_lm_loss(
+        per_token_loss=per_token_loss,
+        flat_targets=targets,
+        blank_id=23,
+        has_blank=True,
+        blank_loss_weight=1.0,
+        soab_id=20,
+        eoab_id=22,
+        agent_backchannel_start_loss_weight=2.0,
+        agent_backchannel_end_loss_weight=5.0,
+    )
+
+    expected = torch.tensor((1.0 * 2.0 + 2.0 + 3.0 * 5.0 + 4.0) / (2.0 + 1.0 + 5.0 + 1.0))
+    assert torch.allclose(loss, expected)
+    assert torch.allclose(metrics["loss_soab"], torch.tensor(1.0))
+    assert torch.allclose(metrics["loss_eoab"], torch.tensor(3.0))
+    assert torch.allclose(metrics["soab_ratio"], torch.tensor(0.25))
+    assert torch.allclose(metrics["eoab_ratio"], torch.tensor(0.25))
 
 
 class _ValidationLogger:
@@ -307,6 +408,41 @@ def test_validation_epoch_end_logs_boundary_metrics_by_loader_and_overall():
     assert all(not metric.startswith("val_boundary") for metric in model.logged)
     assert "val_sou_target_per_sample" not in model.logged
     assert "val_eou_target_per_sample" not in model.logged
+    assert not any("backchannel" in metric or "soab" in metric or "eoab" in metric for metric in model.logged)
+
+
+def test_validation_epoch_end_logs_only_pooled_output_backchannel_metrics():
+    model = _ValidationLogger()
+    model.core_cfg = SimpleNamespace(
+        enable_validation_checkpoint_score=False,
+        enable_agent_backchannels=True,
+    )
+    streaming_stt_model.StreamingSTTModel.on_validation_epoch_start(model)
+    first = {
+        "num_samples": 2,
+        "paired_backchannel_count": 3,
+        "unpaired_soab_count": 1,
+        "unpaired_eoab_count": 0,
+        "hardcoded_backchannel_count": 2,
+    }
+    second = {
+        "num_samples": 1,
+        "paired_backchannel_count": 1,
+        "unpaired_soab_count": 0,
+        "unpaired_eoab_count": 2,
+        "hardcoded_backchannel_count": 1,
+    }
+    for values in (first, second):
+        for metric, value in values.items():
+            model._partial_agent_backchannel_metrics[metric].append(torch.tensor(value))
+
+    streaming_stt_model.StreamingSTTModel.on_validation_epoch_end(model)
+
+    assert model.logged["val_paired_backchannel_tokens_per_utterance"].item() == pytest.approx(4 / 3)
+    assert model.logged["val_unpaired_soab_tokens_per_utterance"].item() == pytest.approx(1 / 3)
+    assert model.logged["val_unpaired_eoab_tokens_per_utterance"].item() == pytest.approx(2 / 3)
+    assert model.logged["val_hardcoded_backchannel_rate"].item() == pytest.approx(3 / 4)
+    assert not any("d7_complete" in metric or "d7_pause" in metric for metric in model.logged)
 
 
 def test_validation_epoch_end_checkpoint_score_equal_weights_three_cohorts():

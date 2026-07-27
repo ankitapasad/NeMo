@@ -44,11 +44,13 @@ from nemo.collections.speechlm2.data.streaming_stt_dataset import (
     _tokenize_compact_with_assistant_mask,
     _tokenize_with_assistant_mask,
     add_gt_utterance_boundary_alignments,
+    build_agent_backchannel_alignments,
     build_compact_turn_markers,
     compute_word_spans,
     decode_with_blank,
     get_llm_messages_for_batch,
     get_llm_messages_for_sample,
+    merge_agent_backchannel_alignments,
 )
 from nemo.collections.speechlm2.parts.alignments import WordAlignment, add_utterance_boundary_alignments
 
@@ -65,6 +67,15 @@ DOCSTRING_ALIGNMENTS = [
     WordAlignment(text="Hello", start_time=0.16, end_time=0.48),
     WordAlignment(text="World", start_time=0.60, end_time=0.80),
 ]
+
+
+def _confirmed_fragment(text="Okay.", start=0.4, duration=0.2, status="confirmed"):
+    return {
+        "backchannel": {"status": status},
+        "duration": duration,
+        "start": start,
+        "text": text,
+    }
 
 
 def _make_messages(**overrides):
@@ -980,6 +991,240 @@ class TestGetLlmMessagesForBatch:
         )
         assert batch[0][0] == {"role": SYSTEM_ROLE, "content": "Transcribe in English."}
         assert batch[1][0] == {"role": SYSTEM_ROLE, "content": "Transcribe in French."}
+
+
+# ===========================================================================
+# Tests: agent backchannel target construction
+# ===========================================================================
+class TestAgentBackchannelTargets:
+
+    def test_builds_exact_first_manifest_example_as_atomic_zero_delay_alignment(self):
+        custom = {
+            "utterance_start_time": 1.0,
+            "utterance_end_time": 22.2,
+            "curation": {
+                "other_speaker": {
+                    "fragments": [_confirmed_fragment(text="Okay.", start=8.510000000000002, duration=0.4)]
+                }
+            },
+        }
+
+        result = build_agent_backchannel_alignments(
+            custom,
+            audio_duration_secs=23.2,
+            start_token="<soab>",
+            end_token="<eoab>",
+            delay_frames=0,
+            cut_id="first-manifest-row",
+        )
+
+        assert result == [
+            WordAlignment(
+                text="<soab>Okay.<eoab>",
+                start_time=8.510000000000002,
+                end_time=8.510000000000002,
+                delay_frames=0,
+            )
+        ]
+
+    def test_keeps_only_confirmed_fully_contained_fragments(self):
+        custom = {
+            "utterance_start_time": 1.0,
+            "utterance_end_time": 3.0,
+            "curation": {
+                "other_speaker": {
+                    "fragments": [
+                        _confirmed_fragment(text="before clip", start=-0.1, duration=0.2),
+                        _confirmed_fragment(text="before utterance", start=0.5, duration=0.2),
+                        _confirmed_fragment(text="valid", start=1.2, duration=0.2),
+                        _confirmed_fragment(text="crosses utterance", start=2.9, duration=0.2),
+                        _confirmed_fragment(text="crosses clip", start=3.9, duration=0.2),
+                        _confirmed_fragment(text="review", start=1.4, duration=0.2, status="review_candidate"),
+                    ]
+                }
+            },
+        }
+
+        result = build_agent_backchannel_alignments(
+            custom,
+            audio_duration_secs=4.0,
+            start_token="<soab>",
+            end_token="<eoab>",
+            cut_id="containment-cut",
+        )
+
+        assert [item.text for item in result] == ["<soab>valid<eoab>"]
+
+    def test_missing_curation_is_noop(self):
+        assert (
+            build_agent_backchannel_alignments(
+                {},
+                audio_duration_secs=1.0,
+                start_token="<soab>",
+                end_token="<eoab>",
+            )
+            == []
+        )
+
+    def test_malformed_confirmed_fragment_is_hard_error(self):
+        custom = {
+            "utterance_start_time": 0.0,
+            "utterance_end_time": 1.0,
+            "curation": {
+                "other_speaker": {
+                    "fragments": [
+                        {
+                            "backchannel": {"status": "confirmed"},
+                            "start": 0.4,
+                            "text": "Okay.",
+                        }
+                    ]
+                }
+            },
+        }
+
+        with pytest.raises(TypeError, match="duration"):
+            build_agent_backchannel_alignments(
+                custom,
+                audio_duration_secs=1.0,
+                start_token="<soab>",
+                end_token="<eoab>",
+                cut_id="malformed-cut",
+            )
+
+    def test_merge_uses_ready_frame_and_transcript_wins_ties(self):
+        existing = [
+            WordAlignment("<sou>", 0.1, 0.1, delay_frames=2),
+            WordAlignment("first", 0.5, 2.0),
+            WordAlignment("second", 2.1, 3.0),
+            WordAlignment("<eou>", 3.2, 3.2, delay_frames=2),
+        ]
+        # At frame length 0.1, first is ready at ceil(2.0/0.1)+3 = 23.
+        backchannels = [WordAlignment("<soab>Okay.<eoab>", 2.3, 2.3, delay_frames=0)]
+
+        merged = merge_agent_backchannel_alignments(
+            existing,
+            backchannels,
+            frame_length_in_secs=0.1,
+            default_delay_frames=3,
+        )
+
+        assert [item.text for item in merged] == [
+            "<sou>",
+            "first",
+            "<soab>Okay.<eoab>",
+            "second",
+            "<eou>",
+        ]
+
+    def test_zero_delay_onset_emits_at_first_available_chunk_boundary(self):
+        messages = get_llm_messages_for_sample(
+            system_role=SYSTEM_ROLE,
+            system_prompt=SYSTEM_PROMPT,
+            audio_tag=AUDIO_TAG,
+            blank_token=BLANK_TOKEN,
+            chunk_size=2,
+            num_delay_frames=3,
+            audio_duration_secs=9.0,
+            frame_length_in_secs=0.08,
+            alignments=[WordAlignment("<soab>Okay.<eoab>", 8.51, 8.51, delay_frames=0)],
+            transcript="",
+        )
+        assistant_contents = [message["content"] for message in messages if message["role"] == "assistant"]
+
+        assert assistant_contents.index("<soab>Okay.<eoab>") == 53
+        assert (53 + 1) * 2 * 0.08 == pytest.approx(8.64)
+
+    def test_same_chunk_backchannel_preserves_original_transcript_whitespace(self):
+        messages = get_llm_messages_for_sample(
+            system_role=SYSTEM_ROLE,
+            system_prompt=SYSTEM_PROMPT,
+            audio_tag=AUDIO_TAG,
+            blank_token=BLANK_TOKEN,
+            chunk_size=4,
+            num_delay_frames=0,
+            audio_duration_secs=0.32,
+            frame_length_in_secs=0.08,
+            alignments=[
+                WordAlignment("Hello", 0.0, 0.16),
+                WordAlignment("<soab>Okay.<eoab>", 0.16, 0.16, delay_frames=0),
+                WordAlignment("world", 0.16, 0.32),
+            ],
+            transcript="Hello world",
+            agent_backchannel_start_token="<soab>",
+            agent_backchannel_end_token="<eoab>",
+        )
+        assistant_contents = [message["content"] for message in messages if message["role"] == "assistant"]
+
+        assert assistant_contents == ["Hello<soab>Okay.<eoab> world"]
+
+    def test_backchannel_does_not_synthesize_space_before_unspaced_fallback_text(self):
+        messages = get_llm_messages_for_sample(
+            system_role=SYSTEM_ROLE,
+            system_prompt=SYSTEM_PROMPT,
+            audio_tag=AUDIO_TAG,
+            blank_token=BLANK_TOKEN,
+            chunk_size=4,
+            num_delay_frames=0,
+            audio_duration_secs=0.32,
+            frame_length_in_secs=0.08,
+            alignments=[
+                WordAlignment("<soab>Okay.<eoab>", 0.16, 0.16, delay_frames=0),
+                WordAlignment("Hello", 0.16, 0.32),
+            ],
+            agent_backchannel_start_token="<soab>",
+            agent_backchannel_end_token="<eoab>",
+        )
+        assistant_contents = [message["content"] for message in messages if message["role"] == "assistant"]
+
+        assert assistant_contents == ["<soab>Okay.<eoab>Hello"]
+
+    def test_disabled_flag_is_byte_identical_when_curation_is_present(self):
+        cfg = {
+            "sample_rate": 16000,
+            "frame_length_in_secs": FRAME_LEN,
+            "chunk_size": CHUNK_SIZE,
+            "num_delay_frames": 0,
+            "audio_tag": AUDIO_TAG,
+            "blank_token": BLANK_TOKEN,
+        }
+        custom_with_curation = {
+            "utterance_start_time": 0.0,
+            "utterance_end_time": 1.0,
+            "curation": {"other_speaker": {"fragments": [_confirmed_fragment()]}},
+        }
+        common = dict(
+            audios=torch.zeros(1, 16000),
+            audio_lens=torch.tensor([16000]),
+            alignments=[[WordAlignment("Hello", 0.16, 0.48)]],
+            text=["Hello"],
+        )
+
+        with_metadata = StreamingSTTDataset(cfg=cfg, tokenizer=_MockNemoTokenizer(_MockHFTokenizer()))
+        without_metadata = StreamingSTTDataset(cfg=cfg, tokenizer=_MockNemoTokenizer(_MockHFTokenizer()))
+        batch_with = with_metadata.get_batch_data(
+            cuts=[SimpleNamespace(id="with-curation", custom=custom_with_curation)], **common
+        )
+        batch_without = without_metadata.get_batch_data(
+            cuts=[SimpleNamespace(id="without-curation", custom={})], **common
+        )
+
+        assert with_metadata.cfg.enable_agent_backchannels is False
+        assert torch.equal(batch_with.input_tokens, batch_without.input_tokens)
+        assert torch.equal(batch_with.target_tokens, batch_without.target_tokens)
+
+    def test_disabled_flag_ignores_inactive_backchannel_config_values(self):
+        cfg = StreamingSTTDataConfig(
+            sample_rate=16000,
+            frame_length_in_secs=FRAME_LEN,
+            chunk_size=CHUNK_SIZE,
+            enable_agent_backchannels=False,
+            agent_backchannel_start_token="",
+            agent_backchannel_end_token="",
+            agent_backchannel_delay_frames=-1,
+        )
+
+        assert cfg.enable_agent_backchannels is False
 
 
 # ===========================================================================

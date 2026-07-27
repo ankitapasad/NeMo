@@ -44,6 +44,7 @@ from nemo.collections.speechlm2.data.streaming_stt_dataset import (
 from nemo.collections.speechlm2.parts.alignments import ForcedAligner
 from nemo.collections.speechlm2.parts.hf_hub import HFHubMixin
 from nemo.collections.speechlm2.parts.lora import maybe_install_lora
+from nemo.collections.speechlm2.parts.metrics.backchannel import compute_agent_backchannel_output_metrics
 from nemo.collections.speechlm2.parts.metrics.boundary import (
     boundary_collar_precision_recall_f1,
     compute_boundary_token_metrics,
@@ -164,6 +165,11 @@ class StreamingSTTModelConfig:
     utterance_end_token: str = "<eou>"
     utterance_start_loss_weight: float = 1.0
     utterance_end_loss_weight: float = 1.0
+    enable_agent_backchannels: bool = False
+    agent_backchannel_start_token: str = "<soab>"
+    agent_backchannel_end_token: str = "<eoab>"
+    agent_backchannel_start_loss_weight: float = 1.0
+    agent_backchannel_end_loss_weight: float = 1.0
     # When enabled, validation logs a cohort-macro score: boundary-aware
     # dataloaders contribute mean(SOU F1, EOU F1), while transcript-only
     # dataloaders contribute token accuracy. Each dataloader has equal weight.
@@ -213,12 +219,18 @@ def _compute_weighted_lm_loss(
     eou_id: Optional[int] = None,
     utterance_start_loss_weight: float = 1.0,
     utterance_end_loss_weight: float = 1.0,
+    soab_id: Optional[int] = None,
+    eoab_id: Optional[int] = None,
+    agent_backchannel_start_loss_weight: float = 1.0,
+    agent_backchannel_end_loss_weight: float = 1.0,
 ) -> tuple[Tensor, dict[str, Tensor]]:
     valid_mask = flat_targets != IGNORE_INDEX
 
     is_blank = valid_mask & (flat_targets == blank_id)
     is_sou = valid_mask & (flat_targets == sou_id) if sou_id is not None else torch.zeros_like(valid_mask)
     is_eou = valid_mask & (flat_targets == eou_id) if eou_id is not None else torch.zeros_like(valid_mask)
+    is_soab = valid_mask & (flat_targets == soab_id) if soab_id is not None else None
+    is_eoab = valid_mask & (flat_targets == eoab_id) if eoab_id is not None else None
     is_nonblank = valid_mask & (flat_targets != blank_id)
 
     num_targets = valid_mask.long().sum()
@@ -226,6 +238,8 @@ def _compute_weighted_lm_loss(
     num_nonblank = is_nonblank.sum()
     num_sou = is_sou.sum()
     num_eou = is_eou.sum()
+    num_soab = is_soab.sum() if is_soab is not None else None
+    num_eoab = is_eoab.sum() if is_eoab is not None else None
 
     loss_weights = torch.ones_like(per_token_loss)
     if num_blank > 0 and blank_loss_weight != 1.0 and has_blank:
@@ -234,6 +248,14 @@ def _compute_weighted_lm_loss(
         loss_weights = torch.where(is_sou, torch.full_like(loss_weights, utterance_start_loss_weight), loss_weights)
     if eou_id is not None and utterance_end_loss_weight != 1.0:
         loss_weights = torch.where(is_eou, torch.full_like(loss_weights, utterance_end_loss_weight), loss_weights)
+    if is_soab is not None and agent_backchannel_start_loss_weight != 1.0:
+        loss_weights = torch.where(
+            is_soab, torch.full_like(loss_weights, agent_backchannel_start_loss_weight), loss_weights
+        )
+    if is_eoab is not None and agent_backchannel_end_loss_weight != 1.0:
+        loss_weights = torch.where(
+            is_eoab, torch.full_like(loss_weights, agent_backchannel_end_loss_weight), loss_weights
+        )
 
     valid_weights = loss_weights[valid_mask]
     loss = (per_token_loss[valid_mask] * valid_weights).sum() / valid_weights.sum().clamp(min=1)
@@ -248,6 +270,20 @@ def _compute_weighted_lm_loss(
             "sou_ratio": num_sou.float() / num_targets.clamp(min=1),
             "eou_ratio": num_eou.float() / num_targets.clamp(min=1),
         }
+        if is_soab is not None:
+            metrics.update(
+                {
+                    "loss_soab": per_token_loss[is_soab].sum() / num_soab.clamp(min=1),
+                    "soab_ratio": num_soab.float() / num_targets.clamp(min=1),
+                }
+            )
+        if is_eoab is not None:
+            metrics.update(
+                {
+                    "loss_eoab": per_token_loss[is_eoab].sum() / num_eoab.clamp(min=1),
+                    "eoab_ratio": num_eoab.float() / num_targets.clamp(min=1),
+                }
+            )
 
     return loss, metrics
 
@@ -316,6 +352,30 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 "use_per_sample_utterance_boundary_timestamps=True requires "
                 "use_per_sample_utterance_boundary_tokens=True"
             )
+        if data_cfg is not None:
+            data_backchannels_enabled = bool(data_cfg.get("enable_agent_backchannels", False))
+            if data_backchannels_enabled != self.core_cfg.enable_agent_backchannels:
+                raise ValueError(
+                    "model.enable_agent_backchannels and data.dataset.enable_agent_backchannels must match"
+                )
+            if self.core_cfg.enable_agent_backchannels:
+                data_start_token = data_cfg.get(
+                    "agent_backchannel_start_token", self.core_cfg.agent_backchannel_start_token
+                )
+                data_end_token = data_cfg.get(
+                    "agent_backchannel_end_token", self.core_cfg.agent_backchannel_end_token
+                )
+                if (
+                    data_start_token != self.core_cfg.agent_backchannel_start_token
+                    or data_end_token != self.core_cfg.agent_backchannel_end_token
+                ):
+                    raise ValueError("model and dataset agent backchannel marker tokens must match")
+        if self.core_cfg.enable_agent_backchannels and (
+            not self.core_cfg.agent_backchannel_start_token
+            or not self.core_cfg.agent_backchannel_end_token
+            or self.core_cfg.agent_backchannel_start_token == self.core_cfg.agent_backchannel_end_token
+        ):
+            raise ValueError("agent backchannel start/end tokens must be non-empty and different")
 
         # --- LLM ---
         self.tokenizer = AutoTokenizer(self.core_cfg.pretrained_llm, use_fast=True)
@@ -351,6 +411,21 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 logging.info(f"Added utterance boundary tokens to tokenizer: {missing_boundary_tokens}")
             else:
                 logging.info(f"Utterance boundary tokens already in tokenizer: {boundary_tokens}")
+
+        if self.core_cfg.enable_agent_backchannels:
+            backchannel_tokens = [
+                self.core_cfg.agent_backchannel_start_token,
+                self.core_cfg.agent_backchannel_end_token,
+            ]
+            missing_backchannel_tokens = [
+                token for token in backchannel_tokens if not token_in_vocab(token, self.tokenizer)
+            ]
+            if missing_backchannel_tokens:
+                self.tokenizer.add_special_tokens({"additional_special_tokens": missing_backchannel_tokens})
+                self.llm.resize_token_embeddings(len(self.tokenizer.tokenizer))
+                logging.info(f"Added agent backchannel tokens to tokenizer: {missing_backchannel_tokens}")
+            else:
+                logging.info(f"Agent backchannel tokens already in tokenizer: {backchannel_tokens}")
 
         # Compact-template boundary tokens: default keeps the existing Qwen
         # <|im_start|>/<|im_end|> behavior. When use_text_tokens=True, add the
@@ -724,8 +799,11 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         # --- Weighted LM loss breakdown ---
         blank_id = self.blank_token_id
         sou_id, eou_id = None, None
+        soab_id, eoab_id = None, None
         if self.core_cfg.add_utterance_boundary_tokens:
             sou_id, eou_id = self._get_boundary_token_ids()
+        if self.core_cfg.enable_agent_backchannels:
+            soab_id, eoab_id = self._get_agent_backchannel_token_ids()
         loss, loss_metrics = _compute_weighted_lm_loss(
             per_token_loss=per_token_loss,
             flat_targets=flat_targets,
@@ -736,6 +814,10 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             eou_id=eou_id,
             utterance_start_loss_weight=self.core_cfg.utterance_start_loss_weight,
             utterance_end_loss_weight=self.core_cfg.utterance_end_loss_weight,
+            soab_id=soab_id,
+            eoab_id=eoab_id,
+            agent_backchannel_start_loss_weight=self.core_cfg.agent_backchannel_start_loss_weight,
+            agent_backchannel_end_loss_weight=self.core_cfg.agent_backchannel_end_loss_weight,
         )
 
         # --- Aux chunk-boundary classifier loss ---
@@ -778,27 +860,34 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 )
 
         B, L = inputs["input_embeds"].shape[:2]
-        self.log_dict(
-            {
-                "loss": loss,
-                "loss_blank": loss_metrics["loss_blank"],
-                "loss_nonblank": loss_metrics["loss_nonblank"],
-                "loss_sou": loss_metrics["loss_sou"],
-                "loss_eou": loss_metrics["loss_eou"],
-                "loss_chunk_cls": cls_loss_log,
-                "blank_ratio": loss_metrics["blank_ratio"],
-                "sou_ratio": loss_metrics["sou_ratio"],
-                "eou_ratio": loss_metrics["eou_ratio"],
-                "learning_rate": torch.as_tensor(
-                    self.trainer.optimizers[0].param_groups[0]["lr"] if self._trainer is not None else 0
-                ),
-                "batch_size": float(B),
-                "sequence_length": float(L),
-                "num_targets": num_targets.float(),
-                "target_to_input_ratio": num_targets / (B * L),
-            },
-            on_step=True,
-        )
+        train_metrics = {
+            "loss": loss,
+            "loss_blank": loss_metrics["loss_blank"],
+            "loss_nonblank": loss_metrics["loss_nonblank"],
+            "loss_sou": loss_metrics["loss_sou"],
+            "loss_eou": loss_metrics["loss_eou"],
+            "loss_chunk_cls": cls_loss_log,
+            "blank_ratio": loss_metrics["blank_ratio"],
+            "sou_ratio": loss_metrics["sou_ratio"],
+            "eou_ratio": loss_metrics["eou_ratio"],
+            "learning_rate": torch.as_tensor(
+                self.trainer.optimizers[0].param_groups[0]["lr"] if self._trainer is not None else 0
+            ),
+            "batch_size": float(B),
+            "sequence_length": float(L),
+            "num_targets": num_targets.float(),
+            "target_to_input_ratio": num_targets / (B * L),
+        }
+        if self.core_cfg.enable_agent_backchannels:
+            train_metrics.update(
+                {
+                    "loss_soab": loss_metrics["loss_soab"],
+                    "loss_eoab": loss_metrics["loss_eoab"],
+                    "soab_ratio": loss_metrics["soab_ratio"],
+                    "eoab_ratio": loss_metrics["eoab_ratio"],
+                }
+            )
+        self.log_dict(train_metrics, on_step=True)
         return {"loss": loss}
 
     def configure_optimizers(self):
@@ -812,6 +901,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         self._partial_val_losses: dict[str, list] = defaultdict(list)
         self._partial_accuracies: dict[str, list] = defaultdict(list)
         self._partial_boundary_metrics: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
+        self._partial_agent_backchannel_metrics: dict[str, list] = defaultdict(list)
         # Per-class TP/total counts for the aux chunk classifier. Aggregated
         # across the epoch so macro acc isn't biased by per-batch composition.
         self._partial_aux_pos_correct: dict[str, list] = defaultdict(list)
@@ -912,6 +1002,34 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 sync_dist=True,
             )
 
+        # Output-only agent backchannel structure/lexicon metrics. These are
+        # intentionally pooled across validation loaders and never compared to
+        # ground-truth backchannel timing or text.
+        if (
+            getattr(getattr(self, "core_cfg", None), "enable_agent_backchannels", False)
+            and self._partial_agent_backchannel_metrics
+        ):
+            totals = {
+                metric: torch.stack(values).sum()
+                for metric, values in self._partial_agent_backchannel_metrics.items()
+                if values
+            }
+            num_samples = totals["num_samples"].clamp(min=1).float()
+            paired = totals["paired_backchannel_count"]
+            self.log_dict(
+                {
+                    "val_paired_backchannel_tokens_per_utterance": paired.float() / num_samples,
+                    "val_unpaired_soab_tokens_per_utterance": totals["unpaired_soab_count"].float()
+                    / num_samples,
+                    "val_unpaired_eoab_tokens_per_utterance": totals["unpaired_eoab_count"].float()
+                    / num_samples,
+                    "val_hardcoded_backchannel_rate": totals["hardcoded_backchannel_count"].float()
+                    / paired.clamp(min=1).float(),
+                },
+                on_epoch=True,
+                sync_dist=True,
+            )
+
         # --- Aux chunk classifier: macro accuracy ---
         # Sum per-class counts across the epoch and compute pos/neg accuracy
         # once at the end. Macro acc = (pos_acc + neg_acc) / 2 — class-balanced.
@@ -934,6 +1052,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         self._partial_val_losses.clear()
         self._partial_accuracies.clear()
         self._partial_boundary_metrics.clear()
+        self._partial_agent_backchannel_metrics.clear()
         self._partial_aux_pos_correct.clear()
         self._partial_aux_pos_total.clear()
         self._partial_aux_neg_correct.clear()
@@ -954,6 +1073,43 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             )
             return None, None
         return sou_ids[0], eou_ids[0]
+
+    def _get_agent_backchannel_token_ids(self) -> tuple[int, int] | tuple[None, None]:
+        if not self.core_cfg.enable_agent_backchannels:
+            return None, None
+
+        hf_tok = self.tokenizer.tokenizer
+        soab_ids = hf_tok.encode(self.core_cfg.agent_backchannel_start_token, add_special_tokens=False)
+        eoab_ids = hf_tok.encode(self.core_cfg.agent_backchannel_end_token, add_special_tokens=False)
+        if len(soab_ids) != 1 or len(eoab_ids) != 1:
+            raise ValueError(
+                "agent backchannel markers must each encode to one token; "
+                f"got {self.core_cfg.agent_backchannel_start_token!r}->{soab_ids}, "
+                f"{self.core_cfg.agent_backchannel_end_token!r}->{eoab_ids}"
+            )
+        return soab_ids[0], eoab_ids[0]
+
+    def _compute_agent_backchannel_metrics(self, pred_ids: Tensor, target_ids: Tensor) -> dict[str, Tensor]:
+        soab_id, eoab_id = self._get_agent_backchannel_token_ids()
+        if soab_id is None or eoab_id is None:
+            return {}
+
+        hf_tok = self.tokenizer.tokenizer
+
+        def decode_token_ids(token_ids: list[int]) -> str:
+            return hf_tok.decode(
+                token_ids,
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )
+
+        return compute_agent_backchannel_output_metrics(
+            pred_ids,
+            target_ids != IGNORE_INDEX,
+            soab_id=soab_id,
+            eoab_id=eoab_id,
+            decode_token_ids=decode_token_ids,
+        )
 
     def _compute_boundary_metrics(
         self, pred_ids: Tensor, target_ids: Tensor, input_tokens: Tensor
@@ -1024,6 +1180,10 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         boundary_metrics = self._compute_boundary_metrics(pred_ids, target_ids, batch.input_tokens)
         for metric, value in boundary_metrics.items():
             self._partial_boundary_metrics[name][metric].append(value.detach())
+
+        agent_backchannel_metrics = self._compute_agent_backchannel_metrics(pred_ids, target_ids)
+        for metric, value in agent_backchannel_metrics.items():
+            self._partial_agent_backchannel_metrics[metric].append(value.detach())
 
         preds = pred_ids.view(-1)
         refs = target_ids.reshape(-1)

@@ -16,9 +16,10 @@ import logging
 import math
 import os
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from numbers import Real
-from typing import Iterable, List, Optional, Union
+from typing import Any, Iterable, List, Optional, Union
 
 import numpy as np
 import torch
@@ -176,6 +177,12 @@ class StreamingSTTDataConfig:
     # alignments do not inherit num_delay_frames.
     utterance_start_boundary_delay_frames: int = 2
     utterance_end_boundary_delay_frames: int = 2
+    # Opt-in agent-backchannel targets sourced from D7 curation metadata.
+    # This is deliberately independent from utterance boundary training.
+    enable_agent_backchannels: bool = False
+    agent_backchannel_start_token: str = "<soab>"
+    agent_backchannel_end_token: str = "<eoab>"
+    agent_backchannel_delay_frames: int = 0
     # K — only effective in dynamic chunking (chunk_size == 0). Each audio
     # segment is rounded UP to a multiple of K frames (and total audio is
     # padded to K-multiple). The model implicitly learns to emit only at
@@ -188,6 +195,13 @@ class StreamingSTTDataConfig:
             raise ValueError("utterance_start_boundary_delay_frames must be non-negative")
         if self.utterance_end_boundary_delay_frames < 0:
             raise ValueError("utterance_end_boundary_delay_frames must be non-negative")
+        if self.enable_agent_backchannels:
+            if self.agent_backchannel_delay_frames < 0:
+                raise ValueError("agent_backchannel_delay_frames must be non-negative")
+            if not self.agent_backchannel_start_token or not self.agent_backchannel_end_token:
+                raise ValueError("agent backchannel tokens must be non-empty")
+            if self.agent_backchannel_start_token == self.agent_backchannel_end_token:
+                raise ValueError("agent backchannel start and end tokens must be different")
 
 
 def _normalize_legacy_text_token_config(cfg: DictConfig | dict) -> DictConfig | dict:
@@ -363,6 +377,152 @@ def _validate_timestamp(value, *, field: str, cut_id: str) -> float:
     return value
 
 
+def build_agent_backchannel_alignments(
+    custom: Mapping[str, Any],
+    *,
+    audio_duration_secs: float,
+    start_token: str,
+    end_token: str,
+    delay_frames: int = 0,
+    cut_id: str = "<unknown>",
+) -> List[WordAlignment]:
+    """Build atomic agent-backchannel alignments from D7 curation metadata.
+
+    Only ``confirmed`` fragments that are fully contained in both the extracted
+    clip and the primary-speaker utterance are eligible. The metadata text is
+    preserved exactly inside one atomic ``<soab>...<eoab>`` alignment scheduled
+    from the fragment onset.
+
+    Samples without D7 curation metadata are a no-op. Once a fragment declares
+    itself confirmed, malformed required fields are treated as data errors rather
+    than silently dropping a supervised event.
+    """
+    if not isinstance(custom, Mapping):
+        raise TypeError(f"Cut {cut_id!r} custom metadata must be a mapping; got {type(custom).__name__}")
+    if delay_frames < 0:
+        raise ValueError(f"agent backchannel delay_frames must be non-negative; got {delay_frames}")
+    if not start_token or not end_token or start_token == end_token:
+        raise ValueError("agent backchannel start/end tokens must be non-empty and different")
+
+    curation = custom.get("curation")
+    if curation is None:
+        return []
+    if not isinstance(curation, Mapping):
+        raise TypeError(f"Cut {cut_id!r} custom field 'curation' must be a mapping")
+    other_speaker = curation.get("other_speaker")
+    if other_speaker is None:
+        return []
+    if not isinstance(other_speaker, Mapping):
+        raise TypeError(f"Cut {cut_id!r} curation.other_speaker must be a mapping")
+    fragments = other_speaker.get("fragments", [])
+    if not isinstance(fragments, list):
+        raise TypeError(f"Cut {cut_id!r} curation.other_speaker.fragments must be a list")
+
+    confirmed_fragments: list[tuple[int, Mapping[str, Any]]] = []
+    for fragment_idx, fragment in enumerate(fragments):
+        if not isinstance(fragment, Mapping):
+            raise TypeError(
+                f"Cut {cut_id!r} curation.other_speaker.fragments[{fragment_idx}] must be a mapping"
+            )
+        backchannel = fragment.get("backchannel")
+        if backchannel is None:
+            continue
+        if not isinstance(backchannel, Mapping):
+            raise TypeError(
+                f"Cut {cut_id!r} curation.other_speaker.fragments[{fragment_idx}].backchannel must be a mapping"
+            )
+        if backchannel.get("status") == "confirmed":
+            confirmed_fragments.append((fragment_idx, fragment))
+
+    if not confirmed_fragments:
+        return []
+
+    duration = _validate_timestamp(audio_duration_secs, field="audio_duration_secs", cut_id=cut_id)
+    utterance_start = _validate_timestamp(
+        custom.get("utterance_start_time"), field="utterance_start_time", cut_id=cut_id
+    )
+    utterance_end = _validate_timestamp(
+        custom.get("utterance_end_time"), field="utterance_end_time", cut_id=cut_id
+    )
+    if duration < 0 or utterance_start < 0 or utterance_end < utterance_start or utterance_end > duration + 1e-6:
+        raise ValueError(
+            f"Cut {cut_id!r} requires 0 <= utterance_start_time <= utterance_end_time <= audio duration; "
+            f"got start={utterance_start}, end={utterance_end}, duration={duration}"
+        )
+
+    alignments: list[WordAlignment] = []
+    for fragment_idx, fragment in confirmed_fragments:
+        prefix = f"curation.other_speaker.fragments[{fragment_idx}]"
+        text = fragment.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise TypeError(f"Cut {cut_id!r} confirmed {prefix}.text must be a non-empty string; got {text!r}")
+        if start_token in text or end_token in text:
+            raise ValueError(f"Cut {cut_id!r} confirmed {prefix}.text contains an agent backchannel marker")
+        start = _validate_timestamp(fragment.get("start"), field=f"{prefix}.start", cut_id=cut_id)
+        fragment_duration = _validate_timestamp(
+            fragment.get("duration"), field=f"{prefix}.duration", cut_id=cut_id
+        )
+        if fragment_duration < 0:
+            raise ValueError(
+                f"Cut {cut_id!r} confirmed {prefix}.duration must be non-negative; got {fragment_duration}"
+            )
+        fragment_end = start + fragment_duration
+
+        # Valid-but-ineligible edge fragments are intentionally skipped.
+        if start < -1e-6 or fragment_end > duration + 1e-6:
+            continue
+        if start < utterance_start - 1e-6 or fragment_end > utterance_end + 1e-6:
+            continue
+
+        alignments.append(
+            WordAlignment(
+                text=f"{start_token}{text}{end_token}",
+                start_time=max(0.0, start),
+                end_time=max(0.0, start),
+                delay_frames=delay_frames,
+            )
+        )
+    return alignments
+
+
+def merge_agent_backchannel_alignments(
+    alignments: List[WordAlignment],
+    agent_backchannels: List[WordAlignment],
+    *,
+    frame_length_in_secs: float,
+    default_delay_frames: int,
+    utterance_start_token: str = "<sou>",
+    utterance_end_token: str = "<eou>",
+) -> List[WordAlignment]:
+    """Merge transcript and agent-backchannel emissions by effective ready frame.
+
+    SOU remains structurally first and EOU structurally last. Within the
+    utterance, transcript emissions win exact ready-frame ties, followed by
+    agent backchannels; original order is otherwise stable.
+    """
+    if not agent_backchannels:
+        return alignments
+    if frame_length_in_secs <= 0:
+        raise ValueError("frame_length_in_secs must be positive")
+
+    starts = [item for item in alignments if item.text == utterance_start_token]
+    ends = [item for item in alignments if item.text == utterance_end_token]
+    middle = [
+        (item, 1, idx)
+        for idx, item in enumerate(alignments)
+        if item.text not in {utterance_start_token, utterance_end_token}
+    ]
+    middle.extend((item, 2, len(alignments) + idx) for idx, item in enumerate(agent_backchannels))
+    middle.sort(
+        key=lambda tagged: (
+            _alignment_ready_frame(tagged[0], frame_length_in_secs, default_delay_frames),
+            tagged[1],
+            tagged[2],
+        )
+    )
+    return [*starts, *(item for item, _, _ in middle), *ends]
+
+
 def add_gt_utterance_boundary_alignments(
     alignments: List[WordAlignment],
     *,
@@ -413,9 +573,19 @@ def add_gt_utterance_boundary_alignments(
     ]
 
 
-def _append_alignment_text(content: str, text: str) -> str:
+def _append_alignment_text(
+    content: str,
+    text: str,
+    *,
+    agent_backchannel_start_token: Optional[str] = None,
+    agent_backchannel_end_token: Optional[str] = None,
+) -> str:
     if not content:
         return text
+    if agent_backchannel_start_token and text.startswith(agent_backchannel_start_token):
+        return content + text
+    if agent_backchannel_end_token and content.endswith(agent_backchannel_end_token):
+        return content + text
     if text.startswith("<") and text.endswith(">"):
         return content + text
     if text.startswith(" ") or content.endswith(" "):
@@ -428,6 +598,8 @@ def _build_alignment_content(
     indices: List[int],
     word_spans: Optional[List[tuple[int, int] | None]],
     transcript: Optional[str],
+    agent_backchannel_start_token: Optional[str] = None,
+    agent_backchannel_end_token: Optional[str] = None,
 ) -> str:
     content = ""
     for idx in indices:
@@ -436,7 +608,12 @@ def _build_alignment_content(
             piece = transcript[span[0] : span[1]]
         else:
             piece = alignments[idx].text
-        content = _append_alignment_text(content, piece)
+        content = _append_alignment_text(
+            content,
+            piece,
+            agent_backchannel_start_token=agent_backchannel_start_token,
+            agent_backchannel_end_token=agent_backchannel_end_token,
+        )
     return content
 
 
@@ -457,6 +634,8 @@ def get_llm_messages_for_sample(
     transcript: Optional[str] = None,
     words_per_group: int = 1,
     chunk_step: int = 1,
+    agent_backchannel_start_token: Optional[str] = None,
+    agent_backchannel_end_token: Optional[str] = None,
 ) -> List[dict]:
     """
     Get the LLM messages for a sample, using the alignments to determine the turns for the audio and text.
@@ -502,6 +681,10 @@ def get_llm_messages_for_sample(
         audio_duration_secs: The duration of the audio in seconds.
         frame_length_in_secs: The length of a single frame in seconds.
         alignments: List of WordAlignment objects for the sample.
+        agent_backchannel_start_token: Optional marker used to avoid synthesizing
+            whitespace immediately before an agent backchannel span.
+        agent_backchannel_end_token: Optional marker used to avoid synthesizing
+            whitespace immediately after an agent backchannel span.
     """
 
     messages = [{"role": system_role, "content": system_prompt}]
@@ -563,11 +746,23 @@ def get_llm_messages_for_sample(
                 messages.append({"role": "user", "content": audio_tag * n_frames_chunk})
 
             # Build assistant content from all buffered words.
-            content = _build_alignment_content(alignments, word_buffer, word_spans, transcript)
+            content = _build_alignment_content(
+                alignments,
+                word_buffer,
+                word_spans,
+                transcript,
+                agent_backchannel_start_token=agent_backchannel_start_token,
+                agent_backchannel_end_token=agent_backchannel_end_token,
+            )
 
             if n_frames_chunk <= 0 and messages[-1]["role"] == "assistant":
                 # Words at same boundary as previous group — append
-                messages[-1]["content"] = _append_alignment_text(messages[-1]["content"], content)
+                messages[-1]["content"] = _append_alignment_text(
+                    messages[-1]["content"],
+                    content,
+                    agent_backchannel_start_token=agent_backchannel_start_token,
+                    agent_backchannel_end_token=agent_backchannel_end_token,
+                )
             else:
                 messages.append({"role": "assistant", "content": content})
 
@@ -606,7 +801,14 @@ def get_llm_messages_for_sample(
                 or is_last_chunk
                 or _buffer_has_forced_alignment(alignments, word_buffer)
             ):
-                content = _build_alignment_content(alignments, word_buffer, word_spans, transcript)
+                content = _build_alignment_content(
+                    alignments,
+                    word_buffer,
+                    word_spans,
+                    transcript,
+                    agent_backchannel_start_token=agent_backchannel_start_token,
+                    agent_backchannel_end_token=agent_backchannel_end_token,
+                )
                 messages.append({"role": "assistant", "content": content})
                 word_buffer = []
             else:
@@ -616,11 +818,23 @@ def get_llm_messages_for_sample(
         # them past the last chunk boundary, or alignment end_time > audio_duration).
         if word_idx < len(alignments):
             residual_indices = list(range(word_idx, len(alignments)))
-            content = _build_alignment_content(alignments, residual_indices, word_spans, transcript)
+            content = _build_alignment_content(
+                alignments,
+                residual_indices,
+                word_spans,
+                transcript,
+                agent_backchannel_start_token=agent_backchannel_start_token,
+                agent_backchannel_end_token=agent_backchannel_end_token,
+            )
             if messages[-1]["role"] == "assistant" and messages[-1]["content"] == blank_token:
                 messages[-1]["content"] = content
             elif messages[-1]["role"] == "assistant":
-                messages[-1]["content"] = _append_alignment_text(messages[-1]["content"], content)
+                messages[-1]["content"] = _append_alignment_text(
+                    messages[-1]["content"],
+                    content,
+                    agent_backchannel_start_token=agent_backchannel_start_token,
+                    agent_backchannel_end_token=agent_backchannel_end_token,
+                )
             else:
                 messages.append({"role": "assistant", "content": content})
 
@@ -640,6 +854,8 @@ def get_llm_messages_for_batch(
     transcripts: Optional[List[str]] = None,
     words_per_group: int = 1,
     chunk_step: int = 1,
+    agent_backchannel_start_token: Optional[str] = None,
+    agent_backchannel_end_token: Optional[str] = None,
 ) -> List[List[dict]]:
     """
     Get the LLM messages for a batch of samples.
@@ -658,6 +874,8 @@ def get_llm_messages_for_batch(
             assistant turn content preserves punctuation and spacing from the transcript.
         words_per_group: Minimum number of words to buffer before emitting an
             assistant turn (default 1 = emit each word immediately).
+        agent_backchannel_start_token: Optional agent-backchannel start marker.
+        agent_backchannel_end_token: Optional agent-backchannel end marker.
     """
     if transcripts is None:
         transcripts = [None] * len(audio_durations_secs)
@@ -682,6 +900,8 @@ def get_llm_messages_for_batch(
                 transcript=transcript,
                 words_per_group=words_per_group,
                 chunk_step=chunk_step,
+                agent_backchannel_start_token=agent_backchannel_start_token,
+                agent_backchannel_end_token=agent_backchannel_end_token,
             )
         )
     return batch_messages
@@ -1151,6 +1371,7 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
         text: List[str],
     ) -> StreamingSTTBatch:
         audio_durations_secs = (audio_lens.float() / self.cfg.sample_rate).tolist()
+        clip_audio_durations_secs = list(audio_durations_secs)
 
         # K-step alignment (dynamic chunking only): pad each waveform up to a
         # multiple of K frames so the encoder produces exactly that many
@@ -1290,6 +1511,32 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
 
             system_prompts = [cut.custom.get(self.cfg.prompt_field, self.cfg.system_prompt) for cut in cuts]
 
+        if self.cfg.enable_agent_backchannels:
+            merged_alignments = []
+            for cut, sample_alignments, clip_duration_secs in zip(
+                cuts, alignments, clip_audio_durations_secs
+            ):
+                cut_id = str(getattr(cut, "id", "<unknown>"))
+                backchannels = build_agent_backchannel_alignments(
+                    cut.custom or {},
+                    audio_duration_secs=clip_duration_secs,
+                    start_token=self.cfg.agent_backchannel_start_token,
+                    end_token=self.cfg.agent_backchannel_end_token,
+                    delay_frames=self.cfg.agent_backchannel_delay_frames,
+                    cut_id=cut_id,
+                )
+                merged_alignments.append(
+                    merge_agent_backchannel_alignments(
+                        sample_alignments,
+                        backchannels,
+                        frame_length_in_secs=self.cfg.frame_length_in_secs,
+                        default_delay_frames=self.cfg.num_delay_frames,
+                        utterance_start_token=self.cfg.utterance_start_token,
+                        utterance_end_token=self.cfg.utterance_end_token,
+                    )
+                )
+            alignments = merged_alignments
+
         batch_messages = get_llm_messages_for_batch(
             system_role=self.cfg.system_role,
             system_prompt=system_prompts,
@@ -1303,6 +1550,12 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             transcripts=text,
             words_per_group=self.cfg.words_per_group,
             chunk_step=K,
+            agent_backchannel_start_token=(
+                self.cfg.agent_backchannel_start_token if self.cfg.enable_agent_backchannels else None
+            ),
+            agent_backchannel_end_token=(
+                self.cfg.agent_backchannel_end_token if self.cfg.enable_agent_backchannels else None
+            ),
         )
 
         all_input_ids = []
