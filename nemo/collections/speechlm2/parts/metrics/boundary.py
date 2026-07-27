@@ -29,12 +29,23 @@ def count_boundary_collar_hits(
         pred_frames = frame_idx[sample_idx][pred_mask[sample_idx]]
         if target_frames.numel() == 0 or pred_frames.numel() == 0:
             continue
-        in_window = (
-            (pred_frames[:, None] >= target_frames[None, :] - before_frames)
-            & (pred_frames[:, None] <= target_frames[None, :] + after_frames)
+        in_window = (pred_frames[:, None] >= target_frames[None, :] - before_frames) & (
+            pred_frames[:, None] <= target_frames[None, :] + after_frames
         )
         hits = hits + in_window.any(dim=0).long().sum()
     return hits
+
+
+def boundary_collar_precision_recall_f1(
+    collar_hits: Tensor, prediction_count: Tensor, target_count: Tensor
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Compute zero-safe collar precision, recall, and F1 from aggregate counts."""
+    hits = collar_hits.float()
+    precision = hits / prediction_count.clamp(min=1).float()
+    recall = hits / target_count.clamp(min=1).float()
+    denom = precision + recall
+    f1 = torch.where(denom > 0, 2 * precision * recall / denom, torch.zeros_like(denom))
+    return precision, recall, f1
 
 
 def compute_boundary_token_metrics(
@@ -72,17 +83,12 @@ def compute_boundary_token_metrics(
         after_frames=eou_after_frames,
     )
 
-    sou_target_count = sou_targets.long().sum()
-    eou_target_count = eou_targets.long().sum()
-    sou_pred_count = sou_preds.long().sum()
-    eou_pred_count = eou_preds.long().sum()
-
     return {
         "num_samples": torch.as_tensor(target_ids.shape[0], dtype=torch.long, device=target_ids.device),
-        "sou_target_count": sou_target_count,
-        "eou_target_count": eou_target_count,
-        "sou_pred_count": sou_pred_count,
-        "eou_pred_count": eou_pred_count,
+        "sou_target_count": sou_targets.long().sum(),
+        "eou_target_count": eou_targets.long().sum(),
+        "sou_pred_count": sou_preds.long().sum(),
+        "eou_pred_count": eou_preds.long().sum(),
         "sou_collar_hit": sou_collar_hit,
         "eou_collar_hit": eou_collar_hit,
     }

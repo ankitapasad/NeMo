@@ -14,6 +14,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -95,6 +96,36 @@ def _minimal_cfg():
         "utterance_start_token": "<sou>",
         "utterance_end_token": "<eou>",
     }
+
+
+def test_model_rejects_per_sample_boundaries_without_boundary_token_support():
+    cfg = _minimal_cfg()
+    cfg["add_utterance_boundary_tokens"] = False
+    with pytest.raises(
+        ValueError,
+        match="use_per_sample_utterance_boundary_tokens=True requires model.add_utterance_boundary_tokens=True",
+    ):
+        streaming_stt_model.StreamingSTTModel(
+            cfg,
+            data_cfg={"use_per_sample_utterance_boundary_tokens": True},
+        )
+
+
+def test_model_rejects_per_sample_timestamps_without_per_sample_boundaries():
+    with pytest.raises(
+        ValueError,
+        match=(
+            "use_per_sample_utterance_boundary_timestamps=True requires "
+            "use_per_sample_utterance_boundary_tokens=True"
+        ),
+    ):
+        streaming_stt_model.StreamingSTTModel(
+            _minimal_cfg(),
+            data_cfg={
+                "use_per_sample_utterance_boundary_tokens": False,
+                "use_per_sample_utterance_boundary_timestamps": True,
+            },
+        )
 
 
 def test_model_init_adds_boundary_and_text_tokens(monkeypatch):
@@ -276,3 +307,42 @@ def test_validation_epoch_end_logs_boundary_metrics_by_loader_and_overall():
     assert all(not metric.startswith("val_boundary") for metric in model.logged)
     assert "val_sou_target_per_sample" not in model.logged
     assert "val_eou_target_per_sample" not in model.logged
+
+
+def test_validation_epoch_end_checkpoint_score_equal_weights_three_cohorts():
+    model = _ValidationLogger()
+    model.core_cfg = SimpleNamespace(enable_validation_checkpoint_score=True)
+    streaming_stt_model.StreamingSTTModel.on_validation_epoch_start(model)
+
+    # Token accuracy is collected for every loader, but boundary-aware loaders
+    # contribute their SOU/EOU macro F1 to the checkpoint score instead.
+    model._partial_accuracies["d7_complete"].append(torch.tensor(0.99))
+    model._partial_accuracies["d7_pause"].append(torch.tensor(0.98))
+    model._partial_accuracies["mcv"].append(torch.tensor(0.75))
+    _append_boundary_totals(
+        model,
+        "d7_complete",
+        sou_target_count=10,
+        eou_target_count=10,
+        sou_pred_count=10,
+        eou_pred_count=10,
+        sou_collar_hit=8,
+        eou_collar_hit=6,
+    )
+    _append_boundary_totals(
+        model,
+        "d7_pause",
+        sou_target_count=10,
+        eou_target_count=10,
+        sou_pred_count=20,
+        eou_pred_count=10,
+        sou_collar_hit=10,
+        eou_collar_hit=10,
+    )
+
+    streaming_stt_model.StreamingSTTModel.on_validation_epoch_end(model)
+
+    complete_macro_f1 = (0.8 + 0.6) / 2
+    pause_macro_f1 = ((2 * 0.5 * 1.0 / (0.5 + 1.0)) + 1.0) / 2
+    expected = (complete_macro_f1 + pause_macro_f1 + 0.75) / 3
+    assert torch.isclose(model.logged["val_checkpoint_score"], torch.tensor(expected))

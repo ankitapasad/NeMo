@@ -44,7 +44,10 @@ from nemo.collections.speechlm2.data.streaming_stt_dataset import (
 from nemo.collections.speechlm2.parts.alignments import ForcedAligner
 from nemo.collections.speechlm2.parts.hf_hub import HFHubMixin
 from nemo.collections.speechlm2.parts.lora import maybe_install_lora
-from nemo.collections.speechlm2.parts.metrics.boundary import compute_boundary_token_metrics
+from nemo.collections.speechlm2.parts.metrics.boundary import (
+    boundary_collar_precision_recall_f1,
+    compute_boundary_token_metrics,
+)
 from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers, is_frozen
 from nemo.collections.speechlm2.parts.pretrained import load_pretrained_hf, move_embedding, setup_perception
 from nemo.collections.speechlm2.parts.utils import freeze_module, to_dataclass, unfreeze_module
@@ -161,6 +164,10 @@ class StreamingSTTModelConfig:
     utterance_end_token: str = "<eou>"
     utterance_start_loss_weight: float = 1.0
     utterance_end_loss_weight: float = 1.0
+    # When enabled, validation logs a cohort-macro score: boundary-aware
+    # dataloaders contribute mean(SOU F1, EOU F1), while transcript-only
+    # dataloaders contribute token accuracy. Each dataloader has equal weight.
+    enable_validation_checkpoint_score: bool = False
     # --- Aux chunk-boundary classifier head ---
     # Master switch. Only valid in dynamic-chunking mode (chunk_size == 0).
     # When True, a small K-layer transformer head is built on top of the LLM's
@@ -224,9 +231,7 @@ def _compute_weighted_lm_loss(
     if num_blank > 0 and blank_loss_weight != 1.0 and has_blank:
         loss_weights = torch.where(is_blank, torch.full_like(loss_weights, blank_loss_weight), loss_weights)
     if sou_id is not None and utterance_start_loss_weight != 1.0:
-        loss_weights = torch.where(
-            is_sou, torch.full_like(loss_weights, utterance_start_loss_weight), loss_weights
-        )
+        loss_weights = torch.where(is_sou, torch.full_like(loss_weights, utterance_start_loss_weight), loss_weights)
     if eou_id is not None and utterance_end_loss_weight != 1.0:
         loss_weights = torch.where(is_eou, torch.full_like(loss_weights, utterance_end_loss_weight), loss_weights)
 
@@ -294,6 +299,23 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         self.core_cfg: StreamingSTTModelConfig = to_dataclass(StreamingSTTModelConfig, cfg)
         if self.core_cfg.compact_text_end_only_no_blank and not self.core_cfg.compact_template:
             raise ValueError("compact_text_end_only_no_blank=True requires compact_template=True")
+        if (
+            data_cfg is not None
+            and data_cfg.get("use_per_sample_utterance_boundary_tokens", False)
+            and not self.core_cfg.add_utterance_boundary_tokens
+        ):
+            raise ValueError(
+                "use_per_sample_utterance_boundary_tokens=True requires " "model.add_utterance_boundary_tokens=True"
+            )
+        if (
+            data_cfg is not None
+            and data_cfg.get("use_per_sample_utterance_boundary_timestamps", False)
+            and not data_cfg.get("use_per_sample_utterance_boundary_tokens", False)
+        ):
+            raise ValueError(
+                "use_per_sample_utterance_boundary_timestamps=True requires "
+                "use_per_sample_utterance_boundary_tokens=True"
+            )
 
         # --- LLM ---
         self.tokenizer = AutoTokenizer(self.core_cfg.pretrained_llm, use_fast=True)
@@ -807,31 +829,45 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             self.log("val_loss", torch.stack(val_losses).mean(), on_epoch=True, sync_dist=True)
 
         accuracies = []
+        val_accuracy_by_name: dict[str, Tensor] = {}
         for name, accs in self._partial_accuracies.items():
             val_acc = torch.stack(accs).mean()
             self.log(f"val_acc_{name}", val_acc, on_epoch=True, sync_dist=True)
             accuracies.append(val_acc)
+            val_accuracy_by_name[name] = val_acc
         if accuracies:
             self.log("val_acc", torch.stack(accuracies).mean(), on_epoch=True, sync_dist=True)
 
         # --- Utterance boundary token metrics ---
         boundary_totals: dict[str, list] = defaultdict(list)
+        boundary_macro_f1_by_name: dict[str, Tensor] = {}
         for name, metric_lists in self._partial_boundary_metrics.items():
             totals = {metric: torch.stack(vals).sum() for metric, vals in metric_lists.items() if vals}
             if not totals:
                 continue
 
             num_samples = totals["num_samples"].clamp(min=1).float()
-            sou_targets = totals["sou_target_count"].clamp(min=1).float()
-            eou_targets = totals["eou_target_count"].clamp(min=1).float()
+            sou_precision, sou_recall, sou_f1 = boundary_collar_precision_recall_f1(
+                totals["sou_collar_hit"], totals["sou_pred_count"], totals["sou_target_count"]
+            )
+            eou_precision, eou_recall, eou_f1 = boundary_collar_precision_recall_f1(
+                totals["eou_collar_hit"], totals["eou_pred_count"], totals["eou_target_count"]
+            )
 
             metrics = {
                 f"val_sou_pred_per_sample_{name}": totals["sou_pred_count"].float() / num_samples,
                 f"val_eou_pred_per_sample_{name}": totals["eou_pred_count"].float() / num_samples,
-                f"val_sou_collar_acc_{name}": totals["sou_collar_hit"].float() / sou_targets,
-                f"val_eou_collar_acc_{name}": totals["eou_collar_hit"].float() / eou_targets,
+                f"val_sou_collar_acc_{name}": sou_recall,
+                f"val_eou_collar_acc_{name}": eou_recall,
+                f"val_sou_collar_precision_{name}": sou_precision,
+                f"val_eou_collar_precision_{name}": eou_precision,
+                f"val_sou_collar_f1_{name}": sou_f1,
+                f"val_eou_collar_f1_{name}": eou_f1,
             }
             self.log_dict(metrics, on_epoch=True, sync_dist=True)
+
+            if totals["sou_target_count"] > 0 and totals["eou_target_count"] > 0:
+                boundary_macro_f1_by_name[name] = (sou_f1 + eou_f1) / 2
 
             for metric, total in totals.items():
                 boundary_totals[metric].append(total)
@@ -839,15 +875,39 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         if boundary_totals:
             totals = {metric: torch.stack(vals).sum() for metric, vals in boundary_totals.items() if vals}
             num_samples = totals["num_samples"].clamp(min=1).float()
-            sou_targets = totals["sou_target_count"].clamp(min=1).float()
-            eou_targets = totals["eou_target_count"].clamp(min=1).float()
+            sou_precision, sou_recall, sou_f1 = boundary_collar_precision_recall_f1(
+                totals["sou_collar_hit"], totals["sou_pred_count"], totals["sou_target_count"]
+            )
+            eou_precision, eou_recall, eou_f1 = boundary_collar_precision_recall_f1(
+                totals["eou_collar_hit"], totals["eou_pred_count"], totals["eou_target_count"]
+            )
             self.log_dict(
                 {
                     "val_sou_pred_per_sample": totals["sou_pred_count"].float() / num_samples,
                     "val_eou_pred_per_sample": totals["eou_pred_count"].float() / num_samples,
-                    "val_sou_collar_acc": totals["sou_collar_hit"].float() / sou_targets,
-                    "val_eou_collar_acc": totals["eou_collar_hit"].float() / eou_targets,
+                    "val_sou_collar_acc": sou_recall,
+                    "val_eou_collar_acc": eou_recall,
+                    "val_sou_collar_precision": sou_precision,
+                    "val_eou_collar_precision": eou_precision,
+                    "val_sou_collar_f1": sou_f1,
+                    "val_eou_collar_f1": eou_f1,
                 },
+                on_epoch=True,
+                sync_dist=True,
+            )
+
+        if getattr(getattr(self, "core_cfg", None), "enable_validation_checkpoint_score", False):
+            checkpoint_components = []
+            for name, val_acc in val_accuracy_by_name.items():
+                checkpoint_components.append(boundary_macro_f1_by_name.get(name, val_acc))
+            if not checkpoint_components or not boundary_macro_f1_by_name:
+                raise RuntimeError(
+                    "enable_validation_checkpoint_score=True requires non-empty validation loaders "
+                    "including at least one boundary-aware cohort"
+                )
+            self.log(
+                "val_checkpoint_score",
+                torch.stack(checkpoint_components).mean(),
                 on_epoch=True,
                 sync_dist=True,
             )
@@ -895,7 +955,9 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             return None, None
         return sou_ids[0], eou_ids[0]
 
-    def _compute_boundary_metrics(self, pred_ids: Tensor, target_ids: Tensor, input_tokens: Tensor) -> dict[str, Tensor]:
+    def _compute_boundary_metrics(
+        self, pred_ids: Tensor, target_ids: Tensor, input_tokens: Tensor
+    ) -> dict[str, Tensor]:
         sou_id, eou_id = self._get_boundary_token_ids()
         if sou_id is None or eou_id is None:
             return {}
@@ -1116,9 +1178,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         self._user_footer_first_id = (
             user_footer_and_asst_header_ids[0]
             if user_footer_and_asst_header_ids
-            else asst_footer_ids[0]
-            if self.core_cfg.compact_text_end_only_no_blank and asst_footer_ids
-            else None
+            else asst_footer_ids[0] if self.core_cfg.compact_text_end_only_no_blank and asst_footer_ids else None
         )
 
         if chunk_size > 0:

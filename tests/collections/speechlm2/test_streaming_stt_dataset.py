@@ -43,6 +43,7 @@ from nemo.collections.speechlm2.data.streaming_stt_dataset import (
     _replace_audio_chunks,
     _tokenize_compact_with_assistant_mask,
     _tokenize_with_assistant_mask,
+    add_gt_utterance_boundary_alignments,
     build_compact_turn_markers,
     compute_word_spans,
     decode_with_blank,
@@ -412,6 +413,72 @@ class TestGetLlmMessagesForSample:
             )
             == []
         )
+
+    def test_gt_boundaries_clip_words_and_preserve_order(self):
+        alignments = [
+            WordAlignment(text="TooEarly", start_time=0.0, end_time=0.08),
+            WordAlignment(text="CrossStart", start_time=0.08, end_time=0.32),
+            WordAlignment(text="Inside", start_time=0.40, end_time=0.56),
+            WordAlignment(text="CrossEnd", start_time=0.64, end_time=0.96),
+            WordAlignment(text="TooLate", start_time=1.04, end_time=1.12),
+        ]
+        resolved = add_gt_utterance_boundary_alignments(
+            alignments,
+            utterance_start_time=0.16,
+            utterance_end_time=0.80,
+            audio_duration_secs=1.20,
+            start_token="<sou>",
+            end_token="<eou>",
+            start_delay_frames=2,
+            end_delay_frames=2,
+            cut_id="gt-cut",
+        )
+
+        assert [word.text for word in resolved] == [
+            "<sou>",
+            "TooEarly",
+            "CrossStart",
+            "Inside",
+            "CrossEnd",
+            "TooLate",
+            "<eou>",
+        ]
+        assert [(word.start_time, word.end_time) for word in resolved] == [
+            (0.16, 0.16),
+            (0.16, 0.16),
+            (0.16, 0.32),
+            (0.40, 0.56),
+            (0.64, 0.80),
+            (0.80, 0.80),
+            (0.80, 0.80),
+        ]
+        assert resolved[0].delay_frames == 2
+        assert resolved[-1].delay_frames == 2
+
+    @pytest.mark.parametrize(
+        ("start", "end", "duration", "error"),
+        [
+            (-0.1, 0.8, 1.0, ValueError),
+            (0.8, 0.7, 1.0, ValueError),
+            (0.1, 1.1, 1.0, ValueError),
+            (True, 0.8, 1.0, TypeError),
+            (0.1, float("nan"), 1.0, ValueError),
+            (0.1, float("inf"), 1.0, ValueError),
+        ],
+    )
+    def test_gt_boundaries_reject_invalid_timestamps(self, start, end, duration, error):
+        with pytest.raises(error):
+            add_gt_utterance_boundary_alignments(
+                DOCSTRING_ALIGNMENTS,
+                utterance_start_time=start,
+                utterance_end_time=end,
+                audio_duration_secs=duration,
+                start_token="<sou>",
+                end_token="<eou>",
+                start_delay_frames=2,
+                end_delay_frames=2,
+                cut_id="bad-gt",
+            )
 
     def test_empty_alignments_all_blank(self):
         msgs = _make_messages(alignments=[])
@@ -920,7 +987,12 @@ class TestGetLlmMessagesForBatch:
 # ===========================================================================
 class TestStreamingSTTDatasetBoundaryIntegration:
 
-    def _make_dataset(self, add_boundaries=True):
+    def _make_dataset(
+        self,
+        add_boundaries=True,
+        use_per_sample_boundaries=False,
+        use_per_sample_timestamps=False,
+    ):
         tok = _MockNemoTokenizer(_MockHFTokenizer())
         cfg = {
             "sample_rate": 16000,
@@ -932,6 +1004,8 @@ class TestStreamingSTTDatasetBoundaryIntegration:
             "system_role": SYSTEM_ROLE,
             "system_prompt": SYSTEM_PROMPT,
             "add_utterance_boundary_tokens": add_boundaries,
+            "use_per_sample_utterance_boundary_tokens": use_per_sample_boundaries,
+            "use_per_sample_utterance_boundary_timestamps": use_per_sample_timestamps,
             "utterance_start_token": "<sou>",
             "utterance_end_token": "<eou>",
             "utterance_start_boundary_delay_frames": 0,  # Explicitly exercise the zero-delay override; default is 2.
@@ -981,6 +1055,284 @@ class TestStreamingSTTDatasetBoundaryIntegration:
         assert "<sou>" not in hf._content_cache
         assert "Hello<eou>" not in hf._content_cache
         assert hf._content_cache["Hello"][0] in valid_targets
+
+    def test_per_sample_mode_mixes_boundary_and_asr_targets(self):
+        dataset = self._make_dataset(add_boundaries=True, use_per_sample_boundaries=True)
+        hf = dataset.tokenizer.tokenizer
+        cuts = [
+            SimpleNamespace(
+                id="boundary",
+                custom={
+                    "system_prompt": "Transcribe and mark <sou> and <eou>.",
+                    "add_utterance_boundary_tokens": True,
+                },
+            ),
+            SimpleNamespace(
+                id="asr",
+                custom={
+                    "system_prompt": SYSTEM_PROMPT,
+                    "add_utterance_boundary_tokens": False,
+                },
+            ),
+        ]
+        audios = torch.zeros(2, 16000)
+        audio_lens = torch.tensor([16000, 16000])
+        alignments = [
+            [WordAlignment(text="Boundary", start_time=0.16, end_time=0.48)],
+            [WordAlignment(text="Plain", start_time=0.16, end_time=0.48)],
+        ]
+
+        batch = dataset.get_batch_data(
+            cuts=cuts,
+            audios=audios,
+            audio_lens=audio_lens,
+            alignments=alignments,
+            text=["Boundary", "Plain"],
+        )
+
+        boundary_targets = [tid for tid in batch.target_tokens[0].tolist() if tid != IGNORE_INDEX]
+        asr_targets = [tid for tid in batch.target_tokens[1].tolist() if tid != IGNORE_INDEX]
+        assert hf._content_cache["<sou>"][0] in boundary_targets
+        assert hf._content_cache["Boundary<eou>"][0] in boundary_targets
+        assert "Plain<eou>" not in hf._content_cache
+        assert hf._content_cache["Plain"][0] in asr_targets
+
+    def test_per_sample_tag_is_ignored_when_mode_is_disabled(self):
+        dataset = self._make_dataset(add_boundaries=True, use_per_sample_boundaries=False)
+        hf = dataset.tokenizer.tokenizer
+        cuts = [
+            SimpleNamespace(
+                id="legacy",
+                custom={
+                    "system_prompt": SYSTEM_PROMPT,
+                    "add_utterance_boundary_tokens": False,
+                },
+            )
+        ]
+        batch = dataset.get_batch_data(
+            cuts=cuts,
+            audios=torch.zeros(1, 16000),
+            audio_lens=torch.tensor([16000]),
+            alignments=[[WordAlignment(text="Hello", start_time=0.16, end_time=0.48)]],
+            text=["Hello"],
+        )
+        valid_targets = [tid for tid in batch.target_tokens[0].tolist() if tid != IGNORE_INDEX]
+        assert hf._content_cache["<sou>"][0] in valid_targets
+        assert hf._content_cache["Hello<eou>"][0] in valid_targets
+
+    def test_gt_preferred_uses_gt_metadata(self):
+        dataset = self._make_dataset(
+            add_boundaries=True,
+            use_per_sample_boundaries=True,
+            use_per_sample_timestamps=True,
+        )
+        cut = SimpleNamespace(
+            id="gt-cut",
+            custom={
+                "system_prompt": "Transcribe and mark <sou> and <eou>.",
+                "add_utterance_boundary_tokens": True,
+                "utterance_boundary_timestamp_source": "gt_preferred",
+                "utterance_start_time": 0.24,
+                "utterance_end_time": 0.64,
+            },
+        )
+        batch = dataset.get_batch_data(
+            cuts=[cut],
+            audios=torch.zeros(1, 16000),
+            audio_lens=torch.tensor([16000]),
+            alignments=[[WordAlignment(text="Hello", start_time=0.0, end_time=0.88)]],
+            text=["Hello"],
+        )
+        valid_targets = [tid for tid in batch.target_tokens[0].tolist() if tid != IGNORE_INDEX]
+        hf = dataset.tokenizer.tokenizer
+        assert hf._content_cache["<sou>"][0] in valid_targets
+        assert hf._content_cache["Hello<eou>"][0] in valid_targets
+
+    def test_gt_preferred_missing_metadata_warns_once_and_falls_back(self, caplog):
+        dataset = self._make_dataset(
+            add_boundaries=True,
+            use_per_sample_boundaries=True,
+            use_per_sample_timestamps=True,
+        )
+        cut = SimpleNamespace(
+            id="unlabeled-cut",
+            custom={
+                "system_prompt": "Transcribe and mark <sou> and <eou>.",
+                "add_utterance_boundary_tokens": True,
+                "utterance_boundary_timestamp_source": "gt_preferred",
+            },
+        )
+        kwargs = dict(
+            cuts=[cut],
+            audios=torch.zeros(1, 16000),
+            audio_lens=torch.tensor([16000]),
+            alignments=[[WordAlignment(text="Hello", start_time=0.16, end_time=0.48)]],
+            text=["Hello"],
+        )
+        with caplog.at_level("WARNING"):
+            dataset.get_batch_data(**kwargs)
+            dataset.get_batch_data(**kwargs)
+        fallback_warnings = [record for record in caplog.records if "falling back" in record.message]
+        assert len(fallback_warnings) == 1
+        assert "unlabeled-cut" in fallback_warnings[0].message
+
+    def test_alignment_source_ignores_gt_metadata_without_warning(self, caplog):
+        dataset = self._make_dataset(
+            add_boundaries=True,
+            use_per_sample_boundaries=True,
+            use_per_sample_timestamps=True,
+        )
+        cut = SimpleNamespace(
+            id="alignment-cut",
+            custom={
+                "system_prompt": "Transcribe and mark <sou> and <eou>.",
+                "add_utterance_boundary_tokens": True,
+                "utterance_boundary_timestamp_source": "alignment",
+                "utterance_start_time": 0.24,
+                "utterance_end_time": 0.64,
+            },
+        )
+        with caplog.at_level("WARNING"):
+            dataset.get_batch_data(
+                cuts=[cut],
+                audios=torch.zeros(1, 16000),
+                audio_lens=torch.tensor([16000]),
+                alignments=[[WordAlignment(text="Hello", start_time=0.16, end_time=0.48)]],
+                text=["Hello"],
+            )
+        assert not [record for record in caplog.records if "falling back" in record.message]
+
+    @pytest.mark.parametrize(
+        "custom_update",
+        [
+            {"utterance_start_time": 0.16},
+            {"utterance_end_time": 0.64},
+        ],
+    )
+    def test_gt_preferred_rejects_partial_metadata(self, custom_update):
+        dataset = self._make_dataset(
+            add_boundaries=True,
+            use_per_sample_boundaries=True,
+            use_per_sample_timestamps=True,
+        )
+        custom = {
+            "system_prompt": "Transcribe and mark <sou> and <eou>.",
+            "add_utterance_boundary_tokens": True,
+            "utterance_boundary_timestamp_source": "gt_preferred",
+            **custom_update,
+        }
+        with pytest.raises(ValueError, match="must provide both"):
+            dataset.get_batch_data(
+                cuts=[SimpleNamespace(id="partial-gt", custom=custom)],
+                audios=torch.zeros(1, 16000),
+                audio_lens=torch.tensor([16000]),
+                alignments=[[WordAlignment(text="Hello", start_time=0.16, end_time=0.48)]],
+                text=["Hello"],
+            )
+
+    def test_timestamp_mode_rejects_missing_source_for_boundary_cut(self):
+        dataset = self._make_dataset(
+            add_boundaries=True,
+            use_per_sample_boundaries=True,
+            use_per_sample_timestamps=True,
+        )
+        with pytest.raises(ValueError, match="utterance_boundary_timestamp_source"):
+            dataset.get_batch_data(
+                cuts=[
+                    SimpleNamespace(
+                        id="missing-source",
+                        custom={
+                            "system_prompt": "Transcribe and mark <sou> and <eou>.",
+                            "add_utterance_boundary_tokens": True,
+                        },
+                    )
+                ],
+                audios=torch.zeros(1, 16000),
+                audio_lens=torch.tensor([16000]),
+                alignments=[[WordAlignment(text="Hello", start_time=0.16, end_time=0.48)]],
+                text=["Hello"],
+            )
+
+    def test_timestamp_mode_does_not_require_source_for_asr_cut(self):
+        dataset = self._make_dataset(
+            add_boundaries=True,
+            use_per_sample_boundaries=True,
+            use_per_sample_timestamps=True,
+        )
+        batch = dataset.get_batch_data(
+            cuts=[
+                SimpleNamespace(
+                    id="asr",
+                    custom={"system_prompt": SYSTEM_PROMPT, "add_utterance_boundary_tokens": False},
+                )
+            ],
+            audios=torch.zeros(1, 16000),
+            audio_lens=torch.tensor([16000]),
+            alignments=[[WordAlignment(text="Plain", start_time=0.16, end_time=0.48)]],
+            text=["Plain"],
+        )
+        valid_targets = [tid for tid in batch.target_tokens[0].tolist() if tid != IGNORE_INDEX]
+        assert dataset.tokenizer.tokenizer._content_cache["Plain"][0] in valid_targets
+
+    def test_boundary_sample_with_nonempty_transcript_requires_word_alignments(self):
+        dataset = self._make_dataset(
+            add_boundaries=True,
+            use_per_sample_boundaries=True,
+            use_per_sample_timestamps=True,
+        )
+        with pytest.raises(ValueError, match="no usable word alignments"):
+            dataset.get_batch_data(
+                cuts=[
+                    SimpleNamespace(
+                        id="no-alignments",
+                        custom={
+                            "system_prompt": "Transcribe and mark <sou> and <eou>.",
+                            "add_utterance_boundary_tokens": True,
+                            "utterance_boundary_timestamp_source": "alignment",
+                        },
+                    )
+                ],
+                audios=torch.zeros(1, 16000),
+                audio_lens=torch.tensor([16000]),
+                alignments=[[]],
+                text=["Hello"],
+            )
+
+    @pytest.mark.parametrize(
+        ("custom", "error", "message"),
+        [
+            (
+                {"add_utterance_boundary_tokens": True},
+                ValueError,
+                "missing required custom field 'system_prompt'",
+            ),
+            (
+                {"system_prompt": SYSTEM_PROMPT},
+                ValueError,
+                "missing required custom field 'add_utterance_boundary_tokens'",
+            ),
+            (
+                {"system_prompt": 123, "add_utterance_boundary_tokens": True},
+                TypeError,
+                "must be a non-empty string",
+            ),
+            (
+                {"system_prompt": SYSTEM_PROMPT, "add_utterance_boundary_tokens": "true"},
+                TypeError,
+                "must be a boolean",
+            ),
+        ],
+    )
+    def test_per_sample_mode_rejects_missing_or_invalid_metadata(self, custom, error, message):
+        dataset = self._make_dataset(add_boundaries=True, use_per_sample_boundaries=True)
+        with pytest.raises(error, match=message):
+            dataset.get_batch_data(
+                cuts=[SimpleNamespace(id="bad-cut", custom=custom)],
+                audios=torch.zeros(1, 16000),
+                audio_lens=torch.tensor([16000]),
+                alignments=[[WordAlignment(text="Hello", start_time=0.16, end_time=0.48)]],
+                text=["Hello"],
+            )
 
 
 class TestBoundaryDelayConfig:
@@ -2119,7 +2471,9 @@ class TestCompactTemplate:
 
         assert input_ids[-1] == end_id
         assert mask[-1] == 1
-        inserted_write_positions = [idx for idx, token_id in enumerate(input_ids) if token_id == write_id and mask[idx]]
+        inserted_write_positions = [
+            idx for idx, token_id in enumerate(input_ids) if token_id == write_id and mask[idx]
+        ]
         assert len(inserted_write_positions) == 1
         assert mask[inserted_write_positions[0]] == 1
 

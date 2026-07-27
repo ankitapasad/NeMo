@@ -17,6 +17,7 @@ import math
 import os
 import re
 from dataclasses import dataclass
+from numbers import Real
 from typing import Iterable, List, Optional, Union
 
 import numpy as np
@@ -40,6 +41,12 @@ from nemo.collections.speechlm2.parts.utils import to_dataclass
 
 AUDIO_TOKEN_IDX = -200
 IGNORE_INDEX = -100
+UTTERANCE_BOUNDARY_TIMESTAMP_SOURCE_ALIGNMENT = "alignment"
+UTTERANCE_BOUNDARY_TIMESTAMP_SOURCE_GT_PREFERRED = "gt_preferred"
+UTTERANCE_BOUNDARY_TIMESTAMP_SOURCES = {
+    UTTERANCE_BOUNDARY_TIMESTAMP_SOURCE_ALIGNMENT,
+    UTTERANCE_BOUNDARY_TIMESTAMP_SOURCE_GT_PREFERRED,
+}
 
 
 def _debug_dump_sequence(
@@ -161,6 +168,8 @@ class StreamingSTTDataConfig:
     text_end_token: str = "<|text_end|>"
     compact_text_end_only_no_blank: bool = False
     add_utterance_boundary_tokens: bool = False
+    use_per_sample_utterance_boundary_tokens: bool = False
+    use_per_sample_utterance_boundary_timestamps: bool = False
     utterance_start_token: str = "<sou>"
     utterance_end_token: str = "<eou>"
     # Absolute delays from first-word onset and last-word end. Boundary
@@ -343,6 +352,65 @@ def _alignment_delay_frames(word: WordAlignment, default_delay_frames: int) -> i
 
 def _alignment_ready_frame(word: WordAlignment, frame_length_in_secs: float, default_delay_frames: int) -> int:
     return math.ceil(word.end_time / frame_length_in_secs) + _alignment_delay_frames(word, default_delay_frames)
+
+
+def _validate_timestamp(value, *, field: str, cut_id: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise TypeError(f"Cut {cut_id!r} custom field {field!r} must be a finite number; got {value!r}")
+    value = float(value)
+    if not math.isfinite(value):
+        raise ValueError(f"Cut {cut_id!r} custom field {field!r} must be finite; got {value!r}")
+    return value
+
+
+def add_gt_utterance_boundary_alignments(
+    alignments: List[WordAlignment],
+    *,
+    utterance_start_time: float,
+    utterance_end_time: float,
+    audio_duration_secs: float,
+    start_token: str,
+    end_token: str,
+    start_delay_frames: int,
+    end_delay_frames: int,
+    cut_id: str = "<unknown>",
+) -> List[WordAlignment]:
+    """Clip word timing to authoritative GT boundaries and add ordered SOU/EOU alignments."""
+    sou = _validate_timestamp(utterance_start_time, field="utterance_start_time", cut_id=cut_id)
+    eou = _validate_timestamp(utterance_end_time, field="utterance_end_time", cut_id=cut_id)
+    duration = _validate_timestamp(audio_duration_secs, field="audio_duration_secs", cut_id=cut_id)
+    if duration < 0:
+        raise ValueError(f"Cut {cut_id!r} audio duration must be non-negative; got {duration}")
+    if sou < 0 or eou < sou or eou > duration + 1e-6:
+        raise ValueError(
+            f"Cut {cut_id!r} requires 0 <= utterance_start_time <= utterance_end_time <= "
+            f"audio duration; got start={sou}, end={eou}, duration={duration}"
+        )
+    eou = min(eou, duration)
+
+    clipped = []
+    for word_idx, word in enumerate(alignments):
+        start = _validate_timestamp(word.start_time, field=f"alignments[{word_idx}].start_time", cut_id=cut_id)
+        end = _validate_timestamp(word.end_time, field=f"alignments[{word_idx}].end_time", cut_id=cut_id)
+        if start < 0 or end < start:
+            raise ValueError(
+                f"Cut {cut_id!r} alignment {word_idx} requires 0 <= start_time <= end_time; "
+                f"got start={start}, end={end}"
+            )
+        clipped.append(
+            WordAlignment(
+                text=word.text,
+                start_time=min(max(start, sou), eou),
+                end_time=min(max(end, sou), eou),
+                delay_frames=word.delay_frames,
+            )
+        )
+
+    return [
+        WordAlignment(start_token, sou, sou, delay_frames=start_delay_frames),
+        *clipped,
+        WordAlignment(end_token, eou, eou, delay_frames=end_delay_frames),
+    ]
 
 
 def _append_alignment_text(content: str, text: str) -> str:
@@ -963,6 +1031,15 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
         )
         if self.cfg.compact_text_end_only_no_blank and not self.cfg.compact_template:
             raise ValueError("compact_text_end_only_no_blank=True requires compact_template=True")
+        if (
+            self.cfg.use_per_sample_utterance_boundary_timestamps
+            and not self.cfg.use_per_sample_utterance_boundary_tokens
+        ):
+            raise ValueError(
+                "use_per_sample_utterance_boundary_timestamps=True requires "
+                "use_per_sample_utterance_boundary_tokens=True"
+            )
+        self._warned_missing_gt_boundary_cut_ids: set[str] = set()
         # Unescape Python escape sequences (e.g. "\\n" → "\n") because Hydra/OmegaConf
         # loads YAML strings literally without interpreting backslash escapes.
         self.cfg.blank_token = self.cfg.blank_token.encode().decode('unicode_escape')
@@ -1013,9 +1090,7 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             write_token = (
                 None
                 if self.cfg.compact_text_end_only_no_blank
-                else self.cfg.text_start_token
-                if self.cfg.use_text_tokens
-                else self.cfg.write_token
+                else self.cfg.text_start_token if self.cfg.use_text_tokens else self.cfg.write_token
             )
             end_token = self.cfg.text_end_token if self.cfg.use_text_tokens else None
             _, ufah_ids, af_ids = build_compact_turn_markers(hf_tok, write_token, end_token=end_token)
@@ -1095,20 +1170,125 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             audio_lens = torch.tensor(new_lens, dtype=audio_lens.dtype, device=audio_lens.device)
             audio_durations_secs = (audio_lens.float() / self.cfg.sample_rate).tolist()
 
-        if self.cfg.add_utterance_boundary_tokens:
-            alignments = [
-                add_utterance_boundary_alignments(
-                    sample_alignments,
-                    audio_duration_secs=duration_secs,
-                    start_token=self.cfg.utterance_start_token,
-                    end_token=self.cfg.utterance_end_token,
-                    start_delay_frames=self.cfg.utterance_start_boundary_delay_frames,
-                    end_delay_frames=self.cfg.utterance_end_boundary_delay_frames,
-                )
-                for sample_alignments, duration_secs in zip(alignments, audio_durations_secs)
-            ]
+        if self.cfg.use_per_sample_utterance_boundary_tokens:
+            system_prompts = []
+            add_boundary_tokens = []
+            timestamp_sources = []
+            for cut in cuts:
+                custom = cut.custom or {}
+                cut_id = getattr(cut, "id", "<unknown>")
+                if self.cfg.prompt_field not in custom:
+                    raise ValueError(
+                        f"Cut {cut_id!r} is missing required custom field {self.cfg.prompt_field!r} "
+                        "while use_per_sample_utterance_boundary_tokens=True"
+                    )
+                prompt = custom[self.cfg.prompt_field]
+                if not isinstance(prompt, str) or not prompt:
+                    raise TypeError(
+                        f"Cut {cut_id!r} custom field {self.cfg.prompt_field!r} must be a non-empty string; "
+                        f"got {prompt!r}"
+                    )
+                if "add_utterance_boundary_tokens" not in custom:
+                    raise ValueError(
+                        f"Cut {cut_id!r} is missing required custom field 'add_utterance_boundary_tokens' "
+                        "while use_per_sample_utterance_boundary_tokens=True"
+                    )
+                add_boundaries = custom["add_utterance_boundary_tokens"]
+                if not isinstance(add_boundaries, bool):
+                    raise TypeError(
+                        f"Cut {cut_id!r} custom field 'add_utterance_boundary_tokens' must be a boolean; "
+                        f"got {add_boundaries!r}"
+                    )
+                system_prompts.append(prompt)
+                add_boundary_tokens.append(add_boundaries)
+                timestamp_source = None
+                if add_boundaries and self.cfg.use_per_sample_utterance_boundary_timestamps:
+                    if "utterance_boundary_timestamp_source" not in custom:
+                        raise ValueError(
+                            f"Cut {cut_id!r} is missing required custom field "
+                            "'utterance_boundary_timestamp_source' while "
+                            "use_per_sample_utterance_boundary_timestamps=True"
+                        )
+                    timestamp_source = custom["utterance_boundary_timestamp_source"]
+                    if (
+                        not isinstance(timestamp_source, str)
+                        or timestamp_source not in UTTERANCE_BOUNDARY_TIMESTAMP_SOURCES
+                    ):
+                        raise ValueError(
+                            f"Cut {cut_id!r} custom field 'utterance_boundary_timestamp_source' must be one of "
+                            f"{sorted(UTTERANCE_BOUNDARY_TIMESTAMP_SOURCES)}; got {timestamp_source!r}"
+                        )
+                timestamp_sources.append(timestamp_source)
 
-        system_prompts = [cut.custom.get(self.cfg.prompt_field, self.cfg.system_prompt) for cut in cuts]
+            resolved_alignments = []
+            for cut, sample_alignments, transcript, duration_secs, add_boundaries, timestamp_source in zip(
+                cuts, alignments, text, audio_durations_secs, add_boundary_tokens, timestamp_sources
+            ):
+                if not add_boundaries:
+                    resolved_alignments.append(sample_alignments)
+                    continue
+
+                cut_id = str(getattr(cut, "id", "<unknown>"))
+                if transcript and not sample_alignments:
+                    raise ValueError(
+                        f"Cut {cut_id!r} has a non-empty transcript but no usable word alignments for "
+                        "utterance boundary training"
+                    )
+                custom = cut.custom or {}
+                use_gt = timestamp_source == UTTERANCE_BOUNDARY_TIMESTAMP_SOURCE_GT_PREFERRED
+                has_gt_start = "utterance_start_time" in custom
+                has_gt_end = "utterance_end_time" in custom
+                if use_gt and has_gt_start != has_gt_end:
+                    raise ValueError(
+                        f"Cut {cut_id!r} must provide both 'utterance_start_time' and 'utterance_end_time', "
+                        "or neither, when utterance_boundary_timestamp_source='gt_preferred'"
+                    )
+                if use_gt and has_gt_start:
+                    sample_alignments = add_gt_utterance_boundary_alignments(
+                        sample_alignments,
+                        utterance_start_time=custom["utterance_start_time"],
+                        utterance_end_time=custom["utterance_end_time"],
+                        audio_duration_secs=duration_secs,
+                        start_token=self.cfg.utterance_start_token,
+                        end_token=self.cfg.utterance_end_token,
+                        start_delay_frames=self.cfg.utterance_start_boundary_delay_frames,
+                        end_delay_frames=self.cfg.utterance_end_boundary_delay_frames,
+                        cut_id=cut_id,
+                    )
+                else:
+                    if use_gt and cut_id not in self._warned_missing_gt_boundary_cut_ids:
+                        logging.warning(
+                            "Cut %r requested gt_preferred utterance boundary timestamps but both GT fields "
+                            "are absent; falling back to alignment-derived SOU/EOU timestamps",
+                            cut_id,
+                        )
+                        self._warned_missing_gt_boundary_cut_ids.add(cut_id)
+                    sample_alignments = add_utterance_boundary_alignments(
+                        sample_alignments,
+                        audio_duration_secs=duration_secs,
+                        start_token=self.cfg.utterance_start_token,
+                        end_token=self.cfg.utterance_end_token,
+                        start_delay_frames=self.cfg.utterance_start_boundary_delay_frames,
+                        end_delay_frames=self.cfg.utterance_end_boundary_delay_frames,
+                    )
+                resolved_alignments.append(sample_alignments)
+            alignments = resolved_alignments
+        else:
+            # Keep the legacy global behavior byte-for-byte when the opt-in mode is disabled.
+            if self.cfg.add_utterance_boundary_tokens:
+                alignments = [
+                    add_utterance_boundary_alignments(
+                        sample_alignments,
+                        audio_duration_secs=duration_secs,
+                        start_token=self.cfg.utterance_start_token,
+                        end_token=self.cfg.utterance_end_token,
+                        start_delay_frames=self.cfg.utterance_start_boundary_delay_frames,
+                        end_delay_frames=self.cfg.utterance_end_boundary_delay_frames,
+                    )
+                    for sample_alignments, duration_secs in zip(alignments, audio_durations_secs)
+                ]
+
+            system_prompts = [cut.custom.get(self.cfg.prompt_field, self.cfg.system_prompt) for cut in cuts]
 
         batch_messages = get_llm_messages_for_batch(
             system_role=self.cfg.system_role,
