@@ -16,7 +16,7 @@ import warnings
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Any, List, Optional, Union
+from typing import Any, List, Literal, Optional, Union
 
 import torch
 import torch.nn.functional as F
@@ -313,6 +313,28 @@ class StreamingState:
     def seq_len(self) -> int:
         """Max seq_len across streams (= KV cache dimension)."""
         return max(self.seq_lens) if self.seq_lens else 0
+
+
+@dataclass(frozen=True)
+class BoundaryEvent:
+    """A sampled utterance or agent-backchannel boundary token."""
+
+    boundary_type: Literal["sou", "eou", "soab", "eoab"]
+    token_id: int
+    token_piece: str
+    sampled_token_sequence_index: int
+    encoder_frames_consumed: int
+    emission_time_seconds: float
+
+
+@dataclass(frozen=True)
+class StreamingGenerationRecord:
+    """Detailed opt-in result for one streaming generation request."""
+
+    pred_text_unnormalized: str
+    sampled_token_ids: list[int]
+    sampled_token_pieces: list[str]
+    boundary_events: list[BoundaryEvent]
 
 
 class StreamingSTTModel(LightningModule, HFHubMixin):
@@ -1089,6 +1111,77 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             )
         return soab_ids[0], eoab_ids[0]
 
+    def _get_boundary_token_info(self) -> dict[int, tuple[Literal["sou", "eou", "soab", "eoab"], str]]:
+        """Map enabled single-token boundary IDs to their semantic type and token piece."""
+        token_info: dict[int, tuple[Literal["sou", "eou", "soab", "eoab"], str]] = {}
+        if getattr(self.core_cfg, "add_utterance_boundary_tokens", False):
+            sou_id, eou_id = self._get_boundary_token_ids()
+            if sou_id is not None and eou_id is not None:
+                token_info[int(sou_id)] = ("sou", self.tokenizer.ids_to_tokens([sou_id])[0])
+                token_info[int(eou_id)] = ("eou", self.tokenizer.ids_to_tokens([eou_id])[0])
+        if getattr(self.core_cfg, "enable_agent_backchannels", False):
+            soab_id, eoab_id = self._get_agent_backchannel_token_ids()
+            if soab_id is not None and eoab_id is not None:
+                token_info[int(soab_id)] = ("soab", self.tokenizer.ids_to_tokens([soab_id])[0])
+                token_info[int(eoab_id)] = ("eoab", self.tokenizer.ids_to_tokens([eoab_id])[0])
+        return token_info
+
+    def _build_generation_records(
+        self,
+        decoded_texts: list[str],
+        sampled_token_ids: list[list[int]],
+        boundary_events: list[list[BoundaryEvent]],
+    ) -> list[StreamingGenerationRecord]:
+        """Build detailed records without changing decoded text semantics."""
+        if not (len(decoded_texts) == len(sampled_token_ids) == len(boundary_events)):
+            raise RuntimeError(
+                "Generation output count mismatch: "
+                f"decoded_texts={len(decoded_texts)}, sampled_token_ids={len(sampled_token_ids)}, "
+                f"boundary_events={len(boundary_events)}"
+            )
+
+        records = []
+        for text, token_ids, events in zip(decoded_texts, sampled_token_ids, boundary_events):
+            token_ids = [int(token_id) for token_id in token_ids]
+            token_pieces = list(self.tokenizer.ids_to_tokens(token_ids))
+            records.append(
+                StreamingGenerationRecord(
+                    pred_text_unnormalized=text,
+                    sampled_token_ids=token_ids,
+                    sampled_token_pieces=token_pieces,
+                    boundary_events=list(events),
+                )
+            )
+        return records
+
+    def _append_sampled_token_and_boundary_event(
+        self,
+        *,
+        token_id: int,
+        encoder_frames_consumed: int,
+        sampled_token_ids: list[int],
+        boundary_events: list[BoundaryEvent],
+        boundary_token_info: dict[int, tuple[Literal["sou", "eou", "soab", "eoab"], str]],
+    ) -> None:
+        """Append one sampled token and its event when it is an enabled boundary."""
+        token_id = int(token_id)
+        sampled_token_ids.append(token_id)
+        token_info = boundary_token_info.get(token_id)
+        if token_info is None:
+            return
+
+        boundary_type, token_piece = token_info
+        boundary_events.append(
+            BoundaryEvent(
+                boundary_type=boundary_type,
+                token_id=token_id,
+                token_piece=token_piece,
+                sampled_token_sequence_index=len(sampled_token_ids) - 1,
+                encoder_frames_consumed=int(encoder_frames_consumed),
+                emission_time_seconds=float(encoder_frames_consumed * self.core_cfg.frame_length_in_secs),
+            )
+        )
+
     def _compute_agent_backchannel_metrics(self, pred_ids: Tensor, target_ids: Tensor) -> dict[str, Tensor]:
         soab_id, eoab_id = self._get_agent_backchannel_token_ids()
         if soab_id is None or eoab_id is None:
@@ -1485,8 +1578,9 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         max_new_tokens: int,
         generation_config: Optional[GenerationConfig] = None,
         stop_on_blank: Union[bool, str] = True,
+        collect_sampled_tokens: bool = False,
         **generation_kwargs,
-    ) -> tuple[list[list[int]], tuple, list[bool], int]:
+    ) -> tuple[list[list[int]], list[list[int]], tuple, list[bool], int]:
         """Autoregressive decoding (supports B streams).
 
         Token selection is delegated to :meth:`_sample_token`, which supports
@@ -1513,17 +1607,22 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                   generated (= "no speech this chunk").  Use when the blank
                   token is a natural text token (e.g. ``" "``).
                 - ``False``: never stop on blank.
+            collect_sampled_tokens: Whether to retain the exact sampled token
+                stream before decode cleanup.
             generation_kwargs: Per-call overrides.
 
         Returns:
-            ``(generated_per_stream, updated_cache, footer_consumed_per_stream, num_feed_steps)``
-            where ``generated_per_stream`` is a list of B token-ID lists and
-            ``num_feed_steps`` is how many tokens were fed to the LLM cache.
+            ``(generated_per_stream, sampled_per_stream, updated_cache,
+            footer_consumed_per_stream, num_feed_steps)``. ``generated_per_stream``
+            retains the existing decode-ready cleanup. ``sampled_per_stream``
+            records every token selected by :meth:`_sample_token`, including
+            EOS, blank, and assistant-footer tokens before cleanup.
         """
         B = logits.shape[0]
         footer = self._asst_footer_ids
         flen = len(footer)
         generated: list[list[int]] = [[] for _ in range(B)]
+        sampled: list[list[int]] = [[] for _ in range(B)]
         footer_consumed = [False] * B
         finished = [False] * B
         num_feed_steps = 0
@@ -1539,6 +1638,8 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 if finished[b]:
                     continue
                 tid = next_tokens[b].item()
+                if collect_sampled_tokens:
+                    sampled[b].append(tid)
 
                 # EOS: stop WITHOUT feeding to LLM. Append a chunk separator so
                 # decode_with_blank can join per-chunk outputs correctly.
@@ -1610,7 +1711,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
             next_tokens = self._sample_token(out.logits[:, -1, :], None, generation_config, **generation_kwargs)
 
-        return generated, cache, footer_consumed, num_feed_steps
+        return generated, sampled, cache, footer_consumed, num_feed_steps
 
     def get_audio_feature_buffer(
         self,
@@ -1755,8 +1856,9 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         max_new_tokens: int = 64,
         generation_config: Optional[GenerationConfig] = None,
         _audio_embs: Optional[Tensor] = None,
+        collect_sampled_tokens: bool = False,
         **generation_kwargs,
-    ) -> list[list[int]]:
+    ) -> tuple[list[list[int]], list[list[int]]]:
         """
         Process B raw audio chunks and generate the assistant responses.
 
@@ -1768,9 +1870,12 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             generation_config: Optional HuggingFace ``GenerationConfig``.
             _audio_embs: Optional pre-computed audio embeddings ``(B, chunk_size, H)``.
                 Diagnostic use only.
+            collect_sampled_tokens: Whether to retain exact sampled tokens
+                before EOS/footer cleanup.
             generation_kwargs: Per-call overrides for generation parameters.
         Returns:
-            List of B token-ID lists (one per stream).
+            A pair of B token-ID lists: the existing decode-ready tokens and
+            the exact sampled tokens before EOS/footer cleanup.
         """
 
         self._ensure_inference_cache()
@@ -1852,12 +1957,13 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             state.seq_lens[b] += input_len
 
         # 6. Autoregressive generation loop
-        generated_per_stream, state.cache, footer_consumed, _ = self._autoregressive_decode(
+        generated_per_stream, sampled_per_stream, state.cache, footer_consumed, _ = self._autoregressive_decode(
             out.logits,
             state.cache,
             state,
             max_new_tokens,
             generation_config,
+            collect_sampled_tokens=collect_sampled_tokens,
             **generation_kwargs,
         )
 
@@ -1889,7 +1995,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         # 8. Store and return
         for b in range(B):
             state.generated_tokens[b].extend(generated_per_stream[b])
-        return generated_per_stream
+        return generated_per_stream, sampled_per_stream
 
     def _build_offline_emb_chunks(
         self,
@@ -2027,7 +2133,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             attention_mask=attention_mask,
             batch_size=B,
         )
-        generated_per_stream, _, _, _ = self._autoregressive_decode(
+        generated_per_stream, _, _, _, _ = self._autoregressive_decode(
             out.logits,
             out.past_key_values,
             state,
@@ -2046,13 +2152,15 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         system_prompt: Union[str, List[str]],
         max_new_tokens: int,
         generation_config: Optional[GenerationConfig] = None,
+        use_offline_embs: bool = False,
         inference_chunk_size: Optional[int] = None,
         dynamic_min_chunk_size: int = 0,
         dynamic_max_chunk_size: Optional[int] = None,
         lm_head_emit_threshold: Optional[float] = None,
         debug_logs: Optional[list] = None,
+        return_generation_records: bool = False,
         **generation_kwargs,
-    ) -> list[str]:
+    ) -> list[str] | list[StreamingGenerationRecord]:
         """Batched dynamic-chunking generation.
 
         All B streams are processed in lockstep: each step feeds exactly 1
@@ -2067,6 +2175,9 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             system_prompt: System prompt string or list.
             max_new_tokens: Max tokens per text generation segment.
             generation_config: Optional HuggingFace ``GenerationConfig``.
+            use_offline_embs: When True, precompute perception embeddings over
+                each complete utterance and feed them through the fixed-chunk
+                state machine one frame at a time. Diagnostic use only.
             inference_chunk_size: Number of encoder frames per perception call
                 (default 1).  Embeddings are buffered and fed to the LLM one
                 at a time.
@@ -2074,6 +2185,9 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 to trigger generation (default 0, no minimum).
             dynamic_max_chunk_size: Maximum frames before forcing generation.
                 ``None`` means no upper bound (default).
+            return_generation_records: Return exact sampled tokens and boundary
+                events with each decoded prediction. Supported for positive
+                fixed chunk sizes only.
             generation_kwargs: Per-call overrides.
         """
         B = len(n_samples_list)
@@ -2111,6 +2225,8 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         gen_token_count = [0] * B  # tokens generated in current GENERATING phase
         last_gen_token = [self.text_pad_id] * B  # last generated token per stream
         all_tokens: list[list[int]] = [[] for _ in range(B)]
+        sampled_token_ids: list[list[int]] = [[] for _ in range(B)]
+        boundary_events: list[list[BoundaryEvent]] = [[] for _ in range(B)]
 
         # Per-stream audio embedding buffer (filled by perception, consumed 1 at a time)
         audio_emb_buf: list[list[Tensor]] = [[] for _ in range(B)]
@@ -2121,6 +2237,23 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         fixed_chunk_size = self.core_cfg.chunk_size if fixed_chunk_mode else 0
         frames_in_segment = [0] * B  # frames consumed in current LISTENING segment
 
+        if use_offline_embs:
+            if not fixed_chunk_mode:
+                raise ValueError(
+                    "use_offline_embs with state-machine inference requires a positive fixed chunk_size"
+                )
+            for b in range(B):
+                if n_samples_list[b] <= 0:
+                    continue
+                offline_chunks = self._build_offline_emb_chunks(
+                    audios[b, : n_samples_list[b]], n_samples_list[b], device
+                )
+                for chunk in offline_chunks:
+                    audio_emb_buf[b].extend(chunk.squeeze(0).type_as(self.embed_tokens.weight).unbind(0))
+                # Mark waveform input exhausted. The state machine will keep
+                # listening until the precomputed embedding buffer is empty.
+                audio_sample_idx[b] = n_samples_list[b]
+
         # --- Audio-frame debug logging ---
         # When debug_logs is provided (a list passed in by the caller), we
         # populate it with per-LISTENING-frame diagnostic records per stream
@@ -2130,10 +2263,11 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         per_stream_frame_logs: list[list[dict]] = [[] for _ in range(B)] if log_frames else []
         total_frame_idx = [0] * B  # cumulative LISTENING frames per stream
 
-        uf_ah_ids = self._user_footer_and_asst_header_ids
-        uh_ids = self._user_header_ids
-        af_ids = self._asst_footer_ids
+        tokens_before_prediction = self._user_footer_and_asst_header_ids
+        user_header_tokens = self._user_header_ids
+        prediction_end_tokens = self._asst_footer_ids
         user_footer_first_id = self._user_footer_first_id
+        boundary_token_info = self._get_boundary_token_info() if return_generation_records else {}
 
         # Max steps: LLM's max context length minus the system prompt already in KV cache.
         max_model_len = getattr(self.llm.config, 'max_position_embeddings', 40960)
@@ -2144,6 +2278,59 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         # model knows). Otherwise fall back to the text pad id.
         pad_token_id = self.blank_token_id if self.has_blank else self.text_pad_id
         pad_emb = self.embed_tokens(torch.tensor([pad_token_id], device=device)).squeeze(0)  # (H,)
+
+        def record_sampled_token(b: int, token_id: int) -> None:
+            if not return_generation_records:
+                return
+            self._append_sampled_token_and_boundary_event(
+                token_id=token_id,
+                encoder_frames_consumed=total_frame_idx[b],
+                sampled_token_ids=sampled_token_ids[b],
+                boundary_events=boundary_events[b],
+                boundary_token_info=boundary_token_info,
+            )
+
+        def start_token_generation(b: int, logits: Tensor) -> None:
+            """Enter GENERATING using logits from the last consumed template/audio token."""
+            stream_state[b] = GENERATING
+            gen_token_count[b] = 0
+            first_token = self._sample_token(
+                logits[b : b + 1, -1, :],
+                None,
+                generation_config,
+                **generation_kwargs,
+            ).item()
+            record_sampled_token(b, first_token)
+            first_is_stop = (
+                (self._eos_id is not None and first_token == self._eos_id)
+                or first_token == self.blank_token_id
+                or (len(prediction_end_tokens) == 1 and first_token == prediction_end_tokens[0])
+            )
+            if first_is_stop:
+                # Immediately done generating -- append chunk separator
+                # (blank when enabled, else EOS so decode_with_blank splits chunks).
+                all_tokens[b].append(self.blank_token_id if self.has_blank else self._eos_id)
+                if fixed_chunk_mode and self.has_blank:
+                    # Feed blank to LLM first (matches training sequence).
+                    stream_state[b] = BLANK_FEED
+                elif prediction_end_tokens:
+                    stream_state[b] = ASST_FOOTER
+                    template_pos[b] = 0
+                else:
+                    self._dynamic_finish_generating(
+                        b,
+                        stream_state,
+                        template_pos,
+                        audio_emb_buf,
+                        audio_sample_idx,
+                        n_samples_list,
+                        _initial_state,
+                        DONE,
+                    )
+            else:
+                all_tokens[b].append(first_token)
+                last_gen_token[b] = first_token
+                gen_token_count[b] = 1
 
         for _step in range(max_steps):
             # --- Refill audio embedding buffers for LISTENING streams ---
@@ -2222,7 +2409,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     else:
                         embs_list.append(pad_emb)
                 elif stream_state[b] == FOOTER:
-                    tid = uf_ah_ids[template_pos[b]]
+                    tid = tokens_before_prediction[template_pos[b]]
                     embs_list.append(self.embed_tokens(torch.tensor([tid], device=device)).squeeze(0))  # (H,)
                 elif stream_state[b] == GENERATING:
                     embs_list.append(
@@ -2234,10 +2421,10 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                         self.embed_tokens(torch.tensor([self.blank_token_id], device=device)).squeeze(0)  # (H,)
                     )
                 elif stream_state[b] == ASST_FOOTER:
-                    tid = af_ids[template_pos[b]]
+                    tid = prediction_end_tokens[template_pos[b]]
                     embs_list.append(self.embed_tokens(torch.tensor([tid], device=device)).squeeze(0))  # (H,)
                 elif stream_state[b] == HEADER:
-                    tid = uh_ids[template_pos[b]]
+                    tid = user_header_tokens[template_pos[b]]
                     embs_list.append(self.embed_tokens(torch.tensor([tid], device=device)).squeeze(0))  # (H,)
                 else:  # DONE
                     embs_list.append(pad_emb)
@@ -2413,46 +2600,13 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                             }
                         )
 
+                    if stream_state[b] == FOOTER and not tokens_before_prediction:
+                        start_token_generation(b, out.logits)
+
                 elif stream_state[b] == FOOTER:
                     template_pos[b] += 1
-                    if template_pos[b] >= len(uf_ah_ids):
-                        stream_state[b] = GENERATING
-                        gen_token_count[b] = 0
-                        # Use the logit from this step as the first generation logit
-                        first_token = self._sample_token(
-                            out.logits[b : b + 1, -1, :],
-                            None,
-                            generation_config,
-                            **generation_kwargs,
-                        ).item()
-                        first_is_stop = (
-                            self._eos_id is not None and first_token == self._eos_id
-                        ) or first_token == self.blank_token_id
-                        if first_is_stop:
-                            # Immediately done generating — append chunk separator
-                            # (blank when enabled, else EOS so decode_with_blank splits chunks)
-                            all_tokens[b].append(self.blank_token_id if self.has_blank else self._eos_id)
-                            if fixed_chunk_mode and self.has_blank:
-                                # Feed blank to LLM first (matches training sequence)
-                                stream_state[b] = BLANK_FEED
-                            elif af_ids:
-                                stream_state[b] = ASST_FOOTER
-                                template_pos[b] = 0
-                            else:
-                                self._dynamic_finish_generating(
-                                    b,
-                                    stream_state,
-                                    template_pos,
-                                    audio_emb_buf,
-                                    audio_sample_idx,
-                                    n_samples_list,
-                                    _initial_state,
-                                    DONE,
-                                )
-                        else:
-                            all_tokens[b].append(first_token)
-                            last_gen_token[b] = first_token
-                            gen_token_count[b] = 1
+                    if template_pos[b] >= len(tokens_before_prediction):
+                        start_token_generation(b, out.logits)
 
                 elif stream_state[b] == GENERATING:
                     token = self._sample_token(
@@ -2461,11 +2615,13 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                         generation_config,
                         **generation_kwargs,
                     ).item()
-                    # Stop on EOS, blank, or max tokens (matching _autoregressive_decode)
+                    record_sampled_token(b, token)
+                    # Stop on EOS, blank, footer, or max tokens (matching _autoregressive_decode).
                     is_eos = self._eos_id is not None and token == self._eos_id
                     is_blank = token == self.blank_token_id
+                    is_footer = len(prediction_end_tokens) == 1 and token == prediction_end_tokens[0]
                     is_max = gen_token_count[b] >= max_new_tokens
-                    if is_eos or is_blank or is_max:
+                    if is_eos or is_blank or is_footer or is_max:
                         # Append chunk separator (blank when enabled, else EOS).
                         # decode_with_blank splits per-chunk outputs on this.
                         all_tokens[b].append(self.blank_token_id if self.has_blank else self._eos_id)
@@ -2479,7 +2635,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                         # (heavy deletion errors, especially in compact mode
                         # where the single asst_footer token can't recover the
                         # context).
-                        if af_ids:
+                        if prediction_end_tokens:
                             stream_state[b] = ASST_FOOTER
                             template_pos[b] = 0
                         else:
@@ -2500,7 +2656,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
                 elif stream_state[b] == BLANK_FEED:
                     # Blank was fed to LLM this step. Transition to ASST_FOOTER.
-                    if af_ids:
+                    if prediction_end_tokens:
                         stream_state[b] = ASST_FOOTER
                         template_pos[b] = 0
                     else:
@@ -2517,7 +2673,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
                 elif stream_state[b] == ASST_FOOTER:
                     template_pos[b] += 1
-                    if template_pos[b] >= len(af_ids):
+                    if template_pos[b] >= len(prediction_end_tokens):
                         self._dynamic_finish_generating(
                             b,
                             stream_state,
@@ -2531,7 +2687,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
                 elif stream_state[b] == HEADER:
                     template_pos[b] += 1
-                    if template_pos[b] >= len(uh_ids):
+                    if template_pos[b] >= len(user_header_tokens):
                         stream_state[b] = LISTENING
 
             if all(s == DONE for s in stream_state):
@@ -2539,7 +2695,10 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
         if log_frames:
             debug_logs.extend(per_stream_frame_logs)
-        return [decode_with_blank(toks, self.blank_token, self.tokenizer) for toks in all_tokens]
+        decoded_texts = [decode_with_blank(toks, self.blank_token, self.tokenizer) for toks in all_tokens]
+        if return_generation_records:
+            return self._build_generation_records(decoded_texts, sampled_token_ids, boundary_events)
+        return decoded_texts
 
     @staticmethod
     def _dynamic_finish_generating(
@@ -2573,8 +2732,9 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         max_new_tokens: int,
         generation_config: Optional[GenerationConfig] = None,
         use_offline_embs: bool = False,
+        return_generation_records: bool = False,
         **generation_kwargs,
-    ) -> list[str]:
+    ) -> list[str] | list[StreamingGenerationRecord]:
         """Chunk-by-chunk streaming generation for B samples in lockstep.
 
         Args:
@@ -2584,6 +2744,8 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             max_new_tokens: Maximum tokens to generate per chunk per stream.
             generation_config: Optional HuggingFace ``GenerationConfig``.
             use_offline_embs: When True, bypass streaming perception with offline embeddings.
+            return_generation_records: Return exact sampled tokens and timestamped
+                SOU/EOU/SOAB/EOAB boundary events with each prediction.
             generation_kwargs: Per-call overrides for generation parameters.
 
         Returns:
@@ -2595,7 +2757,10 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         )
         B = len(n_samples_list)
         if B == 0 or max(n_samples_list) == 0:
-            return [""] * B
+            decoded_texts = [""] * B
+            if return_generation_records:
+                return self._build_generation_records(decoded_texts, [[] for _ in range(B)], [[] for _ in range(B)])
+            return decoded_texts
         device = audios.device
         chunk_size = self.core_cfg.chunk_size
         chunk_samples = math.ceil(chunk_size * self.core_cfg.frame_length_in_secs * self.core_cfg.sample_rate)
@@ -2611,6 +2776,9 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         num_chunks_per_stream = [math.ceil(ns / chunk_samples) if ns > 0 else 0 for ns in n_samples_list]
         max_chunks = max(num_chunks_per_stream)
         all_token_ids: list[list[int]] = [[] for _ in range(B)]
+        sampled_token_ids: list[list[int]] = [[] for _ in range(B)]
+        boundary_events: list[list[BoundaryEvent]] = [[] for _ in range(B)]
+        boundary_token_info = self._get_boundary_token_info() if return_generation_records else {}
 
         for chunk_i in range(max_chunks):
             # Build B audio chunks (zero-pad finished streams)
@@ -2644,12 +2812,13 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                         emb_chunks.append(torch.zeros(1, chunk_size, H, device=device, dtype=audios.dtype))
                 extra_kwargs["_audio_embs"] = torch.cat(emb_chunks, dim=0)
 
-            chunk_tokens = self._chunked_streaming_step(
+            chunk_tokens, chunk_sampled_tokens = self._chunked_streaming_step(
                 audio_batch,
                 lens_batch,
                 state,
                 max_new_tokens,
                 generation_config,
+                collect_sampled_tokens=return_generation_records,
                 **extra_kwargs,
                 **generation_kwargs,
             )
@@ -2657,8 +2826,20 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 # Only collect tokens for streams that are still active
                 if chunk_i < num_chunks_per_stream[b]:
                     all_token_ids[b].extend(chunk_tokens[b])
+                    if return_generation_records:
+                        for token_id in chunk_sampled_tokens[b]:
+                            self._append_sampled_token_and_boundary_event(
+                                token_id=token_id,
+                                encoder_frames_consumed=(chunk_i + 1) * chunk_size,
+                                sampled_token_ids=sampled_token_ids[b],
+                                boundary_events=boundary_events[b],
+                                boundary_token_info=boundary_token_info,
+                            )
 
-        return [decode_with_blank(toks, self.blank_token, self.tokenizer) for toks in all_token_ids]
+        decoded_texts = [decode_with_blank(toks, self.blank_token, self.tokenizer) for toks in all_token_ids]
+        if return_generation_records:
+            return self._build_generation_records(decoded_texts, sampled_token_ids, boundary_events)
+        return decoded_texts
 
     @torch.no_grad()
     def generate(
@@ -2674,8 +2855,9 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         dynamic_max_chunk_size: Optional[int] = None,
         lm_head_emit_threshold: Optional[float] = None,
         debug_logs: Optional[list] = None,
+        return_generation_records: bool = False,
         **generation_kwargs,
-    ) -> list[str]:
+    ) -> list[str] | list[StreamingGenerationRecord]:
         """
         Transcribe full audio(s).
 
@@ -2691,16 +2873,26 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 the model is allowed to trigger generation (default 0).
             dynamic_max_chunk_size: For dynamic chunking — maximum frames before
                 forcing generation. ``None`` means no upper bound (default).
+            return_generation_records: When True, return one
+                :class:`StreamingGenerationRecord` per sample. Detailed records
+                are supported only for positive streaming chunk sizes.
             generation_kwargs: Per-call overrides for generation parameters.
 
         Returns:
-            List of transcription strings, one per sample.
+            A list of transcription strings by default, or detailed generation
+            records when ``return_generation_records=True``.
         """
         self._ensure_inference_cache()
 
         with move_embedding(self):
             B = audios.shape[0]
             n_samples_list = [int(audio_lens[b].item()) for b in range(B)]
+
+            if return_generation_records and self.core_cfg.chunk_size <= 0:
+                raise ValueError(
+                    "return_generation_records=True requires a positive streaming chunk_size; "
+                    f"got {self.core_cfg.chunk_size}"
+                )
 
             if self.core_cfg.chunk_size < 0:
                 results = self._generate_offline(
@@ -2720,10 +2912,12 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     system_prompt,
                     max_new_tokens,
                     generation_config,
+                    use_offline_embs=use_offline_embs,
                     dynamic_min_chunk_size=dynamic_min_chunk_size,
                     dynamic_max_chunk_size=dynamic_max_chunk_size,
                     lm_head_emit_threshold=lm_head_emit_threshold,
                     debug_logs=debug_logs,
+                    return_generation_records=return_generation_records,
                     **generation_kwargs,
                 )
             else:
@@ -2735,6 +2929,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     max_new_tokens,
                     generation_config,
                     use_offline_embs=use_offline_embs,
+                    return_generation_records=return_generation_records,
                     **generation_kwargs,
                 )
 

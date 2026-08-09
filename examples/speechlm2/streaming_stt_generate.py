@@ -27,14 +27,15 @@ Usage::
         inputs=/data/test.jsonl \
         simulate_streaming=true
 
-The model's ``generate()`` method returns ``list[str]`` directly.
+The model's ``generate()`` method returns ``list[str]`` by default. Detailed
+token and boundary records are opt-in through ``log_boundary_events=true``.
 """
 
 from __future__ import annotations
 
 import math
 import os
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from functools import partial
 from pathlib import Path
@@ -54,9 +55,57 @@ from whisper_normalizer.english import EnglishTextNormalizer
 from nemo.collections.asr.metrics.wer import word_error_rate_detail
 from nemo.collections.common.data.lhotse.cutset import guess_parse_cutset
 from nemo.collections.common.data.lhotse.dataloader import pad_extra_duration
-from nemo.collections.speechlm2.models import StreamingSTTModel
+from nemo.collections.speechlm2.models import StreamingGenerationRecord, StreamingSTTModel
 from nemo.core.config import hydra_runner
 from nemo.utils import logging
+
+
+def _cut_custom(cut) -> dict:
+    custom = getattr(cut, "custom", None)
+    return custom if isinstance(custom, dict) else {}
+
+
+def _source_clip_id(cut) -> Optional[str]:
+    custom = _cut_custom(cut)
+    clip_id = getattr(cut, "clip_id", None) or custom.get("clip_id")
+    return str(clip_id) if clip_id is not None else None
+
+
+def _output_record(
+    cut,
+    reference_text: str,
+    normalized_prediction: str,
+    generation_record: Optional[StreamingGenerationRecord] = None,
+) -> dict:
+    """Build one output row in the dataloader's actual yield order."""
+    wer, _, nins, ndel, nsub = word_error_rate_detail(
+        hypotheses=[normalized_prediction], references=[reference_text], use_cer=False
+    )
+    output = {
+        "id": cut.id,
+        "clip_id": _source_clip_id(cut),
+        "duration": cut.duration,
+        "text": reference_text,
+        "pred_text": normalized_prediction,
+        "wer": wer,
+        "ins": nins,
+        "del": ndel,
+        "sub": nsub,
+    }
+    if generation_record is not None:
+        if output["clip_id"] is None:
+            raise RuntimeError(f"Detailed generation output requires source clip_id metadata; cut={cut.id!r}")
+        if len(generation_record.sampled_token_ids) != len(generation_record.sampled_token_pieces):
+            raise RuntimeError(f"Sampled token ID/piece length mismatch for clip_id={output['clip_id']!r}")
+        output.update(
+            {
+                "pred_text_unnormalized": generation_record.pred_text_unnormalized.strip(),
+                "sampled_token_ids": list(generation_record.sampled_token_ids),
+                "sampled_token_pieces": list(generation_record.sampled_token_pieces),
+                "boundary_events": [asdict(event) for event in generation_record.boundary_events],
+            }
+        )
+    return output
 
 
 class ToAudio(torch.utils.data.Dataset):
@@ -88,6 +137,7 @@ class StreamingSTTEvalConfig:
     pretrained_name: str = ""
     inputs: str = ""
     batch_size: int = 64
+    max_batch_duration: Optional[float] = None
     num_workers: int = 4
     max_new_tokens: int = 64
     system_prompt: str = "Transcribe the audio into text."
@@ -114,6 +164,9 @@ class StreamingSTTEvalConfig:
     # sibling JSONL alongside output_manifest. Slows inference; use on
     # small eval sets when debugging boundary-decision behavior.
     debug_log_audio_frames: bool = False
+    # Collect stream-relative SOU/EOU event timestamps and include them in
+    # output records. This is opt-in because it adds diagnostic bookkeeping.
+    log_boundary_events: bool = False
     generation_config: StreamingSTTGenerationConfig = field(default_factory=StreamingSTTGenerationConfig)
 
 
@@ -145,8 +198,12 @@ def main(cfg: StreamingSTTEvalConfig):
         cuts = CutSet.from_cuts(c.resample(model.sampling_rate) for c in cuts)
     cuts = cuts.sort_by_duration()
     cuts = cuts.map(partial(pad_extra_duration, extra_duration=cfg.pad_extra_duration))
-    sampler = lhotse.dataset.DynamicCutSampler(cuts, max_cuts=cfg.batch_size)
-    num_batches = math.ceil(len(cuts) / cfg.batch_size)
+    sampler = lhotse.dataset.DynamicCutSampler(
+        cuts,
+        max_cuts=cfg.batch_size,
+        max_duration=cfg.max_batch_duration,
+    )
+    num_batches = None if cfg.max_batch_duration is not None else math.ceil(len(cuts) / cfg.batch_size)
     dloader = torch.utils.data.DataLoader(
         dataset=ToAudio(),
         sampler=sampler,
@@ -159,8 +216,8 @@ def main(cfg: StreamingSTTEvalConfig):
 
     refs = []
     hyps = []
-    input_durations = []
-    infer_durations = []
+    input_duration = 0.0
+    infer_duration = 0.0
 
     # Optional per-frame debug log file (one record per LISTENING frame per
     # cut, keyed by cut id). Only opened when debug_log_audio_frames=True.
@@ -173,58 +230,90 @@ def main(cfg: StreamingSTTEvalConfig):
         debug_log_writer = SequentialJsonlWriter(str(debug_log_path))
         logging.info(f"Audio frame debug log → {debug_log_path}")
 
-    for batch_idx, batch in tqdm(enumerate(dloader), total=num_batches):
-        ts = perf_counter()
-        cfg.generation_config.max_new_tokens = cfg.max_new_tokens
-        generation_config = GenerationConfig(**OmegaConf.to_container(cfg.generation_config))
-        batch_debug_logs: Optional[list] = [] if cfg.debug_log_audio_frames else None
-        batch_hyps_raw = model.generate(
-            audios=batch["audios"].to(model.device, non_blocking=True),
-            audio_lens=batch["audio_lens"].to(model.device, non_blocking=True),
-            system_prompt=cfg.system_prompt,
-            max_new_tokens=cfg.max_new_tokens,
-            generation_config=generation_config,
-            use_offline_embs=cfg.use_offline_embs,
-            use_state_machine_inference=cfg.use_state_machine_inference,
-            dynamic_min_chunk_size=cfg.dynamic_min_chunk_size,
-            dynamic_max_chunk_size=cfg.dynamic_max_chunk_size,
-            lm_head_emit_threshold=cfg.lm_head_emit_threshold,
-            debug_logs=batch_debug_logs,
-        )
-        batch_infer_duration = perf_counter() - ts
-
-        # Write per-frame debug records keyed by cut id.
-        if debug_log_writer is not None and batch_debug_logs is not None:
-            for cut, frames in zip(batch["cuts"], batch_debug_logs):
-                debug_log_writer.write({"id": cut.id, "duration": cut.duration, "frames": frames})
-
-        batch_duration = sum(c.duration for c in batch["cuts"])
-        batch_refs = [normalizer(cut.supervisions[0].text) for cut in batch["cuts"]]
-        batch_hyps = [normalizer(h.strip()) for h in batch_hyps_raw]
-
-        if cfg.verbose:
-            batch_wer, _, nins, ndel, nsub = word_error_rate_detail(batch_hyps, batch_refs)
-            batch_rtfx = batch_duration / batch_infer_duration
-            logging.info("--------------------------------")
-            logging.info(
-                f"Batch {batch_idx}: "
-                f"WER={batch_wer:.2%} [ins={nins:.2%} del={ndel:.2%} sub={nsub:.2%}] "
-                f"RTFx={batch_rtfx:.1f}"
+    output_writer = SequentialJsonlWriter(cfg.output_manifest) if cfg.output_manifest is not None else None
+    try:
+        for batch_idx, batch in tqdm(enumerate(dloader), total=num_batches):
+            ts = perf_counter()
+            cfg.generation_config.max_new_tokens = cfg.max_new_tokens
+            generation_config = GenerationConfig(**OmegaConf.to_container(cfg.generation_config))
+            batch_debug_logs: Optional[list] = [] if cfg.debug_log_audio_frames else None
+            batch_results = model.generate(
+                audios=batch["audios"].to(model.device, non_blocking=True),
+                audio_lens=batch["audio_lens"].to(model.device, non_blocking=True),
+                system_prompt=cfg.system_prompt,
+                max_new_tokens=cfg.max_new_tokens,
+                generation_config=generation_config,
+                use_offline_embs=cfg.use_offline_embs,
+                use_state_machine_inference=cfg.use_state_machine_inference,
+                dynamic_min_chunk_size=cfg.dynamic_min_chunk_size,
+                dynamic_max_chunk_size=cfg.dynamic_max_chunk_size,
+                lm_head_emit_threshold=cfg.lm_head_emit_threshold,
+                debug_logs=batch_debug_logs,
+                return_generation_records=cfg.log_boundary_events,
             )
-            for ref, hyp in zip(batch_refs, batch_hyps):
-                logging.info(f"\n[REF]\t`{ref}`\n[HYP]\t`{hyp}`\n")
-            logging.info("--------------------------------")
+            batch_infer_duration = perf_counter() - ts
+            batch_cuts = list(batch["cuts"])
+            if len(batch_results) != len(batch_cuts):
+                raise RuntimeError(
+                    f"Generation result count ({len(batch_results)}) did not match yielded cut count "
+                    f"({len(batch_cuts)}) for batch {batch_idx}"
+                )
 
-        refs.extend(batch_refs)
-        hyps.extend(batch_hyps)
-        input_durations.append(batch_duration)
-        infer_durations.append(batch_infer_duration)
+            if debug_log_writer is not None and batch_debug_logs is not None:
+                if len(batch_debug_logs) != len(batch_cuts):
+                    raise RuntimeError(
+                        f"Debug record count ({len(batch_debug_logs)}) did not match yielded cut count "
+                        f"({len(batch_cuts)}) for batch {batch_idx}"
+                    )
+                for cut, frames in zip(batch_cuts, batch_debug_logs):
+                    debug_log_writer.write({"id": cut.id, "duration": cut.duration, "frames": frames})
 
-    if debug_log_writer is not None:
-        debug_log_writer.close()
+            generation_records: list[Optional[StreamingGenerationRecord]]
+            if cfg.log_boundary_events:
+                if not all(isinstance(result, StreamingGenerationRecord) for result in batch_results):
+                    raise RuntimeError("log_boundary_events=true requires detailed StreamingGenerationRecord outputs")
+                generation_records = list(batch_results)
+                batch_unnormalized_predictions = [record.pred_text_unnormalized.strip() for record in batch_results]
+            else:
+                if not all(isinstance(result, str) for result in batch_results):
+                    raise RuntimeError("Text-only generation expected string outputs")
+                generation_records = [None] * len(batch_results)
+                batch_unnormalized_predictions = [prediction.strip() for prediction in batch_results]
+
+            batch_duration = sum(cut.duration for cut in batch_cuts)
+            batch_refs = [normalizer(cut.supervisions[0].text) for cut in batch_cuts]
+            batch_hyps = [normalizer(prediction) for prediction in batch_unnormalized_predictions]
+
+            if cfg.verbose:
+                batch_wer, _, nins, ndel, nsub = word_error_rate_detail(batch_hyps, batch_refs)
+                batch_rtfx = batch_duration / batch_infer_duration
+                logging.info("--------------------------------")
+                logging.info(
+                    f"Batch {batch_idx}: "
+                    f"WER={batch_wer:.2%} [ins={nins:.2%} del={ndel:.2%} sub={nsub:.2%}] "
+                    f"RTFx={batch_rtfx:.1f}"
+                )
+                for ref, hyp in zip(batch_refs, batch_hyps):
+                    logging.info(f"\n[REF]\t`{ref}`\n[HYP]\t`{hyp}`\n")
+                logging.info("--------------------------------")
+
+            refs.extend(batch_refs)
+            hyps.extend(batch_hyps)
+            input_duration += batch_duration
+            infer_duration += batch_infer_duration
+            if output_writer is not None:
+                for cut, ref, hyp, generation_record in zip(
+                    batch_cuts, batch_refs, batch_hyps, generation_records
+                ):
+                    output_writer.write(_output_record(cut, ref, hyp, generation_record))
+    finally:
+        if debug_log_writer is not None:
+            debug_log_writer.close()
+        if output_writer is not None:
+            output_writer.close()
 
     wer, _, nins, ndel, nsub = word_error_rate_detail(hypotheses=hyps, references=refs, use_cer=False)
-    rtfx = sum(input_durations) / sum(infer_durations)
+    rtfx = input_duration / infer_duration
     logging.info(f"WER: {wer:.2%} [ins={nins:.2%} del={ndel:.2%} sub={nsub:.2%}]")
     logging.info(f"RTFx: {rtfx:.1f}")
 
@@ -235,22 +324,7 @@ def main(cfg: StreamingSTTEvalConfig):
             f.write(f"Input: {cfg.inputs}\n")
             f.write(f"WER: {wer:.2%} [ins={nins:.2%} del={ndel:.2%} sub={nsub:.2%}]\n")
             f.write(f"RTFx: {rtfx:.1f}\n")
-            f.write(f"=============================================\n\n")
-        with SequentialJsonlWriter(cfg.output_manifest) as writer:
-            for cut, ref, hyp in zip(cuts, refs, hyps):
-                wer, _, nins, ndel, nsub = word_error_rate_detail(hypotheses=[hyp], references=[ref], use_cer=False)
-                writer.write(
-                    {
-                        "id": cut.id,
-                        "duration": cut.duration,
-                        "text": ref,
-                        "pred_text": hyp,
-                        "wer": wer,
-                        "ins": nins,
-                        "del": ndel,
-                        "sub": nsub,
-                    }
-                )
+            f.write("=============================================\n\n")
 
 
 if __name__ == "__main__":

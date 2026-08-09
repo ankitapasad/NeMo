@@ -18,7 +18,7 @@ from .duplex_stt_model import DuplexSTTModel
 from .nemotron_voicechat import NemotronVoiceChat
 from .salm import SALM
 from .salm_asr_decoder import SALMWithAsrDecoder
-from .streaming_stt_model import StreamingState, StreamingSTTModel
+from .streaming_stt_model import BoundaryEvent, StreamingGenerationRecord, StreamingState, StreamingSTTModel
 
 __all__ = [
     'DuplexS2SModel',
@@ -28,6 +28,8 @@ __all__ = [
     'SALM',
     'SALMWithAsrDecoder',
     'NemotronVoiceChat',
+    'BoundaryEvent',
+    'StreamingGenerationRecord',
     'StreamingState',
     'StreamingSTTModel',
 ]
