@@ -13,12 +13,16 @@
 # limitations under the License.
 
 """Lhotse adapters for NeMo datasets including Parquet support."""
+import copy
+import hashlib
+import math
 import os
 import random
 import re
 import tarfile
 from collections.abc import Mapping, Sequence
 from io import BytesIO
+from numbers import Real
 from pathlib import Path
 from typing import Generator, Iterable, List, Literal
 
@@ -41,6 +45,340 @@ from lhotse.utils import compute_num_samples, ifnone
 from nemo.collections.common.parts.preprocessing.manifest import get_full_path
 from nemo.utils import logging
 from nemo.utils.data_utils import is_datastore_path
+
+
+LEAN_MULTI_TURN_SCHEMA_VERSION = "lean_multi_turn_v2"
+_CONTEXT_SAMPLING_FIELDS = {
+    "min_leading_s",
+    "min_trailing_s",
+    "max_duration_s",
+}
+
+
+def _finite_nonnegative_number(value, *, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise TypeError(f"context_sampling.{field} must be a non-negative finite number; got {value!r}")
+    value = float(value)
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"context_sampling.{field} must be a non-negative finite number; got {value!r}")
+    return value
+
+
+def _finite_number(value, *, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise TypeError(f"context_sampling.{field} must be a finite number; got {value!r}")
+    value = float(value)
+    if not math.isfinite(value):
+        raise ValueError(f"context_sampling.{field} must be a finite number; got {value!r}")
+    return value
+
+
+def _validate_context_sampling_config(config: Mapping | None) -> dict | None:
+    if config is None:
+        return None
+    if not isinstance(config, Mapping):
+        raise TypeError(f"context_sampling must be a mapping; got {type(config).__name__}")
+    unknown = set(config) - _CONTEXT_SAMPLING_FIELDS
+    if unknown:
+        raise ValueError(f"context_sampling has unsupported fields: {sorted(unknown)}")
+    missing = _CONTEXT_SAMPLING_FIELDS - set(config)
+    if missing:
+        raise ValueError(f"context_sampling is missing required fields: {sorted(missing)}")
+
+    normalized = {key: _finite_nonnegative_number(config[key], field=key) for key in _CONTEXT_SAMPLING_FIELDS}
+    if normalized["max_duration_s"] <= 0:
+        raise ValueError("context_sampling.max_duration_s must be positive")
+    return normalized
+
+
+def _uniform_context_pair(
+    rng: random.Random,
+    *,
+    leading_low: float,
+    leading_high: float,
+    trailing_low: float,
+    trailing_high: float,
+    total_budget: float,
+) -> tuple[float, float]:
+    """Sample uniformly from two context intervals conditioned on their sum fitting the budget."""
+    tolerance = 1e-9
+    if leading_low + trailing_low > total_budget + tolerance:
+        raise ValueError(
+            "Minimum available leading/trailing context does not fit max_duration_s: "
+            f"{leading_low} + {trailing_low} > {total_budget}"
+        )
+
+    leading_high = min(leading_high, total_budget - trailing_low)
+    if leading_high < leading_low:
+        leading_high = leading_low
+
+    leading_span = leading_high - leading_low
+    trailing_span = trailing_high - trailing_low
+    if leading_span <= tolerance and trailing_span <= tolerance:
+        return leading_low, trailing_low
+    if leading_span <= tolerance:
+        return leading_low, rng.uniform(trailing_low, min(trailing_high, total_budget - leading_low))
+    if trailing_span <= tolerance:
+        return rng.uniform(leading_low, min(leading_high, total_budget - trailing_low)), trailing_low
+    if leading_high + trailing_high <= total_budget + tolerance:
+        return rng.uniform(leading_low, leading_high), rng.uniform(trailing_low, trailing_high)
+
+    # The feasible region is a rectangle clipped by leading + trailing <= total_budget.
+    # Its vertical width is constant, then decreases linearly. Sampling leading with
+    # density proportional to that width and trailing uniformly inside it produces a
+    # uniform joint sample over the clipped region.
+    plateau_end = min(leading_high, total_budget - trailing_high)
+    full_trailing_width = trailing_high - trailing_low
+    plateau_area = max(0.0, plateau_end - leading_low) * full_trailing_width
+
+    slope_start = max(leading_low, total_budget - trailing_high)
+    slope_end = leading_high
+    slope_width = max(0.0, slope_end - slope_start)
+    width_at_start = max(0.0, total_budget - trailing_low - slope_start)
+    slope_area = width_at_start * slope_width - 0.5 * slope_width * slope_width
+    total_area = plateau_area + max(0.0, slope_area)
+    if total_area <= tolerance:
+        return leading_low, trailing_low
+
+    area_sample = rng.random() * total_area
+    if area_sample < plateau_area:
+        leading = leading_low + area_sample / full_trailing_width
+        trailing_upper = trailing_high
+    else:
+        slope_sample = area_sample - plateau_area
+        discriminant = max(0.0, width_at_start * width_at_start - 2.0 * slope_sample)
+        leading = slope_start + width_at_start - math.sqrt(discriminant)
+        leading = min(max(leading, slope_start), slope_end)
+        trailing_upper = min(trailing_high, total_budget - leading)
+    trailing = rng.uniform(trailing_low, trailing_upper)
+    return leading, trailing
+
+
+def _shift_start_fields(items, *, shift: float, field: str) -> None:
+    if items is None:
+        return
+    if not isinstance(items, list):
+        raise TypeError(f"{field} must be a list for context sampling")
+    for idx, item in enumerate(items):
+        if not isinstance(item, Mapping):
+            raise TypeError(f"{field}[{idx}] must be a mapping for context sampling")
+        if "start" not in item:
+            raise ValueError(f"{field}[{idx}] is missing start for context sampling")
+        shifted_start = _finite_nonnegative_number(item["start"], field=f"{field}[{idx}].start") + shift
+        if shifted_start < -1e-5:
+            raise ValueError(f"{field}[{idx}].start becomes negative after context sampling: {shifted_start}")
+        item["start"] = max(0.0, shifted_start)
+
+
+def _shift_and_filter_context_intervals(
+    items,
+    *,
+    shift: float,
+    clip_duration: float,
+    field: str,
+) -> None:
+    """Shift signed contextual intervals and retain only full in-crop intervals."""
+    if items is None:
+        return
+    if not isinstance(items, list):
+        raise TypeError(f"{field} must be a list for context sampling")
+    clip_duration = _finite_nonnegative_number(clip_duration, field="sampled_clip.duration")
+    tolerance = 1e-5
+    retained = []
+    for idx, item in enumerate(items):
+        if not isinstance(item, Mapping):
+            raise TypeError(f"{field}[{idx}] must be a mapping for context sampling")
+        if "start" not in item:
+            raise ValueError(f"{field}[{idx}] is missing start for context sampling")
+        if "duration" not in item:
+            raise ValueError(f"{field}[{idx}] is missing duration for context sampling")
+        start = _finite_number(item["start"], field=f"{field}[{idx}].start")
+        duration = _finite_nonnegative_number(item["duration"], field=f"{field}[{idx}].duration")
+        shifted_start = start + shift
+        shifted_end = shifted_start + duration
+        if shifted_start < -tolerance or shifted_end > clip_duration + tolerance:
+            continue
+        item["start"] = max(0.0, shifted_start)
+        item["duration"] = min(duration, max(0.0, clip_duration - item["start"]))
+        retained.append(item)
+    items[:] = retained
+
+
+def _sample_lean_multiturn_context(
+    data: Mapping,
+    *,
+    recording_duration: float,
+    context_sampling: Mapping,
+    seed: int,
+) -> dict:
+    """Return a copied v2 row with a sampled real-audio crop and shifted relative timestamps."""
+    data = copy.deepcopy(dict(data))
+    sample_id = data.get("sample_id")
+    if not isinstance(sample_id, str) or not sample_id:
+        raise ValueError("context_sampling requires a non-empty sample_id")
+    curation = data.get("curation")
+    if not isinstance(curation, Mapping) or curation.get("schema_version") != LEAN_MULTI_TURN_SCHEMA_VERSION:
+        schema_version = curation.get("schema_version") if isinstance(curation, Mapping) else None
+        raise ValueError(
+            f"context_sampling is supported only for {LEAN_MULTI_TURN_SCHEMA_VERSION}; "
+            f"sample {sample_id!r} has schema {schema_version!r}"
+        )
+    audio_context = curation.get("audio_context")
+    physical_audio = curation.get("physical_audio")
+    target = curation.get("target")
+    if not all(isinstance(item, Mapping) for item in (audio_context, physical_audio, target)):
+        raise ValueError(f"Sample {sample_id!r} is missing v2 audio_context, physical_audio, or target metadata")
+    if physical_audio.get("stores_all_available_transcript_bounded_context") is not True:
+        raise ValueError(f"Sample {sample_id!r} physical member does not guarantee all available context")
+
+    declared_physical_duration = _finite_nonnegative_number(
+        physical_audio.get("duration"), field="physical_audio.duration"
+    )
+    if abs(declared_physical_duration - recording_duration) > 0.2:
+        raise ValueError(
+            f"Sample {sample_id!r} declares physical duration {declared_physical_duration}, "
+            f"but decoded tar member duration is {recording_duration}"
+        )
+
+    old_offset = _finite_nonnegative_number(data.get("offset", 0.0), field="manifest.offset")
+    old_duration = _finite_nonnegative_number(data.get("duration"), field="manifest.duration")
+    current_leading = _finite_nonnegative_number(audio_context.get("leading_sil"), field="audio_context.leading_sil")
+    current_trailing = _finite_nonnegative_number(
+        audio_context.get("trailing_sil"), field="audio_context.trailing_sil"
+    )
+    available_leading = _finite_nonnegative_number(
+        audio_context.get("max_available_leading_sil"), field="audio_context.max_available_leading_sil"
+    )
+    available_trailing = _finite_nonnegative_number(
+        audio_context.get("max_available_trailing_sil"), field="audio_context.max_available_trailing_sil"
+    )
+    source_start = _finite_nonnegative_number(physical_audio.get("source_start"), field="physical_audio.source_start")
+    source_audio_offset = _finite_nonnegative_number(
+        data.get("source_audio_offset"), field="manifest.source_audio_offset"
+    )
+    if abs(source_audio_offset - (source_start + old_offset)) > 0.2:
+        raise ValueError(
+            f"Sample {sample_id!r} source_audio_offset={source_audio_offset} is inconsistent with "
+            f"physical source_start + offset={source_start + old_offset}"
+        )
+
+    regions = target.get("utterance_regions")
+    if not isinstance(regions, list) or not regions:
+        raise ValueError(f"Sample {sample_id!r} has no target utterance_regions")
+    first_start = _finite_nonnegative_number(regions[0].get("start"), field="target.utterance_regions[0].start")
+    last_start = _finite_nonnegative_number(regions[-1].get("start"), field="target.utterance_regions[-1].start")
+    last_duration = _finite_nonnegative_number(
+        regions[-1].get("duration"), field="target.utterance_regions[-1].duration"
+    )
+    last_end = last_start + last_duration
+    tolerance = 1e-5
+    if abs(first_start - current_leading) > tolerance:
+        raise ValueError(
+            f"Sample {sample_id!r} leading_sil={current_leading} does not match first target start={first_start}"
+        )
+    if abs(old_duration - last_end - current_trailing) > tolerance:
+        raise ValueError(
+            f"Sample {sample_id!r} trailing_sil={current_trailing} does not match "
+            f"duration-last_target_end={old_duration - last_end}"
+        )
+
+    target_start_in_member = old_offset + first_start
+    target_end_in_member = old_offset + last_end
+    physical_leading = target_start_in_member
+    physical_trailing = recording_duration - target_end_in_member
+    if available_leading > physical_leading + 0.2 or available_trailing > physical_trailing + 0.2:
+        raise ValueError(f"Sample {sample_id!r} context availability exceeds physical member bounds")
+    available_leading = min(available_leading, physical_leading)
+    available_trailing = min(available_trailing, physical_trailing)
+
+    leading_high = available_leading
+    trailing_high = available_trailing
+    if leading_high + tolerance < context_sampling["min_leading_s"]:
+        raise ValueError(
+            f"Sample {sample_id!r} has only {leading_high}s available leading context, below "
+            f"context_sampling.min_leading_s={context_sampling['min_leading_s']}"
+        )
+    if trailing_high + tolerance < context_sampling["min_trailing_s"]:
+        raise ValueError(
+            f"Sample {sample_id!r} has only {trailing_high}s available trailing context, below "
+            f"context_sampling.min_trailing_s={context_sampling['min_trailing_s']}"
+        )
+    leading_low = min(context_sampling["min_leading_s"], leading_high)
+    trailing_low = min(context_sampling["min_trailing_s"], trailing_high)
+    core_duration = last_end - first_start
+    total_budget = context_sampling["max_duration_s"] - core_duration
+    stable_seed = int.from_bytes(
+        hashlib.blake2b(f"{seed}\0{sample_id}".encode("utf-8"), digest_size=8).digest(), "big"
+    )
+    leading, trailing = _uniform_context_pair(
+        random.Random(stable_seed),
+        leading_low=leading_low,
+        leading_high=leading_high,
+        trailing_low=trailing_low,
+        trailing_high=trailing_high,
+        total_budget=total_budget,
+    )
+
+    new_offset = target_start_in_member - leading
+    new_duration = core_duration + leading + trailing
+    new_end = new_offset + new_duration
+    if new_offset < -tolerance or new_end > recording_duration + tolerance:
+        raise ValueError(
+            f"Sample {sample_id!r} sampled crop [{new_offset}, {new_end}] exceeds "
+            f"physical duration {recording_duration}"
+        )
+    if new_duration > context_sampling["max_duration_s"] + tolerance:
+        raise ValueError(f"Sample {sample_id!r} sampled duration {new_duration} exceeds max_duration_s")
+
+    shift = old_offset - new_offset
+    components = target.get("components")
+    if not isinstance(components, list):
+        raise TypeError(f"Sample {sample_id!r} target.components must be a list")
+    for component_idx, component in enumerate(components):
+        if not isinstance(component, Mapping):
+            raise TypeError(f"Sample {sample_id!r} target.components[{component_idx}] must be a mapping")
+        _shift_start_fields(
+            component.get("fragments"), shift=shift, field=f"target.components[{component_idx}].fragments"
+        )
+    _shift_start_fields(regions, shift=shift, field="target.utterance_regions")
+    _shift_start_fields(target.get("pause_regions", []), shift=shift, field="target.pause_regions")
+
+    other_speaker = curation.get("other_speaker")
+    if other_speaker is not None:
+        if not isinstance(other_speaker, Mapping):
+            raise TypeError(f"Sample {sample_id!r} other_speaker must be a mapping")
+        other_fragments = other_speaker.get("fragments", [])
+        _shift_and_filter_context_intervals(
+            other_fragments,
+            shift=shift,
+            clip_duration=new_duration,
+            field="other_speaker.fragments",
+        )
+        for fragment_idx, fragment in enumerate(other_fragments):
+            _shift_and_filter_context_intervals(
+                fragment.get("overlap_with_target_active", []),
+                shift=shift,
+                clip_duration=new_duration,
+                field=f"other_speaker.fragments[{fragment_idx}].overlap_with_target_active",
+            )
+
+    data["offset"] = max(0.0, new_offset)
+    data["duration"] = new_duration
+    data["source_audio_offset"] = source_start + data["offset"]
+    audio_context["leading_sil"] = leading
+    audio_context["trailing_sil"] = trailing
+    selection = audio_context.get("selection")
+    selection = dict(selection) if isinstance(selection, Mapping) else {}
+    selection.update(
+        {
+            "policy": "dataloader_uniform_available_transcript_bounded",
+            "selected_leading_s": leading,
+            "selected_trailing_s": trailing,
+            "max_total_duration_s": context_sampling["max_duration_s"],
+        }
+    )
+    audio_context["selection"] = selection
+    return data
 
 
 class LazyNeMoIterator:
@@ -251,6 +589,12 @@ class LazyNeMoTarredIterator:
     Override with an integer value for deterministic behaviour and consult Lhotse documentation for details:
     https://lhotse.readthedocs.io/en/latest/datasets.html#handling-random-seeds
 
+    ``context_sampling`` is an opt-in policy for ``lean_multi_turn_v2`` rows whose tar member stores all
+    transcript-bounded context. It samples each side from its configured minimum through that row's full
+    advertised availability before the in-memory subset is created, shifts row-relative timestamps, and enforces
+    a maximum total cut duration. It is intentionally unsupported by the AIS batch path because that path does
+    not decode the physical member before constructing the cut.
+
     Set ``slice_length`` to enable random slicing mode: for each shard, we'll randomly select an offset K
     and skip the first K examples (but will actually read them first). Then, we'll yield only ``slice_length``
     examples. This setting can improve the sampling randomness when there are many datasets with many shards
@@ -294,6 +638,7 @@ class LazyNeMoTarredIterator:
         skip_missing_manifest_entries: bool = False,
         extra_fields: list[dict[str, str]] | None = None,
         slice_length: int = None,
+        context_sampling: Mapping | None = None,
     ) -> None:
         self.skip_missing_manifest_entries = skip_missing_manifest_entries
         self.shard_id_to_manifest: dict[int, Iterable[dict]]
@@ -339,6 +684,7 @@ class LazyNeMoTarredIterator:
         self.lang_field = lang_field
         self.extra_fields = extra_fields
         self.slice_length = slice_length
+        self.context_sampling = _validate_context_sampling_config(context_sampling)
         self.epoch = 0
         self._validate()
         self.use_ais_get_batch = os.environ.get("USE_AIS_GET_BATCH", "False").lower() == "true"
@@ -358,6 +704,7 @@ class LazyNeMoTarredIterator:
                     shard_seed=self.shard_seed,
                     text_field=self.text_field,
                     lang_field=self.lang_field,
+                    context_sampling=self.context_sampling,
                 )
                 for path, tarpath in zip(self.paths, self.shard_id_to_tar_path.values())
             ]
@@ -526,6 +873,8 @@ class LazyNeMoTarredIterator:
             tar_path = self.shard_id_to_tar_path[sid]
 
             if self.use_ais_get_batch:
+                if self.context_sampling is not None:
+                    raise RuntimeError("context_sampling is not supported with USE_AIS_GET_BATCH=true")
                 # Use batch reading mode - URL-based recordings without opening tar files
                 yield from self._iter_batch_for_ais_get_batch(
                     tar_path, shard_manifest, manifest_path, rng, extra_fields
@@ -550,6 +899,13 @@ class LazyNeMoTarredIterator:
                         # filter out entries with valid "_skipme" values.
                         if data.get("_skipme", False):
                             continue
+                        if self.context_sampling is not None:
+                            data = _sample_lean_multiturn_context(
+                                data,
+                                recording_duration=recording.duration,
+                                context_sampling=self.context_sampling,
+                                seed=seed,
+                            )
                         # Cut the recording into corresponding segment and discard audio data outside the segment.
                         cut = make_cut_with_subset_inmemory_recording(
                             recording, offset=data.get("offset", 0.0), duration=data.get("duration")

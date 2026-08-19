@@ -2,6 +2,15 @@
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 from contextlib import nullcontext
 from types import MethodType, SimpleNamespace
@@ -150,6 +159,17 @@ def test_state_machine_offline_embeddings_return_exact_tokens_and_boundaries(mon
     ]
 
 
+def test_state_machine_preserves_two_ordered_sou_eou_pairs(monkeypatch):
+    monkeypatch.setattr(streaming_stt_model, "decode_with_blank", lambda token_ids, *_args: list(token_ids))
+
+    records = _run_dynamic(_fake_dynamic_model([0, 10, 12, 11, 10, 13, 11, 9, 0]), detailed=True)
+
+    assert records[0].sampled_token_ids == [10, 12, 11, 10, 13, 11, 9]
+    assert [event.boundary_type for event in records[0].boundary_events] == ["sou", "eou", "sou", "eou"]
+    assert [event.sampled_token_sequence_index for event in records[0].boundary_events] == [0, 2, 3, 5]
+    assert [event.encoder_frames_consumed for event in records[0].boundary_events] == [2, 2, 2, 2]
+
+
 def test_empty_transition_and_single_token_assistant_footer_stop_cleanly(monkeypatch):
     monkeypatch.setattr(streaming_stt_model, "decode_with_blank", lambda token_ids, *_args: list(token_ids))
     records = _run_dynamic(
@@ -233,6 +253,33 @@ def test_fixed_streaming_records_preserve_text_exact_tokens_and_stream_timestamp
     assert records[1].boundary_events[0].emission_time_seconds == pytest.approx(0.2)
 
 
+def test_fixed_streaming_preserves_two_ordered_sou_eou_pairs(monkeypatch):
+    monkeypatch.setattr(streaming_stt_model, "decode_with_blank", lambda token_ids, *_args: list(token_ids))
+    model = _fake_chunked_model()
+    outputs = iter(
+        (
+            ([[10, 7]], [[10, 7, 9]]),
+            ([[11, 10, 8]], [[11, 10, 8, 9]]),
+            ([[11]], [[11, 9]]),
+        )
+    )
+    model._chunked_streaming_step = lambda *_args, **_kwargs: next(outputs)
+
+    records = streaming_stt_model.StreamingSTTModel._generate_chunked_streaming(
+        model,
+        audios=torch.zeros(1, 6),
+        n_samples_list=[6],
+        system_prompt="prompt",
+        max_new_tokens=4,
+        return_generation_records=True,
+    )
+
+    assert records[0].sampled_token_ids == [10, 7, 9, 11, 10, 8, 9, 11, 9]
+    assert [event.boundary_type for event in records[0].boundary_events] == ["sou", "eou", "sou", "eou"]
+    assert [event.sampled_token_sequence_index for event in records[0].boundary_events] == [0, 3, 4, 7]
+    assert [event.encoder_frames_consumed for event in records[0].boundary_events] == [2, 4, 4, 6]
+
+
 def test_generation_record_builder_rejects_sample_count_mismatch():
     model = _fake_dynamic_model([])
 
@@ -247,9 +294,7 @@ def _fake_generate_dispatch_model(chunk_size: int):
     model._generate_dynamic_streaming = lambda *_args, **kwargs: [
         f"state-machine:{kwargs['return_generation_records']}"
     ]
-    model._generate_chunked_streaming = lambda *_args, **kwargs: [
-        f"fixed:{kwargs['return_generation_records']}"
-    ]
+    model._generate_chunked_streaming = lambda *_args, **kwargs: [f"fixed:{kwargs['return_generation_records']}"]
     return model
 
 

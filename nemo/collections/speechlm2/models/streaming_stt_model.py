@@ -48,6 +48,7 @@ from nemo.collections.speechlm2.parts.metrics.backchannel import compute_agent_b
 from nemo.collections.speechlm2.parts.metrics.boundary import (
     boundary_collar_precision_recall_f1,
     compute_boundary_token_metrics,
+    compute_ordinal_boundary_timing_metrics,
 )
 from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers, is_frozen
 from nemo.collections.speechlm2.parts.pretrained import load_pretrained_hf, move_embedding, setup_perception
@@ -174,6 +175,14 @@ class StreamingSTTModelConfig:
     # dataloaders contribute mean(SOU F1, EOU F1), while transcript-only
     # dataloaders contribute token accuracy. Each dataloader has equal weight.
     enable_validation_checkpoint_score: bool = False
+    # "cohort_macro" preserves the legacy per-loader score. "turn_ordinal_macro"
+    # averages first-prediction SOU/EOU detection rates for substantive turns 1..4.
+    validation_checkpoint_score_mode: str = "cohort_macro"
+    # Multi-turn dashboards use the ordinal early/detection/late/missing and
+    # spurious suite. Keep redundant per-cohort and pooled collar/prediction-
+    # rate logs suppressed by default; they may be re-enabled for an explicit
+    # historical comparison.
+    log_legacy_boundary_collar_metrics: bool = False
     # --- Aux chunk-boundary classifier head ---
     # Master switch. Only valid in dynamic-chunking mode (chunk_size == 0).
     # When True, a small K-layer transformer head is built on top of the LLM's
@@ -288,6 +297,14 @@ def _compute_weighted_lm_loss(
     return loss, metrics
 
 
+def _distributed_sum(value: Tensor) -> Tensor:
+    """Return a detached count summed across initialized distributed workers."""
+    value = value.detach().clone()
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.SUM)
+    return value
+
+
 @dataclass
 class StreamingState:
     """Holds the KV cache and other state for B streaming audio sessions.
@@ -355,6 +372,14 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         self.save_hyperparameters()
         self.cfg = DictConfig(cfg)
         self.core_cfg: StreamingSTTModelConfig = to_dataclass(StreamingSTTModelConfig, cfg)
+        if self.core_cfg.validation_checkpoint_score_mode not in {
+            "cohort_macro",
+            "turn_ordinal_macro",
+        }:
+            raise ValueError(
+                "validation_checkpoint_score_mode must be 'cohort_macro' or 'turn_ordinal_macro'; "
+                f"got {self.core_cfg.validation_checkpoint_score_mode!r}"
+            )
         if self.core_cfg.compact_text_end_only_no_blank and not self.core_cfg.compact_template:
             raise ValueError("compact_text_end_only_no_blank=True requires compact_template=True")
         if (
@@ -384,9 +409,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 data_start_token = data_cfg.get(
                     "agent_backchannel_start_token", self.core_cfg.agent_backchannel_start_token
                 )
-                data_end_token = data_cfg.get(
-                    "agent_backchannel_end_token", self.core_cfg.agent_backchannel_end_token
-                )
+                data_end_token = data_cfg.get("agent_backchannel_end_token", self.core_cfg.agent_backchannel_end_token)
                 if (
                     data_start_token != self.core_cfg.agent_backchannel_start_token
                     or data_end_token != self.core_cfg.agent_backchannel_end_token
@@ -762,7 +785,13 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 m.eval()
 
         if self.forced_aligner is not None:
-            alignments = self.forced_aligner.align(batch.audios, batch.audio_lens, batch.text)
+            alignments = self.dataset.get_online_alignments(
+                cuts=batch.cuts,
+                audios=batch.audios,
+                audio_lens=batch.audio_lens,
+                text=batch.text,
+                forced_aligner=self.forced_aligner,
+            )
             batch = self.dataset.get_batch_data(
                 cuts=batch.cuts,
                 audios=batch.audios,
@@ -923,6 +952,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         self._partial_val_losses: dict[str, list] = defaultdict(list)
         self._partial_accuracies: dict[str, list] = defaultdict(list)
         self._partial_boundary_metrics: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
+        self._partial_ordinal_boundary_metrics: dict[str, list] = defaultdict(list)
         self._partial_agent_backchannel_metrics: dict[str, list] = defaultdict(list)
         # Per-class TP/total counts for the aux chunk classifier. Aggregated
         # across the epoch so macro acc isn't biased by per-batch composition.
@@ -976,7 +1006,8 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 f"val_sou_collar_f1_{name}": sou_f1,
                 f"val_eou_collar_f1_{name}": eou_f1,
             }
-            self.log_dict(metrics, on_epoch=True, sync_dist=True)
+            if getattr(self.core_cfg, "log_legacy_boundary_collar_metrics", False):
+                self.log_dict(metrics, on_epoch=True, sync_dist=True)
 
             if totals["sou_target_count"] > 0 and totals["eou_target_count"] > 0:
                 boundary_macro_f1_by_name[name] = (sou_f1 + eou_f1) / 2
@@ -993,33 +1024,101 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             eou_precision, eou_recall, eou_f1 = boundary_collar_precision_recall_f1(
                 totals["eou_collar_hit"], totals["eou_pred_count"], totals["eou_target_count"]
             )
-            self.log_dict(
-                {
-                    "val_sou_pred_per_sample": totals["sou_pred_count"].float() / num_samples,
-                    "val_eou_pred_per_sample": totals["eou_pred_count"].float() / num_samples,
-                    "val_sou_collar_acc": sou_recall,
-                    "val_eou_collar_acc": eou_recall,
-                    "val_sou_collar_precision": sou_precision,
-                    "val_eou_collar_precision": eou_precision,
-                    "val_sou_collar_f1": sou_f1,
-                    "val_eou_collar_f1": eou_f1,
-                },
-                on_epoch=True,
-                sync_dist=True,
-            )
+            if getattr(self.core_cfg, "log_legacy_boundary_collar_metrics", False):
+                self.log_dict(
+                    {
+                        "val_sou_pred_per_sample": totals["sou_pred_count"].float() / num_samples,
+                        "val_eou_pred_per_sample": totals["eou_pred_count"].float() / num_samples,
+                        "val_sou_collar_acc": sou_recall,
+                        "val_eou_collar_acc": eou_recall,
+                        "val_sou_collar_precision": sou_precision,
+                        "val_eou_collar_precision": eou_precision,
+                        "val_sou_collar_f1": sou_f1,
+                        "val_eou_collar_f1": eou_f1,
+                    },
+                    on_epoch=True,
+                    sync_dist=True,
+                )
+
+        # --- Real multi-turn first-boundary timing by substantive turn ordinal ---
+        ordinal_detection_by_turn: dict[int, tuple[Tensor, Tensor]] = {}
+        if self._partial_ordinal_boundary_metrics:
+            ordinal_totals = {
+                metric: _distributed_sum(torch.stack(values).sum())
+                for metric, values in self._partial_ordinal_boundary_metrics.items()
+                if values
+            }
+            for turn_ordinal in range(1, 5):
+                prefix = f"turn_{turn_ordinal}"
+                num_samples = ordinal_totals.get(f"{prefix}_num_samples")
+                if num_samples is None or num_samples.item() == 0:
+                    continue
+
+                logged_metrics = {f"val_multiturn_turn_{turn_ordinal}_num_samples": num_samples.float()}
+                turn_detection = {}
+                for token_name in ("sou", "eou"):
+                    for outcome in ("early", "detection", "late", "missing"):
+                        count = ordinal_totals[f"{prefix}_{token_name}_{outcome}_count"]
+                        rate = count.float() / num_samples.float()
+                        logged_metrics[f"val_multiturn_turn_{turn_ordinal}_{token_name}_{outcome}_rate"] = rate
+                        if outcome == "detection":
+                            turn_detection[token_name] = rate
+                    logged_metrics[f"val_multiturn_turn_{turn_ordinal}_{token_name}_spurious_per_sample"] = (
+                        ordinal_totals[f"{prefix}_{token_name}_spurious_count"].float() / num_samples.float()
+                    )
+                self.log_dict(logged_metrics, on_epoch=True, sync_dist=True)
+                ordinal_detection_by_turn[turn_ordinal] = (
+                    turn_detection["sou"],
+                    turn_detection["eou"],
+                )
+
+            for token_name in ("sou", "eou"):
+                zero = next(iter(ordinal_totals.values())).new_zeros(())
+                reference_count = torch.stack(
+                    [ordinal_totals.get(f"turn_{turn_ordinal}_num_samples", zero) for turn_ordinal in range(1, 5)]
+                ).sum()
+                spurious_count = (
+                    ordinal_totals.get(f"{token_name}_spurious_outside_count", zero)
+                    + torch.stack(
+                        [
+                            ordinal_totals.get(f"turn_{turn_ordinal}_{token_name}_spurious_count", zero)
+                            for turn_ordinal in range(1, 5)
+                        ]
+                    ).sum()
+                )
+                self.log(
+                    f"val_multiturn_{token_name}_spurious_per_reference",
+                    spurious_count.float() / reference_count.clamp(min=1).float(),
+                    on_epoch=True,
+                    sync_dist=True,
+                )
 
         if getattr(getattr(self, "core_cfg", None), "enable_validation_checkpoint_score", False):
-            checkpoint_components = []
-            for name, val_acc in val_accuracy_by_name.items():
-                checkpoint_components.append(boundary_macro_f1_by_name.get(name, val_acc))
-            if not checkpoint_components or not boundary_macro_f1_by_name:
-                raise RuntimeError(
-                    "enable_validation_checkpoint_score=True requires non-empty validation loaders "
-                    "including at least one boundary-aware cohort"
-                )
+            score_mode = getattr(self.core_cfg, "validation_checkpoint_score_mode", "cohort_macro")
+            if score_mode == "turn_ordinal_macro":
+                missing_turns = [turn for turn in range(1, 5) if turn not in ordinal_detection_by_turn]
+                if missing_turns:
+                    raise RuntimeError(
+                        "validation_checkpoint_score_mode='turn_ordinal_macro' requires real "
+                        "lean multi-turn validation coverage for substantive turns 1..4; "
+                        f"missing turns: {missing_turns}"
+                    )
+                checkpoint_score = torch.stack(
+                    [torch.stack(ordinal_detection_by_turn[turn_ordinal]).mean() for turn_ordinal in range(1, 5)]
+                ).mean()
+            else:
+                checkpoint_components = []
+                for name, val_acc in val_accuracy_by_name.items():
+                    checkpoint_components.append(boundary_macro_f1_by_name.get(name, val_acc))
+                if not checkpoint_components or not boundary_macro_f1_by_name:
+                    raise RuntimeError(
+                        "enable_validation_checkpoint_score=True requires non-empty validation loaders "
+                        "including at least one boundary-aware cohort"
+                    )
+                checkpoint_score = torch.stack(checkpoint_components).mean()
             self.log(
                 "val_checkpoint_score",
-                torch.stack(checkpoint_components).mean(),
+                checkpoint_score,
                 on_epoch=True,
                 sync_dist=True,
             )
@@ -1041,10 +1140,8 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             self.log_dict(
                 {
                     "val_paired_backchannel_tokens_per_utterance": paired.float() / num_samples,
-                    "val_unpaired_soab_tokens_per_utterance": totals["unpaired_soab_count"].float()
-                    / num_samples,
-                    "val_unpaired_eoab_tokens_per_utterance": totals["unpaired_eoab_count"].float()
-                    / num_samples,
+                    "val_unpaired_soab_tokens_per_utterance": totals["unpaired_soab_count"].float() / num_samples,
+                    "val_unpaired_eoab_tokens_per_utterance": totals["unpaired_eoab_count"].float() / num_samples,
                     "val_hardcoded_backchannel_rate": totals["hardcoded_backchannel_count"].float()
                     / paired.clamp(min=1).float(),
                 },
@@ -1074,6 +1171,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         self._partial_val_losses.clear()
         self._partial_accuracies.clear()
         self._partial_boundary_metrics.clear()
+        self._partial_ordinal_boundary_metrics.clear()
         self._partial_agent_backchannel_metrics.clear()
         self._partial_aux_pos_correct.clear()
         self._partial_aux_pos_total.clear()
@@ -1221,6 +1319,31 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             audio_token_idx=AUDIO_TOKEN_IDX,
         )
 
+    def _compute_ordinal_boundary_metrics(
+        self,
+        pred_ids: Tensor,
+        target_ids: Tensor,
+        batch: StreamingSTTBatch,
+    ) -> dict[str, Tensor]:
+        if batch.boundary_turn_ordinals is None or batch.is_multiturn is None or batch.num_substantive_turns is None:
+            return {}
+        sou_id, eou_id = self._get_boundary_token_ids()
+        if sou_id is None or eou_id is None:
+            return {}
+        return compute_ordinal_boundary_timing_metrics(
+            pred_ids=pred_ids,
+            target_ids=target_ids,
+            input_tokens=batch.input_tokens,
+            boundary_turn_ordinals=batch.boundary_turn_ordinals,
+            is_multiturn=batch.is_multiturn,
+            num_substantive_turns=batch.num_substantive_turns,
+            sou_id=sou_id,
+            eou_id=eou_id,
+            ignore_index=IGNORE_INDEX,
+            audio_token_idx=AUDIO_TOKEN_IDX,
+            max_turns=4,
+        )
+
     def validation_step(self, batch, batch_idx: int):
         # Support multiple validation dataloaders ({name: batch} dict).
         if isinstance(batch, dict):
@@ -1232,7 +1355,13 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
     def _eval_step(self, batch: StreamingSTTBatch, name: str, batch_idx: int = 0) -> None:
         if self.forced_aligner is not None:
-            alignments = self.forced_aligner.align(batch.audios, batch.audio_lens, batch.text)
+            alignments = self.dataset.get_online_alignments(
+                cuts=batch.cuts,
+                audios=batch.audios,
+                audio_lens=batch.audio_lens,
+                text=batch.text,
+                forced_aligner=self.forced_aligner,
+            )
             batch = self.dataset.get_batch_data(
                 cuts=batch.cuts,
                 audios=batch.audios,
@@ -1273,6 +1402,9 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         boundary_metrics = self._compute_boundary_metrics(pred_ids, target_ids, batch.input_tokens)
         for metric, value in boundary_metrics.items():
             self._partial_boundary_metrics[name][metric].append(value.detach())
+        ordinal_boundary_metrics = self._compute_ordinal_boundary_metrics(pred_ids, target_ids, batch)
+        for metric, value in ordinal_boundary_metrics.items():
+            self._partial_ordinal_boundary_metrics[metric].append(value.detach())
 
         agent_backchannel_metrics = self._compute_agent_backchannel_metrics(pred_ids, target_ids)
         for metric, value in agent_backchannel_metrics.items():
@@ -2239,9 +2371,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
         if use_offline_embs:
             if not fixed_chunk_mode:
-                raise ValueError(
-                    "use_offline_embs with state-machine inference requires a positive fixed chunk_size"
-                )
+                raise ValueError("use_offline_embs with state-machine inference requires a positive fixed chunk_size")
             for b in range(B):
                 if n_samples_list[b] <= 0:
                     continue

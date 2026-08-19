@@ -29,6 +29,7 @@ The primary reference is the docstring example in get_llm_messages_for_sample:
 """
 
 import math
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -39,6 +40,7 @@ from nemo.collections.speechlm2.data.streaming_stt_dataset import (
     IGNORE_INDEX,
     StreamingSTTDataConfig,
     StreamingSTTDataset,
+    _debug_boundary_window_positions,
     _normalize_legacy_text_token_config,
     _replace_audio_chunks,
     _tokenize_compact_with_assistant_mask,
@@ -46,11 +48,13 @@ from nemo.collections.speechlm2.data.streaming_stt_dataset import (
     add_gt_utterance_boundary_alignments,
     build_agent_backchannel_alignments,
     build_compact_turn_markers,
+    build_lean_multiturn_alignments,
     compute_word_spans,
     decode_with_blank,
     get_llm_messages_for_batch,
     get_llm_messages_for_sample,
     merge_agent_backchannel_alignments,
+    parse_lean_multiturn_metadata,
 )
 from nemo.collections.speechlm2.parts.alignments import WordAlignment, add_utterance_boundary_alignments
 
@@ -69,12 +73,72 @@ DOCSTRING_ALIGNMENTS = [
 ]
 
 
+def test_debug_boundary_window_positions_preserve_original_indices():
+    input_ids = list(range(20))
+    assert _debug_boundary_window_positions(input_ids, (5, 14), radius=2) == [
+        3,
+        4,
+        5,
+        6,
+        7,
+        12,
+        13,
+        14,
+        15,
+        16,
+    ]
+
+
+def test_debug_boundary_window_positions_merge_overlaps_and_clip_edges():
+    input_ids = [10, 1, 2, 3, 4, 20, 6, 7, 20, 9, 10]
+    assert _debug_boundary_window_positions(input_ids, (10, 20), radius=2) == list(range(11))
+
+
 def _confirmed_fragment(text="Okay.", start=0.4, duration=0.2, status="confirmed"):
     return {
         "backchannel": {"status": status},
         "duration": duration,
         "start": start,
         "text": text,
+    }
+
+
+def _lean_multiturn_custom():
+    source_specs = [
+        ("turn-1", "source-complete", "complete_turn"),
+        ("turn-2", "source-pause", "pause_within_turn"),
+    ]
+    components = [
+        {
+            "type": "substantive_turn",
+            "fragments": [{"start": 0.2, "duration": 0.5, "text": "Hello."}],
+        },
+        {
+            "type": "backchannel",
+            "backchannel": {"status": "confirmed"},
+            "fragments": [{"start": 0.9, "duration": 0.1, "text": "Mm-hmm."}],
+        },
+        {
+            "type": "substantive_turn",
+            "fragments": [{"start": 1.5, "duration": 0.7, "text": "World."}],
+        },
+    ]
+    regions = [
+        {"start": 0.2, "duration": 0.5, "turn_id": "turn-1"},
+        {"start": 1.5, "duration": 0.7, "turn_id": "turn-2"},
+    ]
+    for component, source_spec in zip((components[0], components[2]), source_specs):
+        component["turn_id"], component["source_sample_id"], component["source_sample_type"] = source_spec
+    for region, source_spec in zip(regions, source_specs):
+        region["turn_id"], region["source_sample_id"], region["source_sample_type"] = source_spec
+    return {
+        "curation": {
+            "schema_version": "lean_multi_turn_v2",
+            "target": {
+                "components": components,
+                "utterance_regions": regions,
+            },
+        }
     }
 
 
@@ -1580,12 +1644,297 @@ class TestStreamingSTTDatasetBoundaryIntegration:
             )
 
 
+class TestLeanMultiTurnDataset:
+
+    def test_parser_uses_real_regions_without_concatenating_rows(self):
+        ignored = parse_lean_multiturn_metadata(
+            _lean_multiturn_custom(),
+            audio_duration_secs=3.0,
+            cut_id="multi",
+        )
+        assert ignored.schema_version == "lean_multi_turn_v2"
+        assert ignored.num_substantive_turns == 2
+        assert ignored.transcript == "Hello. World."
+        assert [(segment.start_time, segment.end_time, segment.turn_ordinal) for segment in ignored.segments] == [
+            (0.2, 0.7, 1),
+            (1.5, 2.2, 2),
+        ]
+        assert [segment.source_sample_type for segment in ignored.segments] == [
+            "complete_turn",
+            "pause_within_turn",
+        ]
+
+    def test_rejects_legacy_complete_turn_component_vocabulary(self):
+        custom = _lean_multiturn_custom()
+        custom["curation"]["target"]["components"][0]["type"] = "complete_turn"
+        with pytest.raises(ValueError, match="substantive_turn"):
+            parse_lean_multiturn_metadata(custom, audio_duration_secs=3.0, cut_id="mixed")
+
+    def test_v2_rejects_component_region_identity_mismatch(self):
+        custom = _lean_multiturn_custom()
+        custom["curation"]["target"]["components"][0]["source_sample_id"] = "wrong-source"
+        with pytest.raises(ValueError, match="source_sample_id"):
+            parse_lean_multiturn_metadata(custom, audio_duration_secs=3.0, cut_id="mismatch")
+
+    @pytest.mark.parametrize("schema_version", [None, "unsupported_schema"])
+    def test_rejects_multiturn_regions_without_supported_schema(self, schema_version):
+        custom = _lean_multiturn_custom()
+        custom["curation"]["schema_version"] = schema_version
+        with pytest.raises(ValueError, match="unsupported curation.schema_version"):
+            parse_lean_multiturn_metadata(custom, audio_duration_secs=3.0, cut_id="untagged")
+
+    def test_parser_accepts_more_than_four_substantive_turns(self):
+        components = []
+        regions = []
+        for turn_ordinal in range(1, 6):
+            start = turn_ordinal - 0.8
+            identity = {
+                "turn_id": f"turn-{turn_ordinal}",
+                "source_sample_id": f"source-{turn_ordinal}",
+                "source_sample_type": "complete_turn",
+            }
+            components.append(
+                {
+                    "type": "substantive_turn",
+                    **identity,
+                    "fragments": [
+                        {
+                            "start": start,
+                            "duration": 0.2,
+                            "text": f"Turn {turn_ordinal}.",
+                        }
+                    ],
+                }
+            )
+            regions.append({"start": start, "duration": 0.4, **identity})
+        sample = parse_lean_multiturn_metadata(
+            {
+                "curation": {
+                    "schema_version": "lean_multi_turn_v2",
+                    "target": {
+                        "components": components,
+                        "utterance_regions": regions,
+                    },
+                }
+            },
+            audio_duration_secs=5.0,
+            cut_id="five-turn",
+        )
+        assert sample.num_substantive_turns == 5
+        assert [segment.turn_ordinal for segment in sample.segments] == [1, 2, 3, 4, 5]
+
+    def test_six_turn_row_reaches_collated_training_targets_without_a_turn_cap(self):
+        class _BoundaryAwareTokenizer(_MockHFTokenizer):
+            def _content_to_ids(self, content: str, role: str) -> list[int]:
+                if role != "assistant" or not any(token in content for token in ("<sou>", "<eou>")):
+                    return super()._content_to_ids(content, role)
+                ids = []
+                for piece in filter(None, re.split(r"(<sou>|<eou>)", content)):
+                    ids.extend(self.encode(piece, add_special_tokens=False))
+                return ids
+
+        class _SixTurnAligner:
+            def align(self, audio, audio_lens, texts):
+                self.audio_lens = audio_lens.tolist()
+                self.texts = list(texts)
+                return [[WordAlignment(text, 0.05, 0.15)] for text in texts]
+
+        components = []
+        regions = []
+        for turn_ordinal in range(1, 7):
+            start = turn_ordinal - 0.8
+            identity = {
+                "turn_id": f"turn-{turn_ordinal}",
+                "source_sample_id": f"source-{turn_ordinal}",
+                "source_sample_type": "complete_turn",
+            }
+            components.append(
+                {
+                    "type": "substantive_turn",
+                    **identity,
+                    "fragments": [{"start": start, "duration": 0.2, "text": f"Turn {turn_ordinal}."}],
+                }
+            )
+            regions.append({"start": start, "duration": 0.4, **identity})
+
+        custom = {
+            "curation": {
+                "schema_version": "lean_multi_turn_v2",
+                "target": {"components": components, "utterance_regions": regions},
+            }
+        }
+        dataset = StreamingSTTDataset(
+            cfg={
+                "sample_rate": 10,
+                "frame_length_in_secs": 0.1,
+                "chunk_size": 2,
+                "num_delay_frames": 0,
+                "audio_tag": AUDIO_TAG,
+                "blank_token": BLANK_TOKEN,
+                "system_role": SYSTEM_ROLE,
+                "system_prompt": SYSTEM_PROMPT,
+                "add_utterance_boundary_tokens": True,
+                "utterance_start_token": "<sou>",
+                "utterance_end_token": "<eou>",
+                "utterance_start_boundary_delay_frames": 0,
+                "utterance_end_boundary_delay_frames": 0,
+                "multiturn_forced_alignment_buffer_s": 0.0,
+            },
+            tokenizer=_MockNemoTokenizer(_BoundaryAwareTokenizer()),
+        )
+        cuts = [SimpleNamespace(id="six-turn", custom=custom)]
+        aligner = _SixTurnAligner()
+        alignments = dataset.get_online_alignments(
+            cuts=cuts,
+            audios=torch.zeros(1, 60),
+            audio_lens=torch.tensor([60]),
+            text=["top-level transcript is replaced"],
+            forced_aligner=aligner,
+        )
+
+        batch = dataset.get_batch_data(
+            cuts=cuts,
+            audios=torch.zeros(1, 60),
+            audio_lens=torch.tensor([60]),
+            alignments=alignments,
+            text=["top-level transcript is replaced"],
+        )
+
+        assert aligner.texts == [f"Turn {turn}." for turn in range(1, 7)]
+        assert aligner.audio_lens == [4] * 6
+        assert batch.is_multiturn.tolist() == [True]
+        assert batch.num_substantive_turns.tolist() == [6]
+        assert batch.text == [" ".join(f"Turn {turn}." for turn in range(1, 7))]
+        assert [ordinal for ordinal in batch.boundary_turn_ordinals[0].tolist() if ordinal] == [
+            1,
+            1,
+            2,
+            2,
+            3,
+            3,
+            4,
+            4,
+            5,
+            5,
+            6,
+            6,
+        ]
+        assert torch.count_nonzero(batch.target_tokens != IGNORE_INDEX) > 0
+
+    def test_legacy_row_without_multiturn_regions_returns_none(self):
+        assert (
+            parse_lean_multiturn_metadata(
+                {"curation": {"schema_version": "legacy_atomic_v4", "target": {}}},
+                audio_duration_secs=1.0,
+                cut_id="legacy",
+            )
+            is None
+        )
+
+    def test_build_alignments_adds_one_boundary_pair_per_substantive_turn(self):
+        sample = parse_lean_multiturn_metadata(
+            _lean_multiturn_custom(),
+            audio_duration_secs=3.0,
+            cut_id="multi",
+        )
+        resolved = build_lean_multiturn_alignments(
+            sample,
+            [
+                WordAlignment("Hello", 0.3, 0.6),
+                WordAlignment("World", 1.6, 2.0),
+            ],
+            audio_duration_secs=3.0,
+            start_token="<sou>",
+            end_token="<eou>",
+            start_delay_frames=2,
+            end_delay_frames=3,
+            cut_id="multi",
+        )
+
+        assert [alignment.text for alignment in resolved] == [
+            "<sou>",
+            "Hello",
+            "<eou>",
+            "<sou>",
+            "World",
+            "<eou>",
+        ]
+        assert [(alignment.start_time, alignment.end_time) for alignment in resolved[::3]] == [
+            (0.2, 0.2),
+            (1.5, 1.5),
+        ]
+        assert resolved[2].start_time == pytest.approx(0.7)
+        assert resolved[5].start_time == pytest.approx(2.2)
+
+    def test_online_aligner_batches_legacy_audio_and_each_real_target_region(self):
+        class _RecordingAligner:
+            def align(self, audio, audio_lens, texts):
+                self.audio_shape = tuple(audio.shape)
+                self.audio_lens = audio_lens.tolist()
+                self.texts = list(texts)
+                return [
+                    [WordAlignment(text=text, start_time=0.01, end_time=length / 10 - 0.01)]
+                    for text, length in zip(texts, self.audio_lens)
+                ]
+
+        dataset = object.__new__(StreamingSTTDataset)
+        dataset.cfg = SimpleNamespace(
+            sample_rate=10,
+            target_backchannel_mode="ignore",
+            multiturn_forced_alignment_buffer_s=0.5,
+        )
+        aligner = _RecordingAligner()
+        cuts = [
+            SimpleNamespace(id="legacy", custom={}),
+            SimpleNamespace(id="multi", custom=_lean_multiturn_custom()),
+        ]
+
+        alignments = dataset.get_online_alignments(
+            cuts=cuts,
+            audios=torch.zeros(2, 30),
+            audio_lens=torch.tensor([30, 30]),
+            text=["Legacy.", "top-level text is replaced"],
+            forced_aligner=aligner,
+        )
+
+        assert aligner.texts == ["Legacy.", "Hello.", "World."]
+        assert aligner.audio_lens == [30, 12, 17]
+        assert [alignment.text for alignment in alignments[0]] == ["Legacy."]
+        assert [alignment.text for alignment in alignments[1]] == ["Hello.", "World."]
+        assert alignments[1][0].start_time == pytest.approx(0.01)
+        assert alignments[1][1].start_time == pytest.approx(1.01)
+
+    @pytest.mark.parametrize("mode", ["drop", "", None])
+    def test_rejects_unknown_target_backchannel_mode(self, mode):
+        with pytest.raises(ValueError, match="target_backchannel_mode"):
+            StreamingSTTDataConfig(
+                sample_rate=16000,
+                frame_length_in_secs=FRAME_LEN,
+                chunk_size=CHUNK_SIZE,
+                target_backchannel_mode=mode,
+            )
+
+
 class TestBoundaryDelayConfig:
 
     def test_defaults_to_two_frame_boundary_delays(self):
         cfg = StreamingSTTDataConfig(sample_rate=16000, frame_length_in_secs=FRAME_LEN, chunk_size=CHUNK_SIZE)
         assert cfg.utterance_start_boundary_delay_frames == 2
         assert cfg.utterance_end_boundary_delay_frames == 2
+        assert cfg.multiturn_forced_alignment_buffer_s == 0.5
+
+    @pytest.mark.parametrize(
+        "buffer_s",
+        [-0.1, float("inf"), float("nan"), True, "0.5"],
+    )
+    def test_rejects_invalid_multiturn_forced_alignment_buffer(self, buffer_s):
+        with pytest.raises(ValueError, match="multiturn_forced_alignment_buffer_s"):
+            StreamingSTTDataConfig(
+                sample_rate=16000,
+                frame_length_in_secs=FRAME_LEN,
+                chunk_size=CHUNK_SIZE,
+                multiturn_forced_alignment_buffer_s=buffer_s,
+            )
 
     @pytest.mark.parametrize("margin_secs", [0.16, 0.32])
     def test_rejects_deprecated_boundary_margin(self, margin_secs):

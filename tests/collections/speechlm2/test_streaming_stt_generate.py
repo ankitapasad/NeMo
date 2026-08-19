@@ -1,5 +1,16 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import inspect
 from types import SimpleNamespace
@@ -58,6 +69,31 @@ def test_output_records_follow_actual_yield_order_and_use_clean_schema():
         "first_sou_time",
         "first_eou_time",
     }.intersection(records[0])
+
+
+def test_output_record_serializes_two_complete_boundary_pairs_in_order():
+    boundary_events = [
+        BoundaryEvent("sou", 10, "<sou>", 0, 2, 0.2),
+        BoundaryEvent("eou", 11, "<eou>", 2, 4, 0.4),
+        BoundaryEvent("sou", 10, "<sou>", 3, 6, 0.6),
+        BoundaryEvent("eou", 11, "<eou>", 5, 8, 0.8),
+    ]
+    details = StreamingGenerationRecord(
+        pred_text_unnormalized="<sou> first <eou> <sou> second <eou>",
+        sampled_token_ids=[10, 100, 11, 10, 101, 11],
+        sampled_token_pieces=["<sou>", "first", "<eou>", "<sou>", "second", "<eou>"],
+        boundary_events=boundary_events,
+    )
+
+    record = streaming_stt_generate._output_record(
+        _cut("two-turn", "clip-two-turn", 1.0),
+        "first second",
+        "first second",
+        details,
+    )
+
+    assert [event["boundary_type"] for event in record["boundary_events"]] == ["sou", "eou", "sou", "eou"]
+    assert [event["sampled_token_sequence_index"] for event in record["boundary_events"]] == [0, 2, 3, 5]
 
 
 def test_text_only_output_preserves_established_fields_without_details():

@@ -2627,6 +2627,241 @@ def test_dataloader_from_tarred_nemo_manifest_with_offset(nemo_tarred_manifest_p
     )
 
 
+@pytest.fixture(scope="session")
+def nemo_tarred_multiturn_context_path(tmp_path_factory) -> Tuple[str, str, np.ndarray]:
+    """A v2 logical segment backed by a 10-second physical tar member."""
+    from lhotse.serialization import SequentialJsonlWriter
+    from lhotse.shar.writers import TarWriter
+
+    root = tmp_path_factory.mktemp("nemo_tar_multiturn_context")
+    root.mkdir(exist_ok=True)
+    recording = dummy_recording(101, duration=10.0, with_data=True)
+    full_audio = recording.load_audio()
+    physical_name = f"{recording.id}.wav"
+    logical_name = f"{recording.id}-sub1.wav"
+    identity = {
+        "turn_id": "turn-1",
+        "source_sample_id": "source-1",
+        "source_sample_type": "complete_turn",
+    }
+    row = {
+        "audio_filepath": logical_name,
+        "offset": 2.0,
+        "duration": 5.0,
+        "source_audio_offset": 102.0,
+        "sample_id": "context-sample",
+        "text": "hello",
+        "lang": "en",
+        "shard_id": 0,
+        "curation": {
+            "schema_version": "lean_multi_turn_v2",
+            "audio_context": {
+                "leading_sil": 1.0,
+                "trailing_sil": 1.0,
+                "max_available_leading_sil": 3.0,
+                "max_available_trailing_sil": 4.0,
+                "selection": {
+                    "policy": "fixed_1s_transcript_bounded",
+                    "selected_leading_s": 1.0,
+                    "selected_trailing_s": 1.0,
+                },
+            },
+            "physical_audio": {
+                "duration": 10.0,
+                "source_start": 100.0,
+                "stores_all_available_transcript_bounded_context": True,
+            },
+            "target": {
+                "components": [
+                    {
+                        "type": "substantive_turn",
+                        **identity,
+                        "fragments": [{"start": 1.0, "duration": 3.0, "text": "hello"}],
+                    }
+                ],
+                "utterance_regions": [{"start": 1.0, "duration": 3.0, **identity}],
+                "pause_regions": [{"start": 2.0, "duration": 0.2}],
+            },
+            "other_speaker": {
+                "fragments": [
+                    {
+                        "start": -2.5,
+                        "duration": 0.2,
+                        "text": "outside leading crop",
+                        "overlap_with_target_active": [],
+                    },
+                    {
+                        "start": -1.5,
+                        "duration": 0.2,
+                        "text": "retained leading context",
+                        "overlap_with_target_active": [{"start": -1.45, "duration": 0.05}],
+                    },
+                    {
+                        "start": 2.2,
+                        "duration": 0.4,
+                        "text": "other",
+                        "overlap_with_target_active": [{"start": 2.5, "duration": 0.1}],
+                    },
+                    {
+                        "start": 8.5,
+                        "duration": 0.2,
+                        "text": "outside trailing crop",
+                        "overlap_with_target_active": [],
+                    },
+                ]
+            },
+        },
+    }
+
+    with (
+        TarWriter(f"{root}/audio_0.tar", shard_size=None) as tar_writer,
+        SequentialJsonlWriter(root / "manifest_0.jsonl") as mft_writer,
+    ):
+        tar_writer.write(physical_name, BytesIO(recording.sources[0].source))
+        mft_writer.write(row)
+    return str(mft_writer.path), tar_writer.output_paths[0], full_audio
+
+
+def _multiturn_context_loader(json_mft, tar_mft, context_sampling=None, shard_seed=17):
+    source = {
+        "type": "nemo_tarred",
+        "manifest_filepath": json_mft,
+        "tarred_audio_filepaths": tar_mft,
+        "force_finite": True,
+    }
+    if context_sampling is not None:
+        source["context_sampling"] = context_sampling
+    config = OmegaConf.create(
+        {
+            "input_cfg": [source],
+            "sample_rate": 16000,
+            "shuffle": False,
+            "num_workers": 0,
+            "batch_size": 1,
+            "seed": 0,
+            "shard_seed": shard_seed,
+            "force_finite": True,
+        }
+    )
+    return get_lhotse_dataloader_from_config(config=config, global_rank=0, world_size=1, dataset=Identity())
+
+
+def test_tarred_multiturn_context_sampling_precedes_crop_and_shifts_timestamps(
+    nemo_tarred_multiturn_context_path,
+):
+    json_mft, tar_mft, full_audio = nemo_tarred_multiturn_context_path
+    fixed_at_full_availability = {
+        "min_leading_s": 3.0,
+        "min_trailing_s": 4.0,
+        "max_duration_s": 10.0,
+    }
+    dataloader = _multiturn_context_loader(json_mft, tar_mft, fixed_at_full_availability)
+    (cut,) = next(iter(dataloader))
+
+    assert cut.start == 0.0
+    assert cut.duration == pytest.approx(10.0)
+    assert cut.custom["offset"] == pytest.approx(0.0)
+    assert cut.custom["source_audio_offset"] == pytest.approx(100.0)
+    context = cut.custom["curation"]["audio_context"]
+    assert context["leading_sil"] == pytest.approx(3.0)
+    assert context["trailing_sil"] == pytest.approx(4.0)
+    assert context["selection"]["policy"] == "dataloader_uniform_available_transcript_bounded"
+    target = cut.custom["curation"]["target"]
+    assert target["utterance_regions"][0]["start"] == pytest.approx(3.0)
+    assert target["components"][0]["fragments"][0]["start"] == pytest.approx(3.0)
+    assert target["pause_regions"][0]["start"] == pytest.approx(4.0)
+    other = cut.custom["curation"]["other_speaker"]["fragments"]
+    assert [fragment["text"] for fragment in other] == ["retained leading context", "other"]
+    assert other[0]["start"] == pytest.approx(0.5)
+    assert other[0]["duration"] == pytest.approx(0.2)
+    assert other[0]["overlap_with_target_active"][0]["start"] == pytest.approx(0.55)
+    assert other[1]["start"] == pytest.approx(4.2)
+    assert other[1]["overlap_with_target_active"][0]["start"] == pytest.approx(4.5)
+
+    expected = full_audio
+    np.testing.assert_equal(cut.load_audio(), expected)
+
+
+def test_tarred_multiturn_context_sampling_is_deterministic_and_respects_duration_cap(
+    nemo_tarred_multiturn_context_path,
+):
+    json_mft, tar_mft, _ = nemo_tarred_multiturn_context_path
+    sampling = {
+        "min_leading_s": 1.0,
+        "min_trailing_s": 1.0,
+        "max_duration_s": 5.1,
+    }
+
+    def selected(seed):
+        dataloader = _multiturn_context_loader(json_mft, tar_mft, sampling, shard_seed=seed)
+        (cut,) = next(iter(dataloader))
+        context = cut.custom["curation"]["audio_context"]
+        return cut.duration, context["leading_sil"], context["trailing_sil"]
+
+    first = selected(17)
+    repeated = selected(17)
+    different_seed = selected(18)
+    assert first == repeated
+    assert first != different_seed
+    duration, leading, trailing = first
+    assert duration <= 5.1 + 1e-6
+    assert 1.0 <= leading <= 3.0
+    assert 1.0 <= trailing <= 4.0
+    assert leading + trailing <= 2.1 + 1e-6
+
+
+def test_tarred_multiturn_context_sampling_changes_by_epoch(nemo_tarred_multiturn_context_path):
+    json_mft, tar_mft, _ = nemo_tarred_multiturn_context_path
+    sampling = {
+        "min_leading_s": 1.0,
+        "min_trailing_s": 1.0,
+        "max_duration_s": 10.0,
+    }
+    iterator = LazyNeMoTarredIterator(
+        manifest_path=json_mft,
+        tar_paths=tar_mft,
+        shard_seed=17,
+        context_sampling=sampling,
+    )
+
+    first = list(iterator)[0].custom["curation"]["audio_context"]
+    second = list(iterator)[0].custom["curation"]["audio_context"]
+    assert (first["leading_sil"], first["trailing_sil"]) != (
+        second["leading_sil"],
+        second["trailing_sil"],
+    )
+
+
+def test_tarred_multiturn_context_sampling_rejects_ais_batch_path(
+    nemo_tarred_multiturn_context_path,
+    monkeypatch,
+):
+    json_mft, tar_mft, _ = nemo_tarred_multiturn_context_path
+    monkeypatch.setenv("USE_AIS_GET_BATCH", "true")
+    iterator = LazyNeMoTarredIterator(
+        manifest_path=json_mft,
+        tar_paths=tar_mft,
+        shard_seed=17,
+        context_sampling={
+            "min_leading_s": 1.0,
+            "min_trailing_s": 1.0,
+            "max_duration_s": 10.0,
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="not supported with USE_AIS_GET_BATCH=true"):
+        next(iter(iterator))
+
+
+def test_tarred_multiturn_context_sampling_is_opt_in(nemo_tarred_multiturn_context_path):
+    json_mft, tar_mft, _ = nemo_tarred_multiturn_context_path
+    dataloader = _multiturn_context_loader(json_mft, tar_mft)
+    (cut,) = next(iter(dataloader))
+    assert cut.duration == pytest.approx(5.0)
+    assert cut.custom["offset"] == pytest.approx(2.0)
+    assert cut.custom["curation"]["target"]["utterance_regions"][0]["start"] == pytest.approx(1.0)
+
+
 def test_force_iterable_dataset(cutset_path: Path):
     config = OmegaConf.create({"cuts_path": cutset_path, "batch_size": 2, "num_workers": 2})
     dl = get_lhotse_dataloader_from_config(config=config, global_rank=0, world_size=1, dataset=Identity())

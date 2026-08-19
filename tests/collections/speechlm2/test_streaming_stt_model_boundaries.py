@@ -98,6 +98,16 @@ def _minimal_cfg():
     }
 
 
+def test_multiturn_dashboard_suppresses_legacy_boundary_collar_metrics_by_default():
+    cfg = streaming_stt_model.StreamingSTTModelConfig(**_minimal_cfg())
+    assert cfg.log_legacy_boundary_collar_metrics is False
+
+    explicit_historical_cfg = _minimal_cfg()
+    explicit_historical_cfg["log_legacy_boundary_collar_metrics"] = True
+    cfg = streaming_stt_model.StreamingSTTModelConfig(**explicit_historical_cfg)
+    assert cfg.log_legacy_boundary_collar_metrics is True
+
+
 def test_model_rejects_per_sample_boundaries_without_boundary_token_support():
     cfg = _minimal_cfg()
     cfg["add_utterance_boundary_tokens"] = False
@@ -301,6 +311,30 @@ def test_weighted_lm_loss_applies_separate_boundary_weights():
     assert torch.allclose(metrics["eou_ratio"], torch.tensor(0.25))
 
 
+def test_weighted_lm_loss_weights_every_repeated_boundary_occurrence():
+    per_token_loss = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 99.0])
+    targets = torch.tensor([10, 11, 10, 11, 13, streaming_stt_model.IGNORE_INDEX])
+
+    loss, metrics = streaming_stt_model._compute_weighted_lm_loss(
+        per_token_loss=per_token_loss,
+        flat_targets=targets,
+        blank_id=12,
+        has_blank=True,
+        blank_loss_weight=1.0,
+        sou_id=10,
+        eou_id=11,
+        utterance_start_loss_weight=2.0,
+        utterance_end_loss_weight=5.0,
+    )
+
+    expected = torch.tensor((1.0 * 2.0 + 2.0 * 5.0 + 3.0 * 2.0 + 4.0 * 5.0 + 5.0) / (2.0 + 5.0 + 2.0 + 5.0 + 1.0))
+    assert torch.allclose(loss, expected)
+    assert torch.allclose(metrics["loss_sou"], torch.tensor(2.0))
+    assert torch.allclose(metrics["loss_eou"], torch.tensor(3.0))
+    assert torch.allclose(metrics["sou_ratio"], torch.tensor(0.4))
+    assert torch.allclose(metrics["eou_ratio"], torch.tensor(0.4))
+
+
 def test_weighted_lm_loss_defaults_to_unweighted_boundary_tokens_without_backchannel_metrics():
     per_token_loss = torch.tensor([1.0, 2.0, 3.0])
     targets = torch.tensor([10, 11, 13])
@@ -371,6 +405,7 @@ def _append_boundary_totals(container, name, **values):
 
 def test_validation_epoch_end_logs_boundary_metrics_by_loader_and_overall():
     model = _ValidationLogger()
+    model.core_cfg = SimpleNamespace(log_legacy_boundary_collar_metrics=True)
     streaming_stt_model.StreamingSTTModel.on_validation_epoch_start(model)
     _append_boundary_totals(
         model,
@@ -482,3 +517,82 @@ def test_validation_epoch_end_checkpoint_score_equal_weights_three_cohorts():
     pause_macro_f1 = ((2 * 0.5 * 1.0 / (0.5 + 1.0)) + 1.0) / 2
     expected = (complete_macro_f1 + pause_macro_f1 + 0.75) / 3
     assert torch.isclose(model.logged["val_checkpoint_score"], torch.tensor(expected))
+
+
+def _append_ordinal_totals(
+    container,
+    turn,
+    *,
+    sou_detection,
+    eou_detection,
+    count=10,
+    sou_spurious=0,
+    eou_spurious=0,
+):
+    values = {f"turn_{turn}_num_samples": count}
+    for token_name, detection, spurious in (
+        ("sou", sou_detection, sou_spurious),
+        ("eou", eou_detection, eou_spurious),
+    ):
+        values.update(
+            {
+                f"turn_{turn}_{token_name}_early_count": 0,
+                f"turn_{turn}_{token_name}_detection_count": detection,
+                f"turn_{turn}_{token_name}_late_count": 0,
+                f"turn_{turn}_{token_name}_missing_count": count - detection,
+                f"turn_{turn}_{token_name}_spurious_count": spurious,
+            }
+        )
+    values.update(
+        {
+            "sou_spurious_outside_count": 0,
+            "eou_spurious_outside_count": 0,
+        }
+    )
+    for metric, value in values.items():
+        container._partial_ordinal_boundary_metrics[metric].append(torch.tensor(value))
+
+
+def test_validation_epoch_end_turn_ordinal_macro_checkpoint_score():
+    model = _ValidationLogger()
+    model.core_cfg = SimpleNamespace(
+        enable_validation_checkpoint_score=True,
+        validation_checkpoint_score_mode="turn_ordinal_macro",
+    )
+    streaming_stt_model.StreamingSTTModel.on_validation_epoch_start(model)
+    hits = ((10, 8), (8, 6), (6, 4), (4, 2))
+    for turn, (sou_hit, eou_hit) in enumerate(hits, start=1):
+        _append_ordinal_totals(
+            model,
+            turn,
+            sou_detection=sou_hit,
+            eou_detection=eou_hit,
+            sou_spurious=turn,
+        )
+    _append_boundary_totals(model, "d7_complete")
+
+    streaming_stt_model.StreamingSTTModel.on_validation_epoch_end(model)
+
+    expected = torch.tensor(sum(value for pair in hits for value in pair) / (8 * 10))
+    assert torch.isclose(model.logged["val_checkpoint_score"], expected)
+    assert torch.isclose(model.logged["val_multiturn_turn_2_sou_detection_rate"], torch.tensor(0.8))
+    assert torch.isclose(model.logged["val_multiturn_turn_4_eou_detection_rate"], torch.tensor(0.2))
+    assert torch.isclose(model.logged["val_multiturn_sou_spurious_per_reference"], torch.tensor(0.25))
+    assert not any(
+        name.startswith(("val_sou_pred_per_sample", "val_eou_pred_per_sample", "val_sou_collar", "val_eou_collar"))
+        for name in model.logged
+    )
+
+
+def test_turn_ordinal_macro_checkpoint_requires_turns_one_through_four():
+    model = _ValidationLogger()
+    model.core_cfg = SimpleNamespace(
+        enable_validation_checkpoint_score=True,
+        validation_checkpoint_score_mode="turn_ordinal_macro",
+    )
+    streaming_stt_model.StreamingSTTModel.on_validation_epoch_start(model)
+    for turn in range(1, 4):
+        _append_ordinal_totals(model, turn, sou_detection=10, eou_detection=10)
+
+    with pytest.raises(RuntimeError, match=r"missing turns: \[4\]"):
+        streaming_stt_model.StreamingSTTModel.on_validation_epoch_end(model)

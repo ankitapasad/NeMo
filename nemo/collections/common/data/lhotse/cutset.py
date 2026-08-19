@@ -1331,6 +1331,7 @@ def read_nemo_manifest(config) -> tuple[CutSet, bool]:
                 common_kwargs["shuffle_shards"] = config[key]
             else:
                 common_kwargs[key] = config[key]
+    tarred_kwargs = {"context_sampling": config.get("context_sampling")}
     # The option below is to allow a special case of NeMo manifest iteration as Lhotse CutSet
     # without performing any I/O. NeMo manifests typically don't have sampling_rate information required by Lhotse,
     # so lhotse has to look up the headers of audio files to fill it on-the-fly.
@@ -1349,6 +1350,7 @@ def read_nemo_manifest(config) -> tuple[CutSet, bool]:
                     tar_paths=config.tarred_audio_filepaths,
                     skip_missing_manifest_entries=config.get("skip_missing_manifest_entries", False),
                     slice_length=config.get("slice_length", None),
+                    **tarred_kwargs,
                     **common_kwargs,
                 )
             )
@@ -1389,6 +1391,7 @@ def read_nemo_manifest(config) -> tuple[CutSet, bool]:
                     tar_paths=tar_path,
                     skip_missing_manifest_entries=config.get("skip_missing_manifest_entries", False),
                     slice_length=config.get("slice_length", None),
+                    **tarred_kwargs,
                     **common_kwargs,
                 )
             else:

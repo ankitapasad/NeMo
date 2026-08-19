@@ -34,6 +34,7 @@ from torch.nn.utils.rnn import pad_sequence
 from nemo.collections.common.tokenizers import AutoTokenizer
 from nemo.collections.speechlm2.data.salm_dataset import left_collate_vectors
 from nemo.collections.speechlm2.parts.alignments import (
+    ForcedAligner,
     WordAlignment,
     add_utterance_boundary_alignments,
     get_word_alignments_for_batch,
@@ -48,12 +49,252 @@ UTTERANCE_BOUNDARY_TIMESTAMP_SOURCES = {
     UTTERANCE_BOUNDARY_TIMESTAMP_SOURCE_ALIGNMENT,
     UTTERANCE_BOUNDARY_TIMESTAMP_SOURCE_GT_PREFERRED,
 }
+LEAN_MULTI_TURN_SCHEMA_VERSION = "lean_multi_turn_v2"
+LEAN_MULTI_TURN_SOURCE_SAMPLE_TYPES = {"complete_turn", "pause_within_turn"}
+TARGET_BACKCHANNEL_MODE_IGNORE = "ignore"
+TARGET_BACKCHANNEL_MODES = {TARGET_BACKCHANNEL_MODE_IGNORE}
+
+
+@dataclass(frozen=True)
+class MultiTurnTargetSegment:
+    """A timed target-speaker segment from a lean multi-turn manifest row."""
+
+    text: str
+    start_time: float
+    end_time: float
+    turn_ordinal: int
+    turn_id: str | None = None
+    source_sample_id: str | None = None
+    source_sample_type: str | None = None
+
+
+@dataclass(frozen=True)
+class MultiTurnSample:
+    """Validated row-local multi-turn training metadata."""
+
+    schema_version: str
+    transcript: str
+    segments: tuple[MultiTurnTargetSegment, ...]
+    num_substantive_turns: int
+
+
+def _require_mapping(value: Any, *, field: str, cut_id: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise TypeError(f"Cut {cut_id!r} field {field!r} must be a mapping")
+    return value
+
+
+def _require_list(value: Any, *, field: str, cut_id: str) -> list:
+    if not isinstance(value, list):
+        raise TypeError(f"Cut {cut_id!r} field {field!r} must be a list")
+    return value
+
+
+def _fragment_text(fragment: Mapping[str, Any], *, field: str, cut_id: str) -> str:
+    text = fragment.get("text")
+    if not isinstance(text, str) or not text.strip():
+        raise TypeError(f"Cut {cut_id!r} field {field!r}.text must be a non-empty string")
+    return text.strip()
+
+
+def parse_lean_multiturn_metadata(
+    custom: Mapping[str, Any] | None,
+    *,
+    audio_duration_secs: float,
+    cut_id: str = "<unknown>",
+    target_backchannel_mode: str = TARGET_BACKCHANNEL_MODE_IGNORE,
+) -> MultiTurnSample | None:
+    """Parse a supported lean multi-turn row without synthesizing conversations.
+
+    Substantive components map one-for-one, in order, to ``utterance_regions``.
+    Target-speaker backchannels are validated but omitted from training targets.
+    """
+    if target_backchannel_mode not in TARGET_BACKCHANNEL_MODES:
+        raise ValueError(
+            f"target_backchannel_mode must be one of {sorted(TARGET_BACKCHANNEL_MODES)}; "
+            f"got {target_backchannel_mode!r}"
+        )
+    if custom is None:
+        return None
+    if not isinstance(custom, Mapping):
+        raise TypeError(f"Cut {cut_id!r} custom metadata must be a mapping")
+    curation = custom.get("curation")
+    if curation is None:
+        return None
+    curation = _require_mapping(curation, field="curation", cut_id=cut_id)
+    schema_version = curation.get("schema_version")
+    if schema_version != LEAN_MULTI_TURN_SCHEMA_VERSION:
+        target = curation.get("target")
+        if isinstance(target, Mapping) and "utterance_regions" in target:
+            raise ValueError(
+                f"Cut {cut_id!r} has multi-turn utterance_regions but unsupported "
+                f"curation.schema_version={schema_version!r}"
+            )
+        return None
+    substantive_component_type = "substantive_turn"
+
+    duration = _validate_timestamp(audio_duration_secs, field="audio_duration_secs", cut_id=cut_id)
+    if duration <= 0:
+        raise ValueError(f"Cut {cut_id!r} audio duration must be positive; got {duration}")
+
+    target = _require_mapping(curation.get("target"), field="curation.target", cut_id=cut_id)
+    components = _require_list(target.get("components"), field="curation.target.components", cut_id=cut_id)
+    regions = _require_list(target.get("utterance_regions"), field="curation.target.utterance_regions", cut_id=cut_id)
+    if not regions:
+        raise ValueError(f"Cut {cut_id!r} lean multi-turn row has no utterance regions")
+
+    validated_regions: list[dict[str, Any]] = []
+    previous_region_end = -math.inf
+    for region_idx, raw_region in enumerate(regions):
+        prefix = f"curation.target.utterance_regions[{region_idx}]"
+        region = _require_mapping(raw_region, field=prefix, cut_id=cut_id)
+        start = _validate_timestamp(region.get("start"), field=f"{prefix}.start", cut_id=cut_id)
+        region_duration = _validate_timestamp(region.get("duration"), field=f"{prefix}.duration", cut_id=cut_id)
+        if region_duration <= 0:
+            raise ValueError(f"Cut {cut_id!r} {prefix}.duration must be positive")
+        end = start + region_duration
+        if start < -1e-6 or end > duration + 1e-6:
+            raise ValueError(
+                f"Cut {cut_id!r} {prefix} must be contained in the audio; "
+                f"got start={start}, end={end}, duration={duration}"
+            )
+        if start < previous_region_end - 1e-6:
+            raise ValueError(f"Cut {cut_id!r} substantive utterance regions must be chronological and non-overlapping")
+        turn_id = region.get("turn_id")
+        if not isinstance(turn_id, str) or not turn_id:
+            raise TypeError(f"Cut {cut_id!r} {prefix}.turn_id must be a non-empty string")
+        source_sample_id = region.get("source_sample_id")
+        source_sample_type = region.get("source_sample_type")
+        if not isinstance(source_sample_id, str) or not source_sample_id:
+            raise TypeError(f"Cut {cut_id!r} {prefix}.source_sample_id must be a non-empty string")
+        if source_sample_type not in LEAN_MULTI_TURN_SOURCE_SAMPLE_TYPES:
+            raise ValueError(
+                f"Cut {cut_id!r} {prefix}.source_sample_type must be one of "
+                f"{sorted(LEAN_MULTI_TURN_SOURCE_SAMPLE_TYPES)}; got {source_sample_type!r}"
+            )
+        validated_regions.append(
+            {
+                "start": max(0.0, start),
+                "end": min(duration, end),
+                "turn_id": turn_id,
+                "source_sample_id": source_sample_id,
+                "source_sample_type": source_sample_type,
+            }
+        )
+        previous_region_end = end
+
+    substantive_components = [
+        component
+        for component in components
+        if isinstance(component, Mapping) and component.get("type") == substantive_component_type
+    ]
+    if len(substantive_components) != len(validated_regions):
+        raise ValueError(
+            f"Cut {cut_id!r} has {len(substantive_components)} {substantive_component_type} "
+            f"components but "
+            f"{len(validated_regions)} utterance regions"
+        )
+
+    segments: list[MultiTurnTargetSegment] = []
+    transcript_pieces: list[str] = []
+    complete_idx = 0
+    previous_component_start = -math.inf
+    for component_idx, raw_component in enumerate(components):
+        prefix = f"curation.target.components[{component_idx}]"
+        component = _require_mapping(raw_component, field=prefix, cut_id=cut_id)
+        component_type = component.get("type")
+        if component_type not in {substantive_component_type, "backchannel"}:
+            raise ValueError(
+                f"Cut {cut_id!r} {prefix}.type must be {substantive_component_type!r} "
+                f"or 'backchannel'; "
+                f"got {component_type!r}"
+            )
+        fragments = _require_list(component.get("fragments"), field=f"{prefix}.fragments", cut_id=cut_id)
+        if not fragments:
+            raise ValueError(f"Cut {cut_id!r} {prefix}.fragments must not be empty")
+
+        validated_fragments: list[tuple[float, float, str]] = []
+        for fragment_idx, raw_fragment in enumerate(fragments):
+            fragment_prefix = f"{prefix}.fragments[{fragment_idx}]"
+            fragment = _require_mapping(raw_fragment, field=fragment_prefix, cut_id=cut_id)
+            start = _validate_timestamp(fragment.get("start"), field=f"{fragment_prefix}.start", cut_id=cut_id)
+            fragment_duration = _validate_timestamp(
+                fragment.get("duration"), field=f"{fragment_prefix}.duration", cut_id=cut_id
+            )
+            if fragment_duration <= 0:
+                raise ValueError(f"Cut {cut_id!r} {fragment_prefix}.duration must be positive")
+            end = start + fragment_duration
+            if start < -1e-6 or end > duration + 1e-6:
+                raise ValueError(f"Cut {cut_id!r} {fragment_prefix} must be contained in the audio")
+            text = _fragment_text(fragment, field=fragment_prefix, cut_id=cut_id)
+            validated_fragments.append((max(0.0, start), min(duration, end), text))
+
+        component_start = min(start for start, _, _ in validated_fragments)
+        if component_start < previous_component_start - 1e-6:
+            raise ValueError(f"Cut {cut_id!r} target components must be chronological")
+        previous_component_start = component_start
+
+        if component_type == substantive_component_type:
+            region = validated_regions[complete_idx]
+            region_start, region_end = region["start"], region["end"]
+            for identity_field in ("turn_id", "source_sample_id", "source_sample_type"):
+                if component.get(identity_field) != region[identity_field]:
+                    raise ValueError(
+                        f"Cut {cut_id!r} {prefix}.{identity_field} must match "
+                        f"curation.target.utterance_regions[{complete_idx}].{identity_field}"
+                    )
+            for fragment_start, fragment_end, _ in validated_fragments:
+                if fragment_start < region_start - 1e-6 or fragment_end > region_end + 1e-6:
+                    raise ValueError(
+                        f"Cut {cut_id!r} {prefix} fragments must be contained in substantive "
+                        f"utterance region {complete_idx}"
+                    )
+            text = " ".join(fragment_text for _, _, fragment_text in validated_fragments)
+            complete_idx += 1
+            transcript_pieces.append(text)
+            segments.append(
+                MultiTurnTargetSegment(
+                    text=text,
+                    start_time=region_start,
+                    end_time=region_end,
+                    turn_ordinal=complete_idx,
+                    turn_id=region["turn_id"],
+                    source_sample_id=region["source_sample_id"],
+                    source_sample_type=region["source_sample_type"],
+                )
+            )
+    segments.sort(key=lambda segment: (segment.start_time, segment.end_time))
+    return MultiTurnSample(
+        schema_version=schema_version,
+        transcript=" ".join(transcript_pieces),
+        segments=tuple(segments),
+        num_substantive_turns=len(validated_regions),
+    )
+
+
+def _debug_boundary_window_positions(input_ids, boundary_ids, radius=2):
+    """Return original sequence positions within ``radius`` of each boundary token."""
+    boundary_ids = {token_id for token_id in boundary_ids if token_id is not None}
+    positions = set()
+    for boundary_pos, token_id in enumerate(input_ids):
+        if token_id in boundary_ids:
+            positions.update(range(max(0, boundary_pos - radius), min(len(input_ids), boundary_pos + radius + 1)))
+    return sorted(positions)
 
 
 def _debug_dump_sequence(
-    messages, input_ids, target_ids, assistant_mask, tokenizer, blank_id, transcript=None, do_breakpoint=False
+    messages,
+    input_ids,
+    target_ids,
+    assistant_mask,
+    tokenizer,
+    blank_id,
+    sou_id=None,
+    eou_id=None,
+    transcript=None,
+    do_breakpoint=False,
 ):
-    """Print a readable dump of the full input/target sequence for debugging."""
+    """Print compact input/target windows around each utterance boundary."""
     hf_tok = tokenizer.tokenizer
     sep = "=" * 100
 
@@ -71,11 +312,20 @@ def _debug_dump_sequence(
     if transcript is not None:
         print(f"\n--- TRANSCRIPT ---\n{repr(transcript)}")
 
-    print(f"\n--- TOKEN TABLE (len={len(input_ids)}) ---")
+    boundary_positions = [i for i, token_id in enumerate(input_ids) if token_id in {sou_id, eou_id} - {None}]
+    display_positions = _debug_boundary_window_positions(input_ids, (sou_id, eou_id), radius=2)
+
+    print(
+        f"\n--- BOUNDARY TOKEN WINDOWS " f"(len={len(input_ids)}, boundaries={len(boundary_positions)}, context=2) ---"
+    )
     print(f"  {'pos':>5s}  {'input_id':>9s}  {'target_id':>9s}  {'mask':>4s}  {'input_tok':<20s}  {'target_tok':<20s}")
     print(f"  {'-' * 5}  {'-' * 9}  {'-' * 9}  {'-' * 4}  {'-' * 20}  {'-' * 20}")
 
-    for i in range(len(input_ids)):
+    previous_position = None
+    for i in display_positions:
+        if previous_position is not None and i > previous_position + 1:
+            omitted = i - previous_position - 1
+            print(f"  {'...':>5s}  ... {omitted} token{'s' if omitted != 1 else ''} omitted ...")
         inp_id = input_ids[i]
         tgt_id = target_ids[i] if i < len(target_ids) else None
         mask = assistant_mask[i] if i < len(assistant_mask) else 0
@@ -97,6 +347,10 @@ def _debug_dump_sequence(
 
         mask_str = "*" if mask else "."
         print(f"  {i:5d}  {str(inp_id):>9s}  {tgt_id_str:>9s}  {mask_str:>4s}  {inp_tok:<20s}  {tgt_tok:<20s}")
+        previous_position = i
+
+    if not display_positions:
+        print("  (no <sou>/<eou> tokens found)")
 
     n_audio = sum(1 for token_id in input_ids if token_id == AUDIO_TOKEN_IDX)
     n_blank_tgt = sum(1 for token_id in target_ids if token_id == blank_id)
@@ -108,7 +362,11 @@ def _debug_dump_sequence(
     print(f"  Assistant mask sum: {n_mask} ({n_mask / len(input_ids):.3f})")
     print(f"  Loss positions:     {n_loss} ({n_loss / len(input_ids):.3f})")
     print(f"  Blank targets:      {n_blank_tgt}")
-    print(f"  blank_id={blank_id}, AUDIO_TOKEN_IDX={AUDIO_TOKEN_IDX}, IGNORE_INDEX={IGNORE_INDEX}")
+    print(f"  Boundary positions: {boundary_positions}")
+    print(
+        f"  sou_id={sou_id}, eou_id={eou_id}, blank_id={blank_id}, "
+        f"AUDIO_TOKEN_IDX={AUDIO_TOKEN_IDX}, IGNORE_INDEX={IGNORE_INDEX}"
+    )
     print(sep + "\n")
 
     if do_breakpoint:
@@ -137,6 +395,9 @@ class StreamingSTTBatch:
         target_tokens: (B, L) target token IDs for the LLM. Non-trainable positions are IGNORE_INDEX.
         target_token_lens: (B,) lengths of the target token sequences.
         text: list of ground-truth transcription strings.
+        is_multiturn: (B,) row-local lean-multi-turn indicator.
+        num_substantive_turns: (B,) number of substantive target turns in each row.
+        boundary_turn_ordinals: (B, L) substantive turn ordinal at SOU/EOU targets, else zero.
         cuts: Optional[CutSet] containing the cuts for the batch.
     """
 
@@ -147,6 +408,9 @@ class StreamingSTTBatch:
     target_tokens: Optional[torch.Tensor] = None
     target_token_lens: Optional[torch.Tensor] = None
     text: Optional[List[str]] = None
+    is_multiturn: Optional[torch.Tensor] = None
+    num_substantive_turns: Optional[torch.Tensor] = None
+    boundary_turn_ordinals: Optional[torch.Tensor] = None
     cuts: Optional[CutSet] = None
 
 
@@ -183,6 +447,13 @@ class StreamingSTTDataConfig:
     agent_backchannel_start_token: str = "<soab>"
     agent_backchannel_end_token: str = "<eoab>"
     agent_backchannel_delay_frames: int = 0
+    # Compatibility field for row-local target-speaker backchannels. Only
+    # "ignore" is supported: target backchannels never become training text.
+    target_backchannel_mode: str = TARGET_BACKCHANNEL_MODE_IGNORE
+    # Symmetric acoustic context supplied to the online forced aligner around
+    # each lean multi-turn substantive region. This does not move the
+    # authoritative manifest SOU/EOU timestamps.
+    multiturn_forced_alignment_buffer_s: float = 0.5
     # K — only effective in dynamic chunking (chunk_size == 0). Each audio
     # segment is rounded UP to a multiple of K frames (and total audio is
     # padded to K-multiple). The model implicitly learns to emit only at
@@ -202,6 +473,18 @@ class StreamingSTTDataConfig:
                 raise ValueError("agent backchannel tokens must be non-empty")
             if self.agent_backchannel_start_token == self.agent_backchannel_end_token:
                 raise ValueError("agent backchannel start and end tokens must be different")
+        if self.target_backchannel_mode not in TARGET_BACKCHANNEL_MODES:
+            raise ValueError(
+                f"target_backchannel_mode must be one of {sorted(TARGET_BACKCHANNEL_MODES)}; "
+                f"got {self.target_backchannel_mode!r}"
+            )
+        if (
+            isinstance(self.multiturn_forced_alignment_buffer_s, bool)
+            or not isinstance(self.multiturn_forced_alignment_buffer_s, Real)
+            or not math.isfinite(self.multiturn_forced_alignment_buffer_s)
+            or self.multiturn_forced_alignment_buffer_s < 0
+        ):
+            raise ValueError("multiturn_forced_alignment_buffer_s must be a non-negative finite number")
 
 
 def _normalize_legacy_text_token_config(cfg: DictConfig | dict) -> DictConfig | dict:
@@ -421,9 +704,7 @@ def build_agent_backchannel_alignments(
     confirmed_fragments: list[tuple[int, Mapping[str, Any]]] = []
     for fragment_idx, fragment in enumerate(fragments):
         if not isinstance(fragment, Mapping):
-            raise TypeError(
-                f"Cut {cut_id!r} curation.other_speaker.fragments[{fragment_idx}] must be a mapping"
-            )
+            raise TypeError(f"Cut {cut_id!r} curation.other_speaker.fragments[{fragment_idx}] must be a mapping")
         backchannel = fragment.get("backchannel")
         if backchannel is None:
             continue
@@ -438,16 +719,32 @@ def build_agent_backchannel_alignments(
         return []
 
     duration = _validate_timestamp(audio_duration_secs, field="audio_duration_secs", cut_id=cut_id)
-    utterance_start = _validate_timestamp(
-        custom.get("utterance_start_time"), field="utterance_start_time", cut_id=cut_id
-    )
-    utterance_end = _validate_timestamp(
-        custom.get("utterance_end_time"), field="utterance_end_time", cut_id=cut_id
-    )
-    if duration < 0 or utterance_start < 0 or utterance_end < utterance_start or utterance_end > duration + 1e-6:
+    eligible_ranges: list[tuple[float, float]]
+    if curation.get("schema_version") == LEAN_MULTI_TURN_SCHEMA_VERSION:
+        target = _require_mapping(curation.get("target"), field="curation.target", cut_id=cut_id)
+        regions = _require_list(
+            target.get("utterance_regions"), field="curation.target.utterance_regions", cut_id=cut_id
+        )
+        eligible_ranges = []
+        for region_idx, raw_region in enumerate(regions):
+            prefix = f"curation.target.utterance_regions[{region_idx}]"
+            region = _require_mapping(raw_region, field=prefix, cut_id=cut_id)
+            start = _validate_timestamp(region.get("start"), field=f"{prefix}.start", cut_id=cut_id)
+            region_duration = _validate_timestamp(region.get("duration"), field=f"{prefix}.duration", cut_id=cut_id)
+            eligible_ranges.append((start, start + region_duration))
+    else:
+        utterance_start = _validate_timestamp(
+            custom.get("utterance_start_time"), field="utterance_start_time", cut_id=cut_id
+        )
+        utterance_end = _validate_timestamp(
+            custom.get("utterance_end_time"), field="utterance_end_time", cut_id=cut_id
+        )
+        eligible_ranges = [(utterance_start, utterance_end)]
+
+    if duration < 0 or any(start < 0 or end < start or end > duration + 1e-6 for start, end in eligible_ranges):
         raise ValueError(
-            f"Cut {cut_id!r} requires 0 <= utterance_start_time <= utterance_end_time <= audio duration; "
-            f"got start={utterance_start}, end={utterance_end}, duration={duration}"
+            f"Cut {cut_id!r} requires every target utterance range to satisfy "
+            f"0 <= start <= end <= audio duration; got ranges={eligible_ranges}, duration={duration}"
         )
 
     alignments: list[WordAlignment] = []
@@ -459,9 +756,7 @@ def build_agent_backchannel_alignments(
         if start_token in text or end_token in text:
             raise ValueError(f"Cut {cut_id!r} confirmed {prefix}.text contains an agent backchannel marker")
         start = _validate_timestamp(fragment.get("start"), field=f"{prefix}.start", cut_id=cut_id)
-        fragment_duration = _validate_timestamp(
-            fragment.get("duration"), field=f"{prefix}.duration", cut_id=cut_id
-        )
+        fragment_duration = _validate_timestamp(fragment.get("duration"), field=f"{prefix}.duration", cut_id=cut_id)
         if fragment_duration < 0:
             raise ValueError(
                 f"Cut {cut_id!r} confirmed {prefix}.duration must be non-negative; got {fragment_duration}"
@@ -471,7 +766,10 @@ def build_agent_backchannel_alignments(
         # Valid-but-ineligible edge fragments are intentionally skipped.
         if start < -1e-6 or fragment_end > duration + 1e-6:
             continue
-        if start < utterance_start - 1e-6 or fragment_end > utterance_end + 1e-6:
+        if not any(
+            start >= utterance_start - 1e-6 and fragment_end <= utterance_end + 1e-6
+            for utterance_start, utterance_end in eligible_ranges
+        ):
             continue
 
         alignments.append(
@@ -496,31 +794,33 @@ def merge_agent_backchannel_alignments(
 ) -> List[WordAlignment]:
     """Merge transcript and agent-backchannel emissions by effective ready frame.
 
-    SOU remains structurally first and EOU structurally last. Within the
-    utterance, transcript emissions win exact ready-frame ties, followed by
-    agent backchannels; original order is otherwise stable.
+    Boundary pairs remain chronological for both single- and multi-turn rows.
+    At an exact ready-frame tie, SOU precedes transcript, then agent
+    backchannels, then EOU; original order otherwise remains stable.
     """
     if not agent_backchannels:
         return alignments
     if frame_length_in_secs <= 0:
         raise ValueError("frame_length_in_secs must be positive")
 
-    starts = [item for item in alignments if item.text == utterance_start_token]
-    ends = [item for item in alignments if item.text == utterance_end_token]
-    middle = [
-        (item, 1, idx)
-        for idx, item in enumerate(alignments)
-        if item.text not in {utterance_start_token, utterance_end_token}
-    ]
-    middle.extend((item, 2, len(alignments) + idx) for idx, item in enumerate(agent_backchannels))
-    middle.sort(
+    tagged = []
+    for idx, item in enumerate(alignments):
+        if item.text == utterance_start_token:
+            priority = 0
+        elif item.text == utterance_end_token:
+            priority = 3
+        else:
+            priority = 1
+        tagged.append((item, priority, idx))
+    tagged.extend((item, 2, len(alignments) + idx) for idx, item in enumerate(agent_backchannels))
+    tagged.sort(
         key=lambda tagged: (
             _alignment_ready_frame(tagged[0], frame_length_in_secs, default_delay_frames),
             tagged[1],
             tagged[2],
         )
     )
-    return [*starts, *(item for item, _, _ in middle), *ends]
+    return [item for item, _, _ in tagged]
 
 
 def add_gt_utterance_boundary_alignments(
@@ -535,7 +835,12 @@ def add_gt_utterance_boundary_alignments(
     end_delay_frames: int,
     cut_id: str = "<unknown>",
 ) -> List[WordAlignment]:
-    """Clip word timing to authoritative GT boundaries and add ordered SOU/EOU alignments."""
+    """Clip word timing to authoritative GT boundaries and add ordered SOU/EOU alignments.
+
+    SOU/EOU remain fixed at the manifest region boundaries. Each selected
+    word endpoint is independently clamped into that closed interval, so a
+    small boundary-crossing overlap is retained rather than moving a boundary.
+    """
     sou = _validate_timestamp(utterance_start_time, field="utterance_start_time", cut_id=cut_id)
     eou = _validate_timestamp(utterance_end_time, field="utterance_end_time", cut_id=cut_id)
     duration = _validate_timestamp(audio_duration_secs, field="audio_duration_secs", cut_id=cut_id)
@@ -571,6 +876,68 @@ def add_gt_utterance_boundary_alignments(
         *clipped,
         WordAlignment(end_token, eou, eou, delay_frames=end_delay_frames),
     ]
+
+
+def build_lean_multiturn_alignments(
+    sample: MultiTurnSample,
+    alignments: List[WordAlignment],
+    *,
+    audio_duration_secs: float,
+    start_token: str,
+    end_token: str,
+    start_delay_frames: int,
+    end_delay_frames: int,
+    cut_id: str = "<unknown>",
+) -> List[WordAlignment]:
+    """Select each substantive turn's words and wrap it with SOU/EOU.
+
+    A word belongs to the first substantive region containing its midpoint and
+    is consumed at most once. Words whose midpoints lie outside every region
+    are omitted. A non-empty turn with no selected word alignment is rejected.
+    Selected word endpoints are then clamped to the authoritative region by
+    :func:`add_gt_utterance_boundary_alignments`.
+    """
+    if not alignments and sample.transcript:
+        raise ValueError(f"Cut {cut_id!r} has a non-empty lean multi-turn transcript but no usable word alignments")
+
+    ordered_alignments = sorted(alignments, key=lambda item: (item.start_time, item.end_time))
+    consumed: set[int] = set()
+    resolved: list[WordAlignment] = []
+    for segment_idx, segment in enumerate(sample.segments):
+        segment_alignments = []
+        for alignment_idx, alignment in enumerate(ordered_alignments):
+            if alignment_idx in consumed:
+                continue
+            start = _validate_timestamp(
+                alignment.start_time, field=f"alignments[{alignment_idx}].start_time", cut_id=cut_id
+            )
+            end = _validate_timestamp(alignment.end_time, field=f"alignments[{alignment_idx}].end_time", cut_id=cut_id)
+            if start < 0 or end < start:
+                raise ValueError(f"Cut {cut_id!r} alignment {alignment_idx} requires 0 <= start_time <= end_time")
+            midpoint = (start + end) / 2
+            if segment.start_time - 1e-6 <= midpoint <= segment.end_time + 1e-6:
+                consumed.add(alignment_idx)
+                segment_alignments.append(alignment)
+
+        if segment.text and not segment_alignments:
+            raise ValueError(
+                f"Cut {cut_id!r} target segment {segment_idx} ({segment.text!r}) has no usable word alignments"
+            )
+
+        segment_alignments = add_gt_utterance_boundary_alignments(
+            segment_alignments,
+            utterance_start_time=segment.start_time,
+            utterance_end_time=segment.end_time,
+            audio_duration_secs=audio_duration_secs,
+            start_token=start_token,
+            end_token=end_token,
+            start_delay_frames=start_delay_frames,
+            end_delay_frames=end_delay_frames,
+            cut_id=cut_id,
+        )
+        resolved.extend(segment_alignments)
+
+    return resolved
 
 
 def _append_alignment_text(
@@ -1338,6 +1705,123 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
         else:
             self._user_footer_first_id = None
 
+        self._sou_id = None
+        self._eou_id = None
+        if self.cfg.add_utterance_boundary_tokens:
+            sou_ids = self.tokenizer.tokenizer.encode(self.cfg.utterance_start_token, add_special_tokens=False)
+            eou_ids = self.tokenizer.tokenizer.encode(self.cfg.utterance_end_token, add_special_tokens=False)
+            if len(sou_ids) != 1 or len(eou_ids) != 1:
+                raise ValueError(
+                    "utterance boundary markers must each encode to one token; "
+                    f"got {self.cfg.utterance_start_token!r}->{sou_ids}, "
+                    f"{self.cfg.utterance_end_token!r}->{eou_ids}"
+                )
+            self._sou_id, self._eou_id = sou_ids[0], eou_ids[0]
+
+    def _get_multiturn_samples(
+        self,
+        cuts: CutSet | list,
+        audio_durations_secs: List[float],
+    ) -> List[MultiTurnSample | None]:
+        samples = []
+        for cut, duration_secs in zip(cuts, audio_durations_secs):
+            cut_id = str(getattr(cut, "id", "<unknown>"))
+            samples.append(
+                parse_lean_multiturn_metadata(
+                    cut.custom or {},
+                    audio_duration_secs=duration_secs,
+                    cut_id=cut_id,
+                    target_backchannel_mode=self.cfg.target_backchannel_mode,
+                )
+            )
+        return samples
+
+    @staticmethod
+    def _resolve_multiturn_transcripts(
+        text: List[str],
+        multiturn_samples: List[MultiTurnSample | None],
+    ) -> List[str]:
+        return [
+            sample.transcript if sample is not None else transcript
+            for transcript, sample in zip(text, multiturn_samples)
+        ]
+
+    def get_online_alignments(
+        self,
+        *,
+        cuts: CutSet | list,
+        audios: torch.Tensor,
+        audio_lens: torch.Tensor,
+        text: List[str],
+        forced_aligner: ForcedAligner,
+    ) -> List[List[WordAlignment]]:
+        """Batch legacy utterances and buffered row-local target regions in one aligner call.
+
+        Legacy rows are aligned over their complete clips. Each lean multi-turn
+        substantive region is aligned independently with up to
+        ``multiturn_forced_alignment_buffer_s`` of real audio on either side,
+        clipped to the sample bounds. The buffer supplies acoustic context only;
+        manifest region starts and ends remain the authoritative SOU/EOU times.
+        Returned turn-local word timestamps are shifted back into coordinates of
+        the complete sampled clip.
+        """
+        audio_durations_secs = (audio_lens.float() / self.cfg.sample_rate).tolist()
+        multiturn_samples = self._get_multiturn_samples(cuts, audio_durations_secs)
+        resolved_text = self._resolve_multiturn_transcripts(text, multiturn_samples)
+
+        alignment_audios: list[torch.Tensor] = []
+        alignment_lens: list[int] = []
+        alignment_text: list[str] = []
+        owners: list[tuple[int, float]] = []
+        alignment_buffer_samples = round(self.cfg.multiturn_forced_alignment_buffer_s * self.cfg.sample_rate)
+        for sample_idx, (cut, sample, transcript) in enumerate(zip(cuts, multiturn_samples, resolved_text)):
+            cut_id = str(getattr(cut, "id", "<unknown>"))
+            sample_num_samples = int(audio_lens[sample_idx].item())
+            if sample is None:
+                alignment_audios.append(audios[sample_idx, :sample_num_samples])
+                alignment_lens.append(sample_num_samples)
+                alignment_text.append(transcript)
+                owners.append((sample_idx, 0.0))
+                continue
+
+            for segment in sample.segments:
+                region_start_sample = round(segment.start_time * self.cfg.sample_rate)
+                region_end_sample = round(segment.end_time * self.cfg.sample_rate)
+                start_sample = max(0, region_start_sample - alignment_buffer_samples)
+                end_sample = min(sample_num_samples, region_end_sample + alignment_buffer_samples)
+                if end_sample <= start_sample:
+                    raise ValueError(f"Cut {cut_id!r} target segment {segment.text!r} has no audio samples")
+                alignment_audios.append(audios[sample_idx, start_sample:end_sample])
+                alignment_lens.append(end_sample - start_sample)
+                alignment_text.append(segment.text)
+                owners.append((sample_idx, start_sample / self.cfg.sample_rate))
+
+        if not alignment_audios:
+            return [[] for _ in text]
+
+        padded_audio = pad_sequence(alignment_audios, batch_first=True)
+        padded_lens = torch.tensor(alignment_lens, dtype=audio_lens.dtype, device=audio_lens.device)
+        flat_alignments = forced_aligner.align(padded_audio, padded_lens, alignment_text)
+        if len(flat_alignments) != len(owners):
+            raise RuntimeError(
+                f"Forced aligner returned {len(flat_alignments)} results for {len(owners)} target segments"
+            )
+
+        batch_alignments: list[list[WordAlignment]] = [[] for _ in text]
+        for segment_alignments, (sample_idx, offset_secs) in zip(flat_alignments, owners):
+            batch_alignments[sample_idx].extend(
+                WordAlignment(
+                    text=alignment.text,
+                    start_time=alignment.start_time + offset_secs,
+                    end_time=alignment.end_time + offset_secs,
+                    delay_frames=alignment.delay_frames,
+                )
+                for alignment in segment_alignments
+            )
+        for sample_alignments in batch_alignments:
+            sample_alignments.sort(key=lambda item: (item.start_time, item.end_time))
+        return batch_alignments
+
     def __getitem__(self, cuts: CutSet) -> StreamingSTTBatch | None:
         try:
             audios, audio_lens, cuts = collate_audio(cuts, fault_tolerant=True)
@@ -1349,6 +1833,14 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             return None
 
         text = [cut.supervisions[0].text for cut in cuts]
+        audio_durations_secs = (audio_lens.float() / self.cfg.sample_rate).tolist()
+        multiturn_samples = self._get_multiturn_samples(cuts, audio_durations_secs)
+        text = self._resolve_multiturn_transcripts(text, multiturn_samples)
+        is_multiturn = torch.tensor([sample is not None for sample in multiturn_samples], dtype=torch.bool)
+        num_substantive_turns = torch.tensor(
+            [sample.num_substantive_turns if sample is not None else 0 for sample in multiturn_samples],
+            dtype=torch.long,
+        )
 
         if self.defer_get_batch:
             return StreamingSTTBatch(
@@ -1356,6 +1848,8 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
                 audios=audios,
                 audio_lens=audio_lens,
                 text=text,
+                is_multiturn=is_multiturn,
+                num_substantive_turns=num_substantive_turns,
             )
 
         alignments = get_word_alignments_for_batch(cuts)
@@ -1372,6 +1866,15 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
     ) -> StreamingSTTBatch:
         audio_durations_secs = (audio_lens.float() / self.cfg.sample_rate).tolist()
         clip_audio_durations_secs = list(audio_durations_secs)
+        multiturn_samples = self._get_multiturn_samples(cuts, clip_audio_durations_secs)
+        text = self._resolve_multiturn_transcripts(text, multiturn_samples)
+        if any(sample is not None for sample in multiturn_samples) and not self.cfg.add_utterance_boundary_tokens:
+            raise ValueError("lean multi-turn rows require data.dataset.add_utterance_boundary_tokens=True")
+        is_multiturn = torch.tensor([sample is not None for sample in multiturn_samples], dtype=torch.bool)
+        num_substantive_turns = torch.tensor(
+            [sample.num_substantive_turns if sample is not None else 0 for sample in multiturn_samples],
+            dtype=torch.long,
+        )
 
         # K-step alignment (dynamic chunking only): pad each waveform up to a
         # multiple of K frames so the encoder produces exactly that many
@@ -1395,7 +1898,7 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             system_prompts = []
             add_boundary_tokens = []
             timestamp_sources = []
-            for cut in cuts:
+            for cut, multiturn_sample in zip(cuts, multiturn_samples):
                 custom = cut.custom or {}
                 cut_id = getattr(cut, "id", "<unknown>")
                 if self.cfg.prompt_field not in custom:
@@ -1409,47 +1912,90 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
                         f"Cut {cut_id!r} custom field {self.cfg.prompt_field!r} must be a non-empty string; "
                         f"got {prompt!r}"
                     )
-                if "add_utterance_boundary_tokens" not in custom:
-                    raise ValueError(
-                        f"Cut {cut_id!r} is missing required custom field 'add_utterance_boundary_tokens' "
-                        "while use_per_sample_utterance_boundary_tokens=True"
-                    )
-                add_boundaries = custom["add_utterance_boundary_tokens"]
-                if not isinstance(add_boundaries, bool):
-                    raise TypeError(
-                        f"Cut {cut_id!r} custom field 'add_utterance_boundary_tokens' must be a boolean; "
-                        f"got {add_boundaries!r}"
-                    )
+                if multiturn_sample is not None:
+                    add_boundaries = custom.get("add_utterance_boundary_tokens", True)
+                    if not isinstance(add_boundaries, bool):
+                        raise TypeError(
+                            f"Cut {cut_id!r} custom field 'add_utterance_boundary_tokens' must be a boolean; "
+                            f"got {add_boundaries!r}"
+                        )
+                    if not add_boundaries:
+                        raise ValueError(
+                            f"Cut {cut_id!r} is lean multi-turn and cannot disable utterance boundary tokens"
+                        )
+                else:
+                    if "add_utterance_boundary_tokens" not in custom:
+                        raise ValueError(
+                            f"Cut {cut_id!r} is missing required custom field 'add_utterance_boundary_tokens' "
+                            "while use_per_sample_utterance_boundary_tokens=True"
+                        )
+                    add_boundaries = custom["add_utterance_boundary_tokens"]
+                    if not isinstance(add_boundaries, bool):
+                        raise TypeError(
+                            f"Cut {cut_id!r} custom field 'add_utterance_boundary_tokens' must be a boolean; "
+                            f"got {add_boundaries!r}"
+                        )
                 system_prompts.append(prompt)
                 add_boundary_tokens.append(add_boundaries)
                 timestamp_source = None
                 if add_boundaries and self.cfg.use_per_sample_utterance_boundary_timestamps:
-                    if "utterance_boundary_timestamp_source" not in custom:
+                    if multiturn_sample is not None:
+                        timestamp_source = multiturn_sample.schema_version
+                    elif "utterance_boundary_timestamp_source" not in custom:
                         raise ValueError(
                             f"Cut {cut_id!r} is missing required custom field "
                             "'utterance_boundary_timestamp_source' while "
                             "use_per_sample_utterance_boundary_timestamps=True"
                         )
-                    timestamp_source = custom["utterance_boundary_timestamp_source"]
-                    if (
-                        not isinstance(timestamp_source, str)
-                        or timestamp_source not in UTTERANCE_BOUNDARY_TIMESTAMP_SOURCES
-                    ):
-                        raise ValueError(
-                            f"Cut {cut_id!r} custom field 'utterance_boundary_timestamp_source' must be one of "
-                            f"{sorted(UTTERANCE_BOUNDARY_TIMESTAMP_SOURCES)}; got {timestamp_source!r}"
-                        )
+                    else:
+                        timestamp_source = custom["utterance_boundary_timestamp_source"]
+                        if (
+                            not isinstance(timestamp_source, str)
+                            or timestamp_source not in UTTERANCE_BOUNDARY_TIMESTAMP_SOURCES
+                        ):
+                            raise ValueError(
+                                f"Cut {cut_id!r} custom field 'utterance_boundary_timestamp_source' must be one of "
+                                f"{sorted(UTTERANCE_BOUNDARY_TIMESTAMP_SOURCES)}; got {timestamp_source!r}"
+                            )
                 timestamp_sources.append(timestamp_source)
 
             resolved_alignments = []
-            for cut, sample_alignments, transcript, duration_secs, add_boundaries, timestamp_source in zip(
-                cuts, alignments, text, audio_durations_secs, add_boundary_tokens, timestamp_sources
+            for (
+                cut,
+                sample_alignments,
+                transcript,
+                duration_secs,
+                add_boundaries,
+                timestamp_source,
+                multiturn_sample,
+            ) in zip(
+                cuts,
+                alignments,
+                text,
+                audio_durations_secs,
+                add_boundary_tokens,
+                timestamp_sources,
+                multiturn_samples,
             ):
                 if not add_boundaries:
                     resolved_alignments.append(sample_alignments)
                     continue
 
                 cut_id = str(getattr(cut, "id", "<unknown>"))
+                if multiturn_sample is not None:
+                    resolved_alignments.append(
+                        build_lean_multiturn_alignments(
+                            multiturn_sample,
+                            sample_alignments,
+                            audio_duration_secs=duration_secs,
+                            start_token=self.cfg.utterance_start_token,
+                            end_token=self.cfg.utterance_end_token,
+                            start_delay_frames=self.cfg.utterance_start_boundary_delay_frames,
+                            end_delay_frames=self.cfg.utterance_end_boundary_delay_frames,
+                            cut_id=cut_id,
+                        )
+                    )
+                    continue
                 if transcript and not sample_alignments:
                     raise ValueError(
                         f"Cut {cut_id!r} has a non-empty transcript but no usable word alignments for "
@@ -1495,10 +2041,24 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
                 resolved_alignments.append(sample_alignments)
             alignments = resolved_alignments
         else:
-            # Keep the legacy global behavior byte-for-byte when the opt-in mode is disabled.
-            if self.cfg.add_utterance_boundary_tokens:
-                alignments = [
-                    add_utterance_boundary_alignments(
+            # Preserve legacy global behavior while dispatching actual multi-turn rows locally.
+            resolved_alignments = []
+            for cut, sample_alignments, duration_secs, multiturn_sample in zip(
+                cuts, alignments, audio_durations_secs, multiturn_samples
+            ):
+                if multiturn_sample is not None:
+                    sample_alignments = build_lean_multiturn_alignments(
+                        multiturn_sample,
+                        sample_alignments,
+                        audio_duration_secs=duration_secs,
+                        start_token=self.cfg.utterance_start_token,
+                        end_token=self.cfg.utterance_end_token,
+                        start_delay_frames=self.cfg.utterance_start_boundary_delay_frames,
+                        end_delay_frames=self.cfg.utterance_end_boundary_delay_frames,
+                        cut_id=str(getattr(cut, "id", "<unknown>")),
+                    )
+                elif self.cfg.add_utterance_boundary_tokens:
+                    sample_alignments = add_utterance_boundary_alignments(
                         sample_alignments,
                         audio_duration_secs=duration_secs,
                         start_token=self.cfg.utterance_start_token,
@@ -1506,16 +2066,14 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
                         start_delay_frames=self.cfg.utterance_start_boundary_delay_frames,
                         end_delay_frames=self.cfg.utterance_end_boundary_delay_frames,
                     )
-                    for sample_alignments, duration_secs in zip(alignments, audio_durations_secs)
-                ]
+                resolved_alignments.append(sample_alignments)
+            alignments = resolved_alignments
 
-            system_prompts = [cut.custom.get(self.cfg.prompt_field, self.cfg.system_prompt) for cut in cuts]
+            system_prompts = [(cut.custom or {}).get(self.cfg.prompt_field, self.cfg.system_prompt) for cut in cuts]
 
         if self.cfg.enable_agent_backchannels:
             merged_alignments = []
-            for cut, sample_alignments, clip_duration_secs in zip(
-                cuts, alignments, clip_audio_durations_secs
-            ):
+            for cut, sample_alignments, clip_duration_secs in zip(cuts, alignments, clip_audio_durations_secs):
                 cut_id = str(getattr(cut, "id", "<unknown>"))
                 backchannels = build_agent_backchannel_alignments(
                     cut.custom or {},
@@ -1560,6 +2118,7 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
 
         all_input_ids = []
         all_target_ids = []
+        all_boundary_turn_ordinals = []
 
         for sample_idx, messages in enumerate(batch_messages):
             # Tokenize and compute assistant content mask.
@@ -1623,6 +2182,8 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
                     assistant_mask,
                     self.tokenizer,
                     self.blank_id,
+                    sou_id=self._sou_id,
+                    eou_id=self._eou_id,
                     transcript=text[sample_idx],
                     do_breakpoint=debug_breakpoint,
                 )
@@ -1638,17 +2199,39 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
                     next_is_audio = i + 1 < len(input_ids) and input_ids[i + 1] == AUDIO_TOKEN_IDX
                     target_ids[i] = self.blank_id if next_is_audio else user_footer_id
 
+            boundary_turn_ordinals = [0] * len(target_ids)
+            multiturn_sample = multiturn_samples[sample_idx]
+            if multiturn_sample is not None:
+                sou_ordinal = 0
+                eou_ordinal = 0
+                for target_idx, target_id in enumerate(target_ids):
+                    if target_id == self._sou_id:
+                        sou_ordinal += 1
+                        boundary_turn_ordinals[target_idx] = sou_ordinal
+                    elif target_id == self._eou_id:
+                        eou_ordinal += 1
+                        boundary_turn_ordinals[target_idx] = eou_ordinal
+                expected_turns = multiturn_sample.num_substantive_turns
+                if sou_ordinal != expected_turns or eou_ordinal != expected_turns:
+                    raise RuntimeError(
+                        f"Multi-turn sample {sample_idx} produced SOU/EOU counts "
+                        f"{sou_ordinal}/{eou_ordinal}; expected {expected_turns}/{expected_turns}"
+                    )
+
             all_input_ids.append(torch.tensor(input_ids, dtype=torch.long))
             all_target_ids.append(torch.tensor(target_ids, dtype=torch.long))
+            all_boundary_turn_ordinals.append(torch.tensor(boundary_turn_ordinals, dtype=torch.long))
 
         if self.cfg.chunk_size >= 0:  # fixed chunking or dynamic chunking: right-pad
             input_tokens = right_collate_vectors(all_input_ids, padding_value=self.tokenizer.pad_id)
             target_tokens = right_collate_vectors(all_target_ids, padding_value=IGNORE_INDEX)
+            boundary_turn_ordinals = right_collate_vectors(all_boundary_turn_ordinals, padding_value=0)
             input_token_lens = torch.tensor([len(ids) for ids in all_input_ids], dtype=torch.long)
             target_token_lens = torch.tensor([len(ids) for ids in all_target_ids], dtype=torch.long)
         else:  # offline mode: left-pad
             input_tokens = left_collate_vectors(all_input_ids, padding_value=self.tokenizer.pad_id)
             target_tokens = left_collate_vectors(all_target_ids, padding_value=IGNORE_INDEX)
+            boundary_turn_ordinals = left_collate_vectors(all_boundary_turn_ordinals, padding_value=0)
             # length is the same size as input_tokens.shape[1] since they're left-padded
             input_token_lens = torch.tensor(
                 [input_tokens.shape[1] for _ in range(len(all_input_ids))], dtype=torch.long
@@ -1665,4 +2248,7 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             target_tokens=target_tokens,
             target_token_lens=target_token_lens,
             text=text,
+            is_multiturn=is_multiturn,
+            num_substantive_turns=num_substantive_turns,
+            boundary_turn_ordinals=boundary_turn_ordinals,
         )
