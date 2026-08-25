@@ -954,9 +954,9 @@ class TestTranscriptPreservation:
             transcript="she said good night",
         )
         asst = [m["content"] for m in msgs if m["role"] == "assistant"]
-        # Trailing space is excluded because preserve_leading_whitespace=True
-        #  ensures correct concatenation when turns are joined.
-        assert asst[0] == "said good"
+        # The transcript prefix is unaligned, so GPT-style leading-whitespace
+        # preservation attaches its separator to the first aligned word.
+        assert asst[0] == " said good"
 
     def test_without_transcript_falls_back(self):
         """Without transcript, words are joined with plain space."""
@@ -2500,8 +2500,9 @@ class TestDynamicChunking:
             transcript="Hello, World!",
         )
         asst_msgs = [m for m in msgs if m["role"] == "assistant"]
-        assert asst_msgs[0]["content"] == "Hello, "
-        assert asst_msgs[1]["content"] == "World!"
+        assert asst_msgs[0]["content"] == "Hello,"
+        assert asst_msgs[1]["content"] == " World!"
+        assert "".join(msg["content"] for msg in asst_msgs) == "Hello, World!"
 
     def test_with_delay(self):
         """Delay frames shift chunk boundaries."""
@@ -2645,8 +2646,9 @@ class TestWordsPerChunk:
             words_per_group=2,
         )
         asst = [m["content"] for m in msgs if m["role"] == "assistant"]
-        assert asst[0] == "Hello, World! "  # preserve_trailing_whitespace includes trailing space
-        assert asst[1] == "How?"
+        assert asst[0] == "Hello, World!"
+        assert asst[1] == " How?"
+        assert "".join(asst) == "Hello, World! How?"
 
 
 class TestDynamicChunkTargets:
