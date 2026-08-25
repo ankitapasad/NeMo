@@ -51,8 +51,14 @@ UTTERANCE_BOUNDARY_TIMESTAMP_SOURCES = {
 }
 LEAN_MULTI_TURN_SCHEMA_VERSION = "lean_multi_turn_v2"
 LEAN_MULTI_TURN_SOURCE_SAMPLE_TYPES = {"complete_turn", "pause_within_turn"}
-TARGET_BACKCHANNEL_MODE_IGNORE = "ignore"
-TARGET_BACKCHANNEL_MODES = {TARGET_BACKCHANNEL_MODE_IGNORE}
+USER_BACKCHANNEL_MODE_IGNORE = "ignore"
+USER_BACKCHANNEL_MODE_SOB_EOU = "sob_eou"
+USER_BACKCHANNEL_MODE_SOB_EOB = "sob_eob"
+USER_BACKCHANNEL_MODES = {
+    USER_BACKCHANNEL_MODE_IGNORE,
+    USER_BACKCHANNEL_MODE_SOB_EOU,
+    USER_BACKCHANNEL_MODE_SOB_EOB,
+}
 
 
 @dataclass(frozen=True)
@@ -62,10 +68,11 @@ class MultiTurnTargetSegment:
     text: str
     start_time: float
     end_time: float
-    turn_ordinal: int
+    turn_ordinal: int = 0
     turn_id: str | None = None
     source_sample_id: str | None = None
     source_sample_type: str | None = None
+    user_backchannel_event_id: int = 0
 
 
 @dataclass(frozen=True)
@@ -76,6 +83,7 @@ class MultiTurnSample:
     transcript: str
     segments: tuple[MultiTurnTargetSegment, ...]
     num_substantive_turns: int
+    num_user_backchannel_events: int
 
 
 def _require_mapping(value: Any, *, field: str, cut_id: str) -> Mapping[str, Any]:
@@ -102,17 +110,18 @@ def parse_lean_multiturn_metadata(
     *,
     audio_duration_secs: float,
     cut_id: str = "<unknown>",
-    target_backchannel_mode: str = TARGET_BACKCHANNEL_MODE_IGNORE,
+    user_backchannel_mode: str = USER_BACKCHANNEL_MODE_IGNORE,
 ) -> MultiTurnSample | None:
     """Parse a supported lean multi-turn row without synthesizing conversations.
 
     Substantive components map one-for-one, in order, to ``utterance_regions``.
-    Target-speaker backchannels are validated but omitted from training targets.
+    User backchannels are omitted in ``ignore`` mode. Boundary modes
+    retain each annotated fragment as one distinct chronological event.
     """
-    if target_backchannel_mode not in TARGET_BACKCHANNEL_MODES:
+    if user_backchannel_mode not in USER_BACKCHANNEL_MODES:
         raise ValueError(
-            f"target_backchannel_mode must be one of {sorted(TARGET_BACKCHANNEL_MODES)}; "
-            f"got {target_backchannel_mode!r}"
+            f"user_backchannel_mode must be one of {sorted(USER_BACKCHANNEL_MODES)}; "
+            f"got {user_backchannel_mode!r}"
         )
     if custom is None:
         return None
@@ -198,6 +207,7 @@ def parse_lean_multiturn_metadata(
     segments: list[MultiTurnTargetSegment] = []
     transcript_pieces: list[str] = []
     complete_idx = 0
+    user_backchannel_event_idx = 0
     previous_component_start = -math.inf
     for component_idx, raw_component in enumerate(components):
         prefix = f"curation.target.components[{component_idx}]"
@@ -263,12 +273,29 @@ def parse_lean_multiturn_metadata(
                     source_sample_type=region["source_sample_type"],
                 )
             )
-    segments.sort(key=lambda segment: (segment.start_time, segment.end_time))
+        elif user_backchannel_mode in {
+            USER_BACKCHANNEL_MODE_SOB_EOU,
+            USER_BACKCHANNEL_MODE_SOB_EOB,
+        }:
+            for start, end, text in validated_fragments:
+                user_backchannel_event_idx += 1
+                transcript_pieces.append(text)
+                segments.append(
+                    MultiTurnTargetSegment(
+                        text=text,
+                        start_time=start,
+                        end_time=end,
+                        user_backchannel_event_id=user_backchannel_event_idx,
+                    )
+                )
+
+    segments.sort(key=lambda segment: (segment.start_time, segment.end_time, segment.turn_ordinal == 0))
     return MultiTurnSample(
         schema_version=schema_version,
         transcript=" ".join(transcript_pieces),
         segments=tuple(segments),
         num_substantive_turns=len(validated_regions),
+        num_user_backchannel_events=user_backchannel_event_idx,
     )
 
 
@@ -398,6 +425,10 @@ class StreamingSTTBatch:
         is_multiturn: (B,) row-local lean-multi-turn indicator.
         num_substantive_turns: (B,) number of substantive target turns in each row.
         boundary_turn_ordinals: (B, L) substantive turn ordinal at SOU/EOU targets, else zero.
+        user_backchannel_event_ids: (B, L) user backchannel event ID at SOB/closing-marker targets, else zero.
+        user_backchannel_reference_frames: (B, L) annotated fragment boundary frame at SOB/closing-marker
+            targets, else -1.
+        num_user_backchannel_events: (B,) number of enabled user-backchannel events in each row.
         cuts: Optional[CutSet] containing the cuts for the batch.
     """
 
@@ -411,6 +442,9 @@ class StreamingSTTBatch:
     is_multiturn: Optional[torch.Tensor] = None
     num_substantive_turns: Optional[torch.Tensor] = None
     boundary_turn_ordinals: Optional[torch.Tensor] = None
+    user_backchannel_event_ids: Optional[torch.Tensor] = None
+    user_backchannel_reference_frames: Optional[torch.Tensor] = None
+    num_user_backchannel_events: Optional[torch.Tensor] = None
     cuts: Optional[CutSet] = None
 
 
@@ -447,9 +481,13 @@ class StreamingSTTDataConfig:
     agent_backchannel_start_token: str = "<soab>"
     agent_backchannel_end_token: str = "<eoab>"
     agent_backchannel_delay_frames: int = 0
-    # Compatibility field for row-local target-speaker backchannels. Only
-    # "ignore" is supported: target backchannels never become training text.
-    target_backchannel_mode: str = TARGET_BACKCHANNEL_MODE_IGNORE
+    # Row-local user backchannels from supported lean multi-turn metadata.
+    # Boundary modes emit <sob> text followed by shared <eou> or dedicated <eob>.
+    user_backchannel_mode: str = USER_BACKCHANNEL_MODE_IGNORE
+    user_backchannel_start_token: str = "<sob>"
+    user_backchannel_end_token: str = "<eob>"
+    user_backchannel_start_delay_frames: int = 4
+    user_backchannel_end_delay_frames: int = 2
     # Symmetric acoustic context supplied to the online forced aligner around
     # each lean multi-turn substantive region. This does not move the
     # authoritative manifest SOU/EOU timestamps.
@@ -473,11 +511,40 @@ class StreamingSTTDataConfig:
                 raise ValueError("agent backchannel tokens must be non-empty")
             if self.agent_backchannel_start_token == self.agent_backchannel_end_token:
                 raise ValueError("agent backchannel start and end tokens must be different")
-        if self.target_backchannel_mode not in TARGET_BACKCHANNEL_MODES:
+        if self.user_backchannel_mode not in USER_BACKCHANNEL_MODES:
             raise ValueError(
-                f"target_backchannel_mode must be one of {sorted(TARGET_BACKCHANNEL_MODES)}; "
-                f"got {self.target_backchannel_mode!r}"
+                f"user_backchannel_mode must be one of {sorted(USER_BACKCHANNEL_MODES)}; "
+                f"got {self.user_backchannel_mode!r}"
             )
+        if self.user_backchannel_start_delay_frames < 0:
+            raise ValueError("user_backchannel_start_delay_frames must be non-negative")
+        if self.user_backchannel_end_delay_frames < 0:
+            raise ValueError("user_backchannel_end_delay_frames must be non-negative")
+        if self.user_backchannel_mode in {
+            USER_BACKCHANNEL_MODE_SOB_EOU,
+            USER_BACKCHANNEL_MODE_SOB_EOB,
+        }:
+            if not self.add_utterance_boundary_tokens:
+                raise ValueError(
+                    f"user_backchannel_mode={self.user_backchannel_mode!r} requires "
+                    "add_utterance_boundary_tokens=True"
+                )
+            if not self.user_backchannel_start_token:
+                raise ValueError("user_backchannel_start_token must be non-empty in boundary modes")
+            if self.user_backchannel_start_token in {
+                self.utterance_start_token,
+                self.utterance_end_token,
+            }:
+                raise ValueError("user backchannel SOB must differ from SOU and EOU")
+        if self.user_backchannel_mode == USER_BACKCHANNEL_MODE_SOB_EOB:
+            if not self.user_backchannel_end_token:
+                raise ValueError("user_backchannel_end_token must be non-empty in sob_eob mode")
+            if self.user_backchannel_end_token in {
+                self.utterance_start_token,
+                self.utterance_end_token,
+                self.user_backchannel_start_token,
+            }:
+                raise ValueError("user backchannel EOB must differ from SOU, EOU, and SOB")
         if (
             isinstance(self.multiturn_forced_alignment_buffer_s, bool)
             or not isinstance(self.multiturn_forced_alignment_buffer_s, Real)
@@ -887,15 +954,20 @@ def build_lean_multiturn_alignments(
     end_token: str,
     start_delay_frames: int,
     end_delay_frames: int,
+    user_backchannel_start_token: str | None = None,
+    user_backchannel_end_token: str | None = None,
+    user_backchannel_start_delay_frames: int = 4,
+    user_backchannel_end_delay_frames: int = 2,
     cut_id: str = "<unknown>",
 ) -> List[WordAlignment]:
-    """Select each substantive turn's words and wrap it with SOU/EOU.
+    """Select target words and add the configured per-segment boundaries.
 
     A word belongs to the first substantive region containing its midpoint and
     is consumed at most once. Words whose midpoints lie outside every region
     are omitted. A non-empty turn with no selected word alignment is rejected.
-    Selected word endpoints are then clamped to the authoritative region by
-    :func:`add_gt_utterance_boundary_alignments`.
+    Substantive turns use SOU/EOU. User-backchannel words inherit the default text
+    delay and each annotated fragment stays atomic as SOB, words, then the
+    configured EOU or EOB marker.
     """
     if not alignments and sample.transcript:
         raise ValueError(f"Cut {cut_id!r} has a non-empty lean multi-turn transcript but no usable word alignments")
@@ -924,20 +996,117 @@ def build_lean_multiturn_alignments(
                 f"Cut {cut_id!r} target segment {segment_idx} ({segment.text!r}) has no usable word alignments"
             )
 
-        segment_alignments = add_gt_utterance_boundary_alignments(
-            segment_alignments,
-            utterance_start_time=segment.start_time,
-            utterance_end_time=segment.end_time,
-            audio_duration_secs=audio_duration_secs,
-            start_token=start_token,
-            end_token=end_token,
-            start_delay_frames=start_delay_frames,
-            end_delay_frames=end_delay_frames,
-            cut_id=cut_id,
-        )
+        if segment.turn_ordinal:
+            segment_alignments = add_gt_utterance_boundary_alignments(
+                segment_alignments,
+                utterance_start_time=segment.start_time,
+                utterance_end_time=segment.end_time,
+                audio_duration_secs=audio_duration_secs,
+                start_token=start_token,
+                end_token=end_token,
+                start_delay_frames=start_delay_frames,
+                end_delay_frames=end_delay_frames,
+                cut_id=cut_id,
+            )
+        elif user_backchannel_start_token is not None and user_backchannel_end_token is not None:
+            segment_alignments = [
+                WordAlignment(
+                    text=alignment.text,
+                    start_time=min(max(alignment.start_time, segment.start_time), segment.end_time),
+                    end_time=min(max(alignment.end_time, segment.start_time), segment.end_time),
+                    delay_frames=None,
+                )
+                for alignment in segment_alignments
+            ]
+            segment_alignments = [
+                WordAlignment(
+                    user_backchannel_start_token,
+                    segment.start_time,
+                    segment.start_time,
+                    delay_frames=user_backchannel_start_delay_frames,
+                ),
+                *segment_alignments,
+                WordAlignment(
+                    user_backchannel_end_token,
+                    segment.end_time,
+                    segment.end_time,
+                    delay_frames=user_backchannel_end_delay_frames,
+                ),
+            ]
+        else:
+            segment_alignments = [
+                WordAlignment(
+                    text=alignment.text,
+                    start_time=min(max(alignment.start_time, segment.start_time), segment.end_time),
+                    end_time=min(max(alignment.end_time, segment.start_time), segment.end_time),
+                    delay_frames=None,
+                )
+                for alignment in segment_alignments
+            ]
         resolved.extend(segment_alignments)
 
     return resolved
+
+
+def build_multiturn_marker_metadata(
+    target_ids: list[int],
+    sample: MultiTurnSample,
+    *,
+    sou_id: int,
+    eou_id: int,
+    sob_id: int | None,
+    user_backchannel_end_id: int | None,
+    frame_length_in_secs: float,
+    sample_idx: int = 0,
+) -> tuple[list[int], list[int], list[int]]:
+    """Map emitted marker targets to substantive ordinals and user-backchannel events.
+
+    User-backchannel reference frames come directly from annotated fragment
+    boundaries, not word alignments or delayed target positions.
+    """
+    expected_markers: list[tuple[int, int, int, int]] = []
+    for segment in sample.segments:
+        start_reference_frame = math.ceil(segment.start_time / frame_length_in_secs)
+        end_reference_frame = math.ceil(segment.end_time / frame_length_in_secs)
+        if segment.turn_ordinal:
+            expected_markers.extend(
+                [
+                    (sou_id, segment.turn_ordinal, 0, -1),
+                    (eou_id, segment.turn_ordinal, 0, -1),
+                ]
+            )
+        elif sob_id is not None and user_backchannel_end_id is not None:
+            expected_markers.extend(
+                [
+                    (sob_id, 0, segment.user_backchannel_event_id, start_reference_frame),
+                    (user_backchannel_end_id, 0, segment.user_backchannel_event_id, end_reference_frame),
+                ]
+            )
+
+    marker_token_ids = {sou_id, eou_id}
+    if sob_id is not None:
+        marker_token_ids.add(sob_id)
+    if user_backchannel_end_id is not None:
+        marker_token_ids.add(user_backchannel_end_id)
+    marker_indices = [idx for idx, token_id in enumerate(target_ids) if token_id in marker_token_ids]
+    actual_markers = [target_ids[idx] for idx in marker_indices]
+    expected_token_ids = [marker[0] for marker in expected_markers]
+    if actual_markers != expected_token_ids:
+        raise RuntimeError(
+            f"Multi-turn sample {sample_idx} produced marker sequence {actual_markers}; "
+            f"expected {expected_token_ids}"
+        )
+
+    boundary_turn_ordinals = [0] * len(target_ids)
+    user_backchannel_event_ids = [0] * len(target_ids)
+    user_backchannel_reference_frames = [-1] * len(target_ids)
+    for target_idx, (_, turn_ordinal, event_id, reference_frame) in zip(
+        marker_indices, expected_markers
+    ):
+        boundary_turn_ordinals[target_idx] = turn_ordinal
+        user_backchannel_event_ids[target_idx] = event_id
+        user_backchannel_reference_frames[target_idx] = reference_frame
+    return boundary_turn_ordinals, user_backchannel_event_ids, user_backchannel_reference_frames
 
 
 def _append_alignment_text(
@@ -1707,6 +1876,9 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
 
         self._sou_id = None
         self._eou_id = None
+        self._sob_id = None
+        self._eob_id = None
+        self._user_backchannel_end_id = None
         if self.cfg.add_utterance_boundary_tokens:
             sou_ids = self.tokenizer.tokenizer.encode(self.cfg.utterance_start_token, add_special_tokens=False)
             eou_ids = self.tokenizer.tokenizer.encode(self.cfg.utterance_end_token, add_special_tokens=False)
@@ -1717,6 +1889,32 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
                     f"{self.cfg.utterance_end_token!r}->{eou_ids}"
                 )
             self._sou_id, self._eou_id = sou_ids[0], eou_ids[0]
+        if self.cfg.user_backchannel_mode in {
+            USER_BACKCHANNEL_MODE_SOB_EOU,
+            USER_BACKCHANNEL_MODE_SOB_EOB,
+        }:
+            sob_ids = self.tokenizer.tokenizer.encode(
+                self.cfg.user_backchannel_start_token, add_special_tokens=False
+            )
+            if len(sob_ids) != 1:
+                raise ValueError(
+                    "user backchannel start marker must encode to one token; "
+                    f"got {self.cfg.user_backchannel_start_token!r}->{sob_ids}"
+                )
+            self._sob_id = sob_ids[0]
+            if self.cfg.user_backchannel_mode == USER_BACKCHANNEL_MODE_SOB_EOU:
+                self._user_backchannel_end_id = self._eou_id
+            else:
+                eob_ids = self.tokenizer.tokenizer.encode(
+                    self.cfg.user_backchannel_end_token, add_special_tokens=False
+                )
+                if len(eob_ids) != 1:
+                    raise ValueError(
+                        "user backchannel end marker must encode to one token; "
+                        f"got {self.cfg.user_backchannel_end_token!r}->{eob_ids}"
+                    )
+                self._eob_id = eob_ids[0]
+                self._user_backchannel_end_id = self._eob_id
 
     def _get_multiturn_samples(
         self,
@@ -1731,7 +1929,7 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
                     cut.custom or {},
                     audio_duration_secs=duration_secs,
                     cut_id=cut_id,
-                    target_backchannel_mode=self.cfg.target_backchannel_mode,
+                    user_backchannel_mode=self.cfg.user_backchannel_mode,
                 )
             )
         return samples
@@ -1762,6 +1960,8 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
         ``multiturn_forced_alignment_buffer_s`` of real audio on either side,
         clipped to the sample bounds. The buffer supplies acoustic context only;
         manifest region starts and ends remain the authoritative SOU/EOU times.
+        User-backchannel fragments use their exact annotated spans so their metadata
+        remains an atomic fallback when the forced aligner cannot resolve them.
         Returned turn-local word timestamps are shifted back into coordinates of
         the complete sampled clip.
         """
@@ -1772,7 +1972,7 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
         alignment_audios: list[torch.Tensor] = []
         alignment_lens: list[int] = []
         alignment_text: list[str] = []
-        owners: list[tuple[int, float]] = []
+        owners: list[tuple[int, float, str, MultiTurnTargetSegment | None]] = []
         alignment_buffer_samples = round(self.cfg.multiturn_forced_alignment_buffer_s * self.cfg.sample_rate)
         for sample_idx, (cut, sample, transcript) in enumerate(zip(cuts, multiturn_samples, resolved_text)):
             cut_id = str(getattr(cut, "id", "<unknown>"))
@@ -1781,20 +1981,24 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
                 alignment_audios.append(audios[sample_idx, :sample_num_samples])
                 alignment_lens.append(sample_num_samples)
                 alignment_text.append(transcript)
-                owners.append((sample_idx, 0.0))
+                owners.append((sample_idx, 0.0, cut_id, None))
                 continue
 
             for segment in sample.segments:
                 region_start_sample = round(segment.start_time * self.cfg.sample_rate)
                 region_end_sample = round(segment.end_time * self.cfg.sample_rate)
-                start_sample = max(0, region_start_sample - alignment_buffer_samples)
-                end_sample = min(sample_num_samples, region_end_sample + alignment_buffer_samples)
+                if segment.user_backchannel_event_id:
+                    start_sample = max(0, region_start_sample)
+                    end_sample = min(sample_num_samples, region_end_sample)
+                else:
+                    start_sample = max(0, region_start_sample - alignment_buffer_samples)
+                    end_sample = min(sample_num_samples, region_end_sample + alignment_buffer_samples)
                 if end_sample <= start_sample:
                     raise ValueError(f"Cut {cut_id!r} target segment {segment.text!r} has no audio samples")
                 alignment_audios.append(audios[sample_idx, start_sample:end_sample])
                 alignment_lens.append(end_sample - start_sample)
                 alignment_text.append(segment.text)
-                owners.append((sample_idx, start_sample / self.cfg.sample_rate))
+                owners.append((sample_idx, start_sample / self.cfg.sample_rate, cut_id, segment))
 
         if not alignment_audios:
             return [[] for _ in text]
@@ -1808,7 +2012,46 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             )
 
         batch_alignments: list[list[WordAlignment]] = [[] for _ in text]
-        for segment_alignments, (sample_idx, offset_secs) in zip(flat_alignments, owners):
+        for segment_alignments, (sample_idx, offset_secs, cut_id, segment) in zip(flat_alignments, owners):
+            if segment is not None and segment.user_backchannel_event_id:
+                # Very short user backchannels (for example, "Mm.") can be
+                # unalignable or receive a nonempty forced-alignment result
+                # whose timestamps fall outside the fragment. Their confirmed
+                # metadata supplies authoritative text and fragment boundaries.
+                # Keep substantive turns strict, but preserve an unusable
+                # backchannel result as one atomic annotated alignment.
+                fragment_duration = segment.end_time - segment.start_time
+                usable_user_backchannel_result = bool(segment_alignments)
+                for alignment in segment_alignments:
+                    start = alignment.start_time
+                    end = alignment.end_time
+                    usable_user_backchannel_result = usable_user_backchannel_result and (
+                        isinstance(start, Real)
+                        and not isinstance(start, bool)
+                        and math.isfinite(float(start))
+                        and isinstance(end, Real)
+                        and not isinstance(end, bool)
+                        and math.isfinite(float(end))
+                        and 0.0 <= float(start) <= float(end)
+                        and float(end) <= fragment_duration + 1e-6
+                        and (float(start) + float(end)) / 2 <= fragment_duration + 1e-6
+                    )
+                if not usable_user_backchannel_result:
+                    logging.warning(
+                        "Cut %r user backchannel event %d (%r) produced no usable forced alignment "
+                        "from %d returned entries; using its annotated fragment timing",
+                        cut_id,
+                        segment.user_backchannel_event_id,
+                        segment.text,
+                        len(segment_alignments),
+                    )
+                    segment_alignments = [
+                        WordAlignment(
+                            text=segment.text,
+                            start_time=0.0,
+                            end_time=fragment_duration,
+                        )
+                    ]
             batch_alignments[sample_idx].extend(
                 WordAlignment(
                     text=alignment.text,
@@ -1841,6 +2084,10 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             [sample.num_substantive_turns if sample is not None else 0 for sample in multiturn_samples],
             dtype=torch.long,
         )
+        num_user_backchannel_events = torch.tensor(
+            [sample.num_user_backchannel_events if sample is not None else 0 for sample in multiturn_samples],
+            dtype=torch.long,
+        )
 
         if self.defer_get_batch:
             return StreamingSTTBatch(
@@ -1850,6 +2097,7 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
                 text=text,
                 is_multiturn=is_multiturn,
                 num_substantive_turns=num_substantive_turns,
+                num_user_backchannel_events=num_user_backchannel_events,
             )
 
         alignments = get_word_alignments_for_batch(cuts)
@@ -1873,6 +2121,10 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
         is_multiturn = torch.tensor([sample is not None for sample in multiturn_samples], dtype=torch.bool)
         num_substantive_turns = torch.tensor(
             [sample.num_substantive_turns if sample is not None else 0 for sample in multiturn_samples],
+            dtype=torch.long,
+        )
+        num_user_backchannel_events = torch.tensor(
+            [sample.num_user_backchannel_events if sample is not None else 0 for sample in multiturn_samples],
             dtype=torch.long,
         )
 
@@ -1992,6 +2244,21 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
                             end_token=self.cfg.utterance_end_token,
                             start_delay_frames=self.cfg.utterance_start_boundary_delay_frames,
                             end_delay_frames=self.cfg.utterance_end_boundary_delay_frames,
+                            user_backchannel_start_token=(
+                                self.cfg.user_backchannel_start_token
+                                if self.cfg.user_backchannel_mode
+                                in {USER_BACKCHANNEL_MODE_SOB_EOU, USER_BACKCHANNEL_MODE_SOB_EOB}
+                                else None
+                            ),
+                            user_backchannel_end_token=(
+                                self.cfg.utterance_end_token
+                                if self.cfg.user_backchannel_mode == USER_BACKCHANNEL_MODE_SOB_EOU
+                                else self.cfg.user_backchannel_end_token
+                                if self.cfg.user_backchannel_mode == USER_BACKCHANNEL_MODE_SOB_EOB
+                                else None
+                            ),
+                            user_backchannel_start_delay_frames=self.cfg.user_backchannel_start_delay_frames,
+                            user_backchannel_end_delay_frames=self.cfg.user_backchannel_end_delay_frames,
                             cut_id=cut_id,
                         )
                     )
@@ -2055,6 +2322,21 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
                         end_token=self.cfg.utterance_end_token,
                         start_delay_frames=self.cfg.utterance_start_boundary_delay_frames,
                         end_delay_frames=self.cfg.utterance_end_boundary_delay_frames,
+                        user_backchannel_start_token=(
+                            self.cfg.user_backchannel_start_token
+                            if self.cfg.user_backchannel_mode
+                            in {USER_BACKCHANNEL_MODE_SOB_EOU, USER_BACKCHANNEL_MODE_SOB_EOB}
+                            else None
+                        ),
+                        user_backchannel_end_token=(
+                            self.cfg.utterance_end_token
+                            if self.cfg.user_backchannel_mode == USER_BACKCHANNEL_MODE_SOB_EOU
+                            else self.cfg.user_backchannel_end_token
+                            if self.cfg.user_backchannel_mode == USER_BACKCHANNEL_MODE_SOB_EOB
+                            else None
+                        ),
+                        user_backchannel_start_delay_frames=self.cfg.user_backchannel_start_delay_frames,
+                        user_backchannel_end_delay_frames=self.cfg.user_backchannel_end_delay_frames,
                         cut_id=str(getattr(cut, "id", "<unknown>")),
                     )
                 elif self.cfg.add_utterance_boundary_tokens:
@@ -2119,6 +2401,8 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
         all_input_ids = []
         all_target_ids = []
         all_boundary_turn_ordinals = []
+        all_user_backchannel_event_ids = []
+        all_user_backchannel_reference_frames = []
 
         for sample_idx, messages in enumerate(batch_messages):
             # Tokenize and compute assistant content mask.
@@ -2200,38 +2484,51 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
                     target_ids[i] = self.blank_id if next_is_audio else user_footer_id
 
             boundary_turn_ordinals = [0] * len(target_ids)
+            user_backchannel_event_ids = [0] * len(target_ids)
+            user_backchannel_reference_frames = [-1] * len(target_ids)
             multiturn_sample = multiturn_samples[sample_idx]
             if multiturn_sample is not None:
-                sou_ordinal = 0
-                eou_ordinal = 0
-                for target_idx, target_id in enumerate(target_ids):
-                    if target_id == self._sou_id:
-                        sou_ordinal += 1
-                        boundary_turn_ordinals[target_idx] = sou_ordinal
-                    elif target_id == self._eou_id:
-                        eou_ordinal += 1
-                        boundary_turn_ordinals[target_idx] = eou_ordinal
-                expected_turns = multiturn_sample.num_substantive_turns
-                if sou_ordinal != expected_turns or eou_ordinal != expected_turns:
-                    raise RuntimeError(
-                        f"Multi-turn sample {sample_idx} produced SOU/EOU counts "
-                        f"{sou_ordinal}/{eou_ordinal}; expected {expected_turns}/{expected_turns}"
-                    )
+                (
+                    boundary_turn_ordinals,
+                    user_backchannel_event_ids,
+                    user_backchannel_reference_frames,
+                ) = build_multiturn_marker_metadata(
+                    target_ids,
+                    multiturn_sample,
+                    sou_id=self._sou_id,
+                    eou_id=self._eou_id,
+                    sob_id=self._sob_id,
+                    user_backchannel_end_id=self._user_backchannel_end_id,
+                    frame_length_in_secs=self.cfg.frame_length_in_secs,
+                    sample_idx=sample_idx,
+                )
 
             all_input_ids.append(torch.tensor(input_ids, dtype=torch.long))
             all_target_ids.append(torch.tensor(target_ids, dtype=torch.long))
             all_boundary_turn_ordinals.append(torch.tensor(boundary_turn_ordinals, dtype=torch.long))
+            all_user_backchannel_event_ids.append(torch.tensor(user_backchannel_event_ids, dtype=torch.long))
+            all_user_backchannel_reference_frames.append(
+                torch.tensor(user_backchannel_reference_frames, dtype=torch.long)
+            )
 
         if self.cfg.chunk_size >= 0:  # fixed chunking or dynamic chunking: right-pad
             input_tokens = right_collate_vectors(all_input_ids, padding_value=self.tokenizer.pad_id)
             target_tokens = right_collate_vectors(all_target_ids, padding_value=IGNORE_INDEX)
             boundary_turn_ordinals = right_collate_vectors(all_boundary_turn_ordinals, padding_value=0)
+            user_backchannel_event_ids = right_collate_vectors(all_user_backchannel_event_ids, padding_value=0)
+            user_backchannel_reference_frames = right_collate_vectors(
+                all_user_backchannel_reference_frames, padding_value=-1
+            )
             input_token_lens = torch.tensor([len(ids) for ids in all_input_ids], dtype=torch.long)
             target_token_lens = torch.tensor([len(ids) for ids in all_target_ids], dtype=torch.long)
         else:  # offline mode: left-pad
             input_tokens = left_collate_vectors(all_input_ids, padding_value=self.tokenizer.pad_id)
             target_tokens = left_collate_vectors(all_target_ids, padding_value=IGNORE_INDEX)
             boundary_turn_ordinals = left_collate_vectors(all_boundary_turn_ordinals, padding_value=0)
+            user_backchannel_event_ids = left_collate_vectors(all_user_backchannel_event_ids, padding_value=0)
+            user_backchannel_reference_frames = left_collate_vectors(
+                all_user_backchannel_reference_frames, padding_value=-1
+            )
             # length is the same size as input_tokens.shape[1] since they're left-padded
             input_token_lens = torch.tensor(
                 [input_tokens.shape[1] for _ in range(len(all_input_ids))], dtype=torch.long
@@ -2251,4 +2548,7 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             is_multiturn=is_multiturn,
             num_substantive_turns=num_substantive_turns,
             boundary_turn_ordinals=boundary_turn_ordinals,
+            user_backchannel_event_ids=user_backchannel_event_ids,
+            user_backchannel_reference_frames=user_backchannel_reference_frames,
+            num_user_backchannel_events=num_user_backchannel_events,
         )

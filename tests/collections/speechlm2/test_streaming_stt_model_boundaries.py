@@ -41,6 +41,13 @@ class _FakeTokenizer:
     def text_to_ids(self, token):
         return [self.vocab[token]]
 
+    def encode(self, token, add_special_tokens=False):
+        return self.text_to_ids(token)
+
+    def ids_to_tokens(self, token_ids):
+        inverse = {token_id: token for token, token_id in self.vocab.items()}
+        return [inverse[token_id] for token_id in token_ids]
+
     def add_special_tokens(self, special_tokens_dict):
         tokens = list(special_tokens_dict["additional_special_tokens"])
         self.added_batches.append(tokens)
@@ -106,6 +113,18 @@ def test_multiturn_dashboard_suppresses_legacy_boundary_collar_metrics_by_defaul
     explicit_historical_cfg["log_legacy_boundary_collar_metrics"] = True
     cfg = streaming_stt_model.StreamingSTTModelConfig(**explicit_historical_cfg)
     assert cfg.log_legacy_boundary_collar_metrics is True
+
+
+def test_boundary_token_info_defaults_missing_user_backchannel_mode_to_ignore():
+    """Legacy inference collector fakes need not define the new optional mode."""
+    legacy_model = SimpleNamespace(
+        core_cfg=SimpleNamespace(
+            add_utterance_boundary_tokens=False,
+            enable_agent_backchannels=False,
+        )
+    )
+
+    assert streaming_stt_model.StreamingSTTModel._get_boundary_token_info(legacy_model) == {}
 
 
 def test_model_rejects_per_sample_boundaries_without_boundary_token_support():
@@ -201,6 +220,82 @@ def test_model_init_adds_agent_backchannel_tokens_only_when_enabled(monkeypatch)
     assert fake_llm.resize_sizes == [2, 4, 6, 8]
     assert model.core_cfg.agent_backchannel_start_loss_weight == 1.0
     assert model.core_cfg.agent_backchannel_end_loss_weight == 1.0
+
+
+def test_model_init_keeps_existing_vocabulary_in_ignore_mode(monkeypatch):
+    fake_tokenizer = _FakeTokenizer()
+    fake_llm = _FakeLLM()
+    monkeypatch.setattr(streaming_stt_model, "AutoTokenizer", lambda *args, **kwargs: fake_tokenizer)
+    monkeypatch.setattr(streaming_stt_model, "load_pretrained_hf", lambda *args, **kwargs: fake_llm)
+    monkeypatch.setattr(streaming_stt_model, "setup_perception", lambda *args, **kwargs: _fake_perception())
+    monkeypatch.setattr(streaming_stt_model, "ModelSummary", lambda *args, **kwargs: "summary")
+
+    streaming_stt_model.StreamingSTTModel(
+        _minimal_cfg(), data_cfg={"user_backchannel_mode": "ignore"}
+    )
+    assert fake_tokenizer.added_batches == [
+        ["<blank>"],
+        ["<sou>", "<eou>"],
+        ["<|text_start|>", "<|text_end|>"],
+    ]
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_tokens", "expected_sizes"),
+    [
+        ("sob_eou", ["<sob>"], [2, 4, 5, 7]),
+        ("sob_eob", ["<sob>", "<eob>"], [2, 4, 6, 8]),
+    ],
+)
+def test_model_init_registers_only_mode_required_user_backchannel_tokens(
+    monkeypatch, mode, expected_tokens, expected_sizes
+):
+    fake_tokenizer = _FakeTokenizer()
+    fake_llm = _FakeLLM()
+    monkeypatch.setattr(streaming_stt_model, "AutoTokenizer", lambda *args, **kwargs: fake_tokenizer)
+    monkeypatch.setattr(streaming_stt_model, "load_pretrained_hf", lambda *args, **kwargs: fake_llm)
+    monkeypatch.setattr(streaming_stt_model, "setup_perception", lambda *args, **kwargs: _fake_perception())
+    monkeypatch.setattr(streaming_stt_model, "ModelSummary", lambda *args, **kwargs: "summary")
+
+    cfg = _minimal_cfg()
+    cfg.update(
+        user_backchannel_mode=mode,
+        user_backchannel_start_token="<sob>",
+        user_backchannel_end_token="<eob>",
+    )
+    model = streaming_stt_model.StreamingSTTModel(
+        cfg,
+        data_cfg={
+            "user_backchannel_mode": mode,
+            "user_backchannel_start_token": "<sob>",
+            "user_backchannel_end_token": "<eob>",
+        },
+    )
+    assert fake_tokenizer.added_batches == [
+        ["<blank>"],
+        ["<sou>", "<eou>"],
+        expected_tokens,
+        ["<|text_start|>", "<|text_end|>"],
+    ]
+    assert fake_llm.resize_sizes == expected_sizes
+    assert model.cfg.user_backchannel_mode == mode
+
+    boundary_types = set(value[0] for value in model._get_boundary_token_info().values())
+    assert {"sou", "eou", "sob"}.issubset(boundary_types)
+    if mode == "sob_eob":
+        assert "eob" in boundary_types
+    else:
+        assert "eob" not in boundary_types
+
+
+def test_model_rejects_user_backchannel_model_data_mismatch():
+    cfg = _minimal_cfg()
+    cfg["user_backchannel_mode"] = "sob_eou"
+    with pytest.raises(ValueError, match="user_backchannel_mode must match"):
+        streaming_stt_model.StreamingSTTModel(
+            cfg,
+            data_cfg={"user_backchannel_mode": "sob_eob"},
+        )
 
 
 def test_model_init_ignores_inactive_agent_backchannel_config_values(monkeypatch):
@@ -375,6 +470,64 @@ def test_weighted_lm_loss_applies_agent_backchannel_marker_weights_only_to_marke
     assert torch.allclose(metrics["loss_eoab"], torch.tensor(3.0))
     assert torch.allclose(metrics["soab_ratio"], torch.tensor(0.25))
     assert torch.allclose(metrics["eoab_ratio"], torch.tensor(0.25))
+
+
+def test_weighted_lm_loss_classifies_shared_eou_and_reports_sob_separately():
+    per_token_loss = torch.tensor([1.0, 2.0, 3.0, 4.0])
+    targets = torch.tensor([20, 11, 11, 13])
+    event_ids = torch.tensor([1, 1, 0, 0])
+
+    loss, metrics = streaming_stt_model._compute_weighted_lm_loss(
+        per_token_loss=per_token_loss,
+        flat_targets=targets,
+        blank_id=99,
+        has_blank=True,
+        blank_loss_weight=1.0,
+        eou_id=11,
+        utterance_end_loss_weight=5.0,
+        sob_id=20,
+        user_backchannel_start_loss_weight=3.0,
+        user_backchannel_event_ids=event_ids,
+    )
+
+    expected = torch.tensor((1.0 * 3.0 + 2.0 * 5.0 + 3.0 * 5.0 + 4.0) / 14.0)
+    assert torch.allclose(loss, expected)
+    assert torch.allclose(metrics["loss_sob"], torch.tensor(1.0))
+    assert torch.allclose(metrics["loss_eou_backchannel"], torch.tensor(2.0))
+    assert torch.allclose(metrics["loss_eou"], torch.tensor(3.0))
+    assert metrics["num_sob_targets"].item() == 1
+    assert metrics["num_eou_backchannel_targets"].item() == 1
+    assert torch.allclose(metrics["eou_ratio"], torch.tensor(0.25))
+    assert torch.allclose(metrics["eou_backchannel_ratio"], torch.tensor(0.25))
+
+
+def test_weighted_lm_loss_applies_independent_sob_and_eob_weights():
+    per_token_loss = torch.tensor([1.0, 2.0, 3.0, 4.0])
+    targets = torch.tensor([20, 21, 11, 13])
+    event_ids = torch.tensor([1, 1, 0, 0])
+
+    loss, metrics = streaming_stt_model._compute_weighted_lm_loss(
+        per_token_loss=per_token_loss,
+        flat_targets=targets,
+        blank_id=99,
+        has_blank=True,
+        blank_loss_weight=1.0,
+        eou_id=11,
+        utterance_end_loss_weight=5.0,
+        sob_id=20,
+        user_backchannel_start_loss_weight=3.0,
+        eob_id=21,
+        user_backchannel_end_loss_weight=5.0,
+        user_backchannel_event_ids=event_ids,
+    )
+
+    expected = torch.tensor((1.0 * 3.0 + 2.0 * 5.0 + 3.0 * 5.0 + 4.0) / 14.0)
+    assert torch.allclose(loss, expected)
+    assert torch.allclose(metrics["loss_sob"], torch.tensor(1.0))
+    assert torch.allclose(metrics["loss_eob"], torch.tensor(2.0))
+    assert torch.allclose(metrics["loss_eou"], torch.tensor(3.0))
+    assert metrics["num_eob_targets"].item() == 1
+    assert "loss_eou_backchannel" not in metrics
 
 
 class _ValidationLogger:

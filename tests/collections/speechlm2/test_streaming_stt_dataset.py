@@ -49,6 +49,7 @@ from nemo.collections.speechlm2.data.streaming_stt_dataset import (
     build_agent_backchannel_alignments,
     build_compact_turn_markers,
     build_lean_multiturn_alignments,
+    build_multiturn_marker_metadata,
     compute_word_spans,
     decode_with_blank,
     get_llm_messages_for_batch,
@@ -1652,6 +1653,18 @@ class TestLeanMultiTurnDataset:
             audio_duration_secs=3.0,
             cut_id="multi",
         )
+        sob_eou = parse_lean_multiturn_metadata(
+            _lean_multiturn_custom(),
+            audio_duration_secs=3.0,
+            cut_id="multi",
+            user_backchannel_mode="sob_eou",
+        )
+        sob_eob = parse_lean_multiturn_metadata(
+            _lean_multiturn_custom(),
+            audio_duration_secs=3.0,
+            cut_id="multi",
+            user_backchannel_mode="sob_eob",
+        )
         assert ignored.schema_version == "lean_multi_turn_v2"
         assert ignored.num_substantive_turns == 2
         assert ignored.transcript == "Hello. World."
@@ -1659,6 +1672,11 @@ class TestLeanMultiTurnDataset:
             (0.2, 0.7, 1),
             (1.5, 2.2, 2),
         ]
+        for enabled in (sob_eou, sob_eob):
+            assert enabled.transcript == "Hello. Mm-hmm. World."
+            assert [segment.turn_ordinal for segment in enabled.segments] == [1, 0, 2]
+            assert enabled.num_user_backchannel_events == 1
+            assert [segment.user_backchannel_event_id for segment in enabled.segments] == [0, 1, 0]
         assert [segment.source_sample_type for segment in ignored.segments] == [
             "complete_turn",
             "pause_within_turn",
@@ -1866,6 +1884,80 @@ class TestLeanMultiTurnDataset:
         assert resolved[2].start_time == pytest.approx(0.7)
         assert resolved[5].start_time == pytest.approx(2.2)
 
+    @pytest.mark.parametrize(
+        ("mode", "user_backchannel_end_token"),
+        [("sob_eou", "<eou>"), ("sob_eob", "<eob>")],
+    )
+    def test_boundary_modes_keep_multiple_backchannel_fragments_as_ordered_events(
+        self, mode, user_backchannel_end_token
+    ):
+        custom = _lean_multiturn_custom()
+        custom["curation"]["target"]["components"][1]["fragments"].append(
+            {"start": 1.1, "duration": 0.1, "text": "Right."}
+        )
+        sample = parse_lean_multiturn_metadata(
+            custom,
+            audio_duration_secs=3.0,
+            cut_id="two-backchannels",
+            user_backchannel_mode=mode,
+        )
+        assert sample.num_user_backchannel_events == 2
+        assert [segment.user_backchannel_event_id for segment in sample.segments] == [0, 1, 2, 0]
+
+        resolved = build_lean_multiturn_alignments(
+            sample,
+            [
+                WordAlignment("Hello", 0.3, 0.6),
+                WordAlignment("Mm-hmm", 0.91, 0.98, delay_frames=99),
+                WordAlignment("Right", 1.11, 1.18, delay_frames=99),
+                WordAlignment("World", 1.6, 2.0),
+            ],
+            audio_duration_secs=3.0,
+            start_token="<sou>",
+            end_token="<eou>",
+            start_delay_frames=2,
+            end_delay_frames=3,
+            user_backchannel_start_token="<sob>",
+            user_backchannel_end_token=user_backchannel_end_token,
+            user_backchannel_start_delay_frames=4,
+            user_backchannel_end_delay_frames=2,
+            cut_id="two-backchannels",
+        )
+        assert [alignment.text for alignment in resolved] == [
+            "<sou>",
+            "Hello",
+            "<eou>",
+            "<sob>",
+            "Mm-hmm",
+            user_backchannel_end_token,
+            "<sob>",
+            "Right",
+            user_backchannel_end_token,
+            "<sou>",
+            "World",
+            "<eou>",
+        ]
+        assert resolved[3].delay_frames == 4
+        assert resolved[4].delay_frames is None
+        assert resolved[5].delay_frames == 2
+        assert resolved[6].delay_frames == 4
+        assert resolved[7].delay_frames is None
+        assert resolved[8].delay_frames == 2
+
+        ordinals, event_ids, references = build_multiturn_marker_metadata(
+            [10, 100, 11, 12, 101, 11 if mode == "sob_eou" else 13,
+             12, 102, 11 if mode == "sob_eou" else 13, 10, 103, 11],
+            sample,
+            sou_id=10,
+            eou_id=11,
+            sob_id=12,
+            user_backchannel_end_id=11 if mode == "sob_eou" else 13,
+            frame_length_in_secs=FRAME_LEN,
+        )
+        assert [ordinals[idx] for idx in (0, 2, 9, 11)] == [1, 1, 2, 2]
+        assert [event_ids[idx] for idx in (3, 5, 6, 8)] == [1, 1, 2, 2]
+        assert [references[idx] for idx in (3, 5, 6, 8)] == [12, 13, 14, 16]
+
     def test_online_aligner_batches_legacy_audio_and_each_real_target_region(self):
         class _RecordingAligner:
             def align(self, audio, audio_lens, texts):
@@ -1880,7 +1972,7 @@ class TestLeanMultiTurnDataset:
         dataset = object.__new__(StreamingSTTDataset)
         dataset.cfg = SimpleNamespace(
             sample_rate=10,
-            target_backchannel_mode="ignore",
+            user_backchannel_mode="ignore",
             multiturn_forced_alignment_buffer_s=0.5,
         )
         aligner = _RecordingAligner()
@@ -1904,14 +1996,76 @@ class TestLeanMultiTurnDataset:
         assert alignments[1][0].start_time == pytest.approx(0.01)
         assert alignments[1][1].start_time == pytest.approx(1.01)
 
+    def test_online_aligner_uses_annotated_fallback_for_unalignable_user_backchannel(self, caplog):
+        class _ShortBackchannelAligner:
+            def align(self, audio, audio_lens, texts):
+                assert list(texts) == ["Hello.", "Mm-hmm.", "World."]
+                return [
+                    [WordAlignment(text="Hello.", start_time=0.01, end_time=0.49)],
+                    [],
+                    [WordAlignment(text="World.", start_time=0.01, end_time=0.69)],
+                ]
+
+        dataset = object.__new__(StreamingSTTDataset)
+        dataset.cfg = SimpleNamespace(
+            sample_rate=10,
+            user_backchannel_mode="sob_eou",
+            multiturn_forced_alignment_buffer_s=0.5,
+        )
+        alignments = dataset.get_online_alignments(
+            cuts=[SimpleNamespace(id="multi", custom=_lean_multiturn_custom())],
+            audios=torch.zeros(1, 30),
+            audio_lens=torch.tensor([30]),
+            text=["top-level text is replaced"],
+            forced_aligner=_ShortBackchannelAligner(),
+        )
+
+        assert [(item.text, item.start_time, item.end_time) for item in alignments[0]] == [
+            ("Hello.", pytest.approx(0.01), pytest.approx(0.49)),
+            ("Mm-hmm.", pytest.approx(0.9), pytest.approx(1.0)),
+            ("World.", pytest.approx(1.01), pytest.approx(1.69)),
+        ]
+        assert "using its annotated fragment timing" in caplog.text
+
+    def test_online_aligner_replaces_nonempty_out_of_fragment_user_backchannel_result(self, caplog):
+        class _OutOfFragmentBackchannelAligner:
+            def align(self, audio, audio_lens, texts):
+                assert list(texts) == ["Hello.", "Mm-hmm.", "World."]
+                return [
+                    [WordAlignment(text="Hello.", start_time=0.01, end_time=0.49)],
+                    [WordAlignment(text="hallucinated", start_time=0.20, end_time=0.40)],
+                    [WordAlignment(text="World.", start_time=0.01, end_time=0.69)],
+                ]
+
+        dataset = object.__new__(StreamingSTTDataset)
+        dataset.cfg = SimpleNamespace(
+            sample_rate=10,
+            user_backchannel_mode="sob_eou",
+            multiturn_forced_alignment_buffer_s=0.5,
+        )
+        alignments = dataset.get_online_alignments(
+            cuts=[SimpleNamespace(id="multi", custom=_lean_multiturn_custom())],
+            audios=torch.zeros(1, 30),
+            audio_lens=torch.tensor([30]),
+            text=["top-level text is replaced"],
+            forced_aligner=_OutOfFragmentBackchannelAligner(),
+        )
+
+        assert [(item.text, item.start_time, item.end_time) for item in alignments[0]] == [
+            ("Hello.", pytest.approx(0.01), pytest.approx(0.49)),
+            ("Mm-hmm.", pytest.approx(0.9), pytest.approx(1.0)),
+            ("World.", pytest.approx(1.01), pytest.approx(1.69)),
+        ]
+        assert "no usable forced alignment from 1 returned entries" in caplog.text
+
     @pytest.mark.parametrize("mode", ["drop", "", None])
-    def test_rejects_unknown_target_backchannel_mode(self, mode):
-        with pytest.raises(ValueError, match="target_backchannel_mode"):
+    def test_rejects_unknown_user_backchannel_mode(self, mode):
+        with pytest.raises(ValueError, match="user_backchannel_mode"):
             StreamingSTTDataConfig(
                 sample_rate=16000,
                 frame_length_in_secs=FRAME_LEN,
                 chunk_size=CHUNK_SIZE,
-                target_backchannel_mode=mode,
+                user_backchannel_mode=mode,
             )
 
 
@@ -1921,6 +2075,8 @@ class TestBoundaryDelayConfig:
         cfg = StreamingSTTDataConfig(sample_rate=16000, frame_length_in_secs=FRAME_LEN, chunk_size=CHUNK_SIZE)
         assert cfg.utterance_start_boundary_delay_frames == 2
         assert cfg.utterance_end_boundary_delay_frames == 2
+        assert cfg.user_backchannel_start_delay_frames == 4
+        assert cfg.user_backchannel_end_delay_frames == 2
         assert cfg.multiturn_forced_alignment_buffer_s == 0.5
 
     @pytest.mark.parametrize(

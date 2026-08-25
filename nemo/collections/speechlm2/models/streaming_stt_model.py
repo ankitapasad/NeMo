@@ -35,6 +35,10 @@ from nemo.collections.common.tokenizers import AutoTokenizer
 from nemo.collections.speechlm2.data.streaming_stt_dataset import (
     AUDIO_TOKEN_IDX,
     IGNORE_INDEX,
+    USER_BACKCHANNEL_MODE_IGNORE,
+    USER_BACKCHANNEL_MODE_SOB_EOB,
+    USER_BACKCHANNEL_MODE_SOB_EOU,
+    USER_BACKCHANNEL_MODES,
     StreamingSTTBatch,
     StreamingSTTDataset,
     build_compact_turn_markers,
@@ -49,6 +53,7 @@ from nemo.collections.speechlm2.parts.metrics.boundary import (
     boundary_collar_precision_recall_f1,
     compute_boundary_token_metrics,
     compute_ordinal_boundary_timing_metrics,
+    compute_user_backchannel_metrics,
 )
 from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers, is_frozen
 from nemo.collections.speechlm2.parts.pretrained import load_pretrained_hf, move_embedding, setup_perception
@@ -166,6 +171,11 @@ class StreamingSTTModelConfig:
     utterance_end_token: str = "<eou>"
     utterance_start_loss_weight: float = 1.0
     utterance_end_loss_weight: float = 1.0
+    user_backchannel_mode: str = USER_BACKCHANNEL_MODE_IGNORE
+    user_backchannel_start_token: str = "<sob>"
+    user_backchannel_end_token: str = "<eob>"
+    user_backchannel_start_loss_weight: float = 3.0
+    user_backchannel_end_loss_weight: float = 5.0
     enable_agent_backchannels: bool = False
     agent_backchannel_start_token: str = "<soab>"
     agent_backchannel_end_token: str = "<eoab>"
@@ -228,6 +238,11 @@ def _compute_weighted_lm_loss(
     eou_id: Optional[int] = None,
     utterance_start_loss_weight: float = 1.0,
     utterance_end_loss_weight: float = 1.0,
+    sob_id: Optional[int] = None,
+    user_backchannel_start_loss_weight: float = 1.0,
+    eob_id: Optional[int] = None,
+    user_backchannel_end_loss_weight: float = 1.0,
+    user_backchannel_event_ids: Optional[Tensor] = None,
     soab_id: Optional[int] = None,
     eoab_id: Optional[int] = None,
     agent_backchannel_start_loss_weight: float = 1.0,
@@ -237,7 +252,15 @@ def _compute_weighted_lm_loss(
 
     is_blank = valid_mask & (flat_targets == blank_id)
     is_sou = valid_mask & (flat_targets == sou_id) if sou_id is not None else torch.zeros_like(valid_mask)
-    is_eou = valid_mask & (flat_targets == eou_id) if eou_id is not None else torch.zeros_like(valid_mask)
+    is_eou_all = valid_mask & (flat_targets == eou_id) if eou_id is not None else torch.zeros_like(valid_mask)
+    if user_backchannel_event_ids is None:
+        user_backchannel_event_ids = torch.zeros_like(flat_targets)
+    if user_backchannel_event_ids.shape != flat_targets.shape:
+        raise ValueError("user_backchannel_event_ids must match flattened targets")
+    is_eou_backchannel = is_eou_all & (user_backchannel_event_ids > 0)
+    is_eou = is_eou_all & ~is_eou_backchannel
+    is_sob = valid_mask & (flat_targets == sob_id) if sob_id is not None else None
+    is_eob = valid_mask & (flat_targets == eob_id) if eob_id is not None else None
     is_soab = valid_mask & (flat_targets == soab_id) if soab_id is not None else None
     is_eoab = valid_mask & (flat_targets == eoab_id) if eoab_id is not None else None
     is_nonblank = valid_mask & (flat_targets != blank_id)
@@ -247,6 +270,9 @@ def _compute_weighted_lm_loss(
     num_nonblank = is_nonblank.sum()
     num_sou = is_sou.sum()
     num_eou = is_eou.sum()
+    num_eou_backchannel = is_eou_backchannel.sum()
+    num_sob = is_sob.sum() if is_sob is not None else None
+    num_eob = is_eob.sum() if is_eob is not None else None
     num_soab = is_soab.sum() if is_soab is not None else None
     num_eoab = is_eoab.sum() if is_eoab is not None else None
 
@@ -256,7 +282,17 @@ def _compute_weighted_lm_loss(
     if sou_id is not None and utterance_start_loss_weight != 1.0:
         loss_weights = torch.where(is_sou, torch.full_like(loss_weights, utterance_start_loss_weight), loss_weights)
     if eou_id is not None and utterance_end_loss_weight != 1.0:
-        loss_weights = torch.where(is_eou, torch.full_like(loss_weights, utterance_end_loss_weight), loss_weights)
+        loss_weights = torch.where(
+            is_eou_all, torch.full_like(loss_weights, utterance_end_loss_weight), loss_weights
+        )
+    if is_sob is not None and user_backchannel_start_loss_weight != 1.0:
+        loss_weights = torch.where(
+            is_sob, torch.full_like(loss_weights, user_backchannel_start_loss_weight), loss_weights
+        )
+    if is_eob is not None and user_backchannel_end_loss_weight != 1.0:
+        loss_weights = torch.where(
+            is_eob, torch.full_like(loss_weights, user_backchannel_end_loss_weight), loss_weights
+        )
     if is_soab is not None and agent_backchannel_start_loss_weight != 1.0:
         loss_weights = torch.where(
             is_soab, torch.full_like(loss_weights, agent_backchannel_start_loss_weight), loss_weights
@@ -286,6 +322,32 @@ def _compute_weighted_lm_loss(
                     "soab_ratio": num_soab.float() / num_targets.clamp(min=1),
                 }
             )
+        if is_sob is not None:
+            metrics.update(
+                {
+                    "loss_sob": per_token_loss[is_sob].sum() / num_sob.clamp(min=1),
+                    "sob_ratio": num_sob.float() / num_targets.clamp(min=1),
+                    "num_sob_targets": num_sob,
+                }
+            )
+        if sob_id is not None and eob_id is None:
+            metrics.update(
+                {
+                    "loss_eou_backchannel": per_token_loss[is_eou_backchannel].sum()
+                    / num_eou_backchannel.clamp(min=1),
+                    "eou_backchannel_ratio": num_eou_backchannel.float()
+                    / num_targets.clamp(min=1),
+                    "num_eou_backchannel_targets": num_eou_backchannel,
+                }
+            )
+        if is_eob is not None:
+            metrics.update(
+                {
+                    "loss_eob": per_token_loss[is_eob].sum() / num_eob.clamp(min=1),
+                    "eob_ratio": num_eob.float() / num_targets.clamp(min=1),
+                    "num_eob_targets": num_eob,
+                }
+            )
         if is_eoab is not None:
             metrics.update(
                 {
@@ -303,6 +365,27 @@ def _distributed_sum(value: Tensor) -> Tensor:
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.SUM)
     return value
+
+
+def _distributed_concat_1d(values: Tensor) -> Tensor:
+    """Gather a variable-length one-dimensional tensor exactly across workers."""
+    values = values.detach().flatten()
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return values
+    world_size = torch.distributed.get_world_size()
+    local_size = torch.as_tensor([values.numel()], dtype=torch.long, device=values.device)
+    sizes = [torch.zeros_like(local_size) for _ in range(world_size)]
+    torch.distributed.all_gather(sizes, local_size)
+    max_size = max(int(size.item()) for size in sizes)
+    if max_size == 0:
+        return values.new_empty((0,))
+    padded = values.new_zeros((max_size,))
+    padded[: values.numel()] = values
+    gathered = [torch.zeros_like(padded) for _ in range(world_size)]
+    torch.distributed.all_gather(gathered, padded)
+    return torch.cat(
+        [tensor[: int(size.item())] for tensor, size in zip(gathered, sizes)], dim=0
+    )
 
 
 @dataclass
@@ -334,9 +417,9 @@ class StreamingState:
 
 @dataclass(frozen=True)
 class BoundaryEvent:
-    """A sampled utterance or agent-backchannel boundary token."""
+    """A sampled utterance or backchannel boundary token."""
 
-    boundary_type: Literal["sou", "eou", "soab", "eoab"]
+    boundary_type: Literal["sou", "eou", "sob", "eob", "soab", "eoab"]
     token_id: int
     token_piece: str
     sampled_token_sequence_index: int
@@ -372,6 +455,54 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         self.save_hyperparameters()
         self.cfg = DictConfig(cfg)
         self.core_cfg: StreamingSTTModelConfig = to_dataclass(StreamingSTTModelConfig, cfg)
+        # Keep user-backchannel semantics in the model config so they survive
+        # checkpoint/HF serialization and are available without a dataset at
+        # inference time. Training requires the model and dataset views to agree.
+        self.user_backchannel_mode = self.core_cfg.user_backchannel_mode
+        self.user_backchannel_start_token = self.core_cfg.user_backchannel_start_token
+        self.user_backchannel_end_token = self.core_cfg.user_backchannel_end_token
+        if self.user_backchannel_mode not in USER_BACKCHANNEL_MODES:
+            raise ValueError(
+                f"user_backchannel_mode must be one of {sorted(USER_BACKCHANNEL_MODES)}; "
+                f"got {self.user_backchannel_mode!r}"
+            )
+        if data_cfg is not None:
+            data_mode = data_cfg.get("user_backchannel_mode", USER_BACKCHANNEL_MODE_IGNORE)
+            data_start_token = data_cfg.get(
+                "user_backchannel_start_token", self.user_backchannel_start_token
+            )
+            data_end_token = data_cfg.get(
+                "user_backchannel_end_token", self.user_backchannel_end_token
+            )
+            if data_mode != self.user_backchannel_mode:
+                raise ValueError("model and dataset user_backchannel_mode must match")
+            if (
+                data_start_token != self.user_backchannel_start_token
+                or data_end_token != self.user_backchannel_end_token
+            ):
+                raise ValueError("model and dataset user backchannel marker tokens must match")
+        if self.user_backchannel_mode in {
+            USER_BACKCHANNEL_MODE_SOB_EOU,
+            USER_BACKCHANNEL_MODE_SOB_EOB,
+        }:
+            if not self.core_cfg.add_utterance_boundary_tokens:
+                raise ValueError("user backchannel boundary modes require utterance boundary tokens")
+            if not self.user_backchannel_start_token:
+                raise ValueError("user_backchannel_start_token must be non-empty in boundary modes")
+            if self.user_backchannel_start_token in {
+                self.core_cfg.utterance_start_token,
+                self.core_cfg.utterance_end_token,
+            }:
+                raise ValueError("user backchannel SOB must differ from SOU and EOU")
+        if self.user_backchannel_mode == USER_BACKCHANNEL_MODE_SOB_EOB:
+            if not self.user_backchannel_end_token:
+                raise ValueError("user_backchannel_end_token must be non-empty in sob_eob mode")
+            if self.user_backchannel_end_token in {
+                self.core_cfg.utterance_start_token,
+                self.core_cfg.utterance_end_token,
+                self.user_backchannel_start_token,
+            }:
+                raise ValueError("user backchannel EOB must differ from SOU, EOU, and SOB")
         if self.core_cfg.validation_checkpoint_score_mode not in {
             "cohort_macro",
             "turn_ordinal_macro",
@@ -456,6 +587,33 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 logging.info(f"Added utterance boundary tokens to tokenizer: {missing_boundary_tokens}")
             else:
                 logging.info(f"Utterance boundary tokens already in tokenizer: {boundary_tokens}")
+
+        if self.user_backchannel_mode in {
+            USER_BACKCHANNEL_MODE_SOB_EOU,
+            USER_BACKCHANNEL_MODE_SOB_EOB,
+        }:
+            user_backchannel_tokens = [self.user_backchannel_start_token]
+            if self.user_backchannel_mode == USER_BACKCHANNEL_MODE_SOB_EOB:
+                user_backchannel_tokens.append(self.user_backchannel_end_token)
+            missing_user_backchannel_tokens = [
+                token
+                for token in user_backchannel_tokens
+                if not token_in_vocab(token, self.tokenizer)
+            ]
+            if missing_user_backchannel_tokens:
+                self.tokenizer.add_special_tokens(
+                    {"additional_special_tokens": missing_user_backchannel_tokens}
+                )
+                self.llm.resize_token_embeddings(len(self.tokenizer.tokenizer))
+                logging.info(
+                    "Added user backchannel tokens to tokenizer: %s",
+                    missing_user_backchannel_tokens,
+                )
+            else:
+                logging.info(
+                    "User backchannel tokens already in tokenizer: %s",
+                    user_backchannel_tokens,
+                )
 
         if self.core_cfg.enable_agent_backchannels:
             backchannel_tokens = [
@@ -850,11 +1008,19 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         # --- Weighted LM loss breakdown ---
         blank_id = self.blank_token_id
         sou_id, eou_id = None, None
+        sob_id, eob_id = None, None
         soab_id, eoab_id = None, None
         if self.core_cfg.add_utterance_boundary_tokens:
             sou_id, eou_id = self._get_boundary_token_ids()
         if self.core_cfg.enable_agent_backchannels:
             soab_id, eoab_id = self._get_agent_backchannel_token_ids()
+        if self.user_backchannel_mode in {
+            USER_BACKCHANNEL_MODE_SOB_EOU,
+            USER_BACKCHANNEL_MODE_SOB_EOB,
+        }:
+            sob_id, user_backchannel_end_id = self._get_user_backchannel_token_ids()
+            if self.user_backchannel_mode == USER_BACKCHANNEL_MODE_SOB_EOB:
+                eob_id = user_backchannel_end_id
         loss, loss_metrics = _compute_weighted_lm_loss(
             per_token_loss=per_token_loss,
             flat_targets=flat_targets,
@@ -865,6 +1031,15 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             eou_id=eou_id,
             utterance_start_loss_weight=self.core_cfg.utterance_start_loss_weight,
             utterance_end_loss_weight=self.core_cfg.utterance_end_loss_weight,
+            sob_id=sob_id,
+            user_backchannel_start_loss_weight=self.core_cfg.user_backchannel_start_loss_weight,
+            eob_id=eob_id,
+            user_backchannel_end_loss_weight=self.core_cfg.user_backchannel_end_loss_weight,
+            user_backchannel_event_ids=(
+                batch.user_backchannel_event_ids.flatten(0, 1)
+                if batch.user_backchannel_event_ids is not None
+                else None
+            ),
             soab_id=soab_id,
             eoab_id=eoab_id,
             agent_backchannel_start_loss_weight=self.core_cfg.agent_backchannel_start_loss_weight,
@@ -938,6 +1113,35 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     "eoab_ratio": loss_metrics["eoab_ratio"],
                 }
             )
+        if self.user_backchannel_mode in {
+            USER_BACKCHANNEL_MODE_SOB_EOU,
+            USER_BACKCHANNEL_MODE_SOB_EOB,
+        }:
+            train_metrics.update(
+                {
+                    "loss_sob": loss_metrics["loss_sob"],
+                    "sob_ratio": loss_metrics["sob_ratio"],
+                    "num_sob_targets": loss_metrics["num_sob_targets"].float(),
+                }
+            )
+            if self.user_backchannel_mode == USER_BACKCHANNEL_MODE_SOB_EOU:
+                train_metrics.update(
+                    {
+                        "loss_eou_backchannel": loss_metrics["loss_eou_backchannel"],
+                        "eou_backchannel_ratio": loss_metrics["eou_backchannel_ratio"],
+                        "num_eou_backchannel_targets": loss_metrics[
+                            "num_eou_backchannel_targets"
+                        ].float(),
+                    }
+                )
+            else:
+                train_metrics.update(
+                    {
+                        "loss_eob": loss_metrics["loss_eob"],
+                        "eob_ratio": loss_metrics["eob_ratio"],
+                        "num_eob_targets": loss_metrics["num_eob_targets"].float(),
+                    }
+                )
         self.log_dict(train_metrics, on_step=True)
         return {"loss": loss}
 
@@ -953,6 +1157,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         self._partial_accuracies: dict[str, list] = defaultdict(list)
         self._partial_boundary_metrics: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
         self._partial_ordinal_boundary_metrics: dict[str, list] = defaultdict(list)
+        self._partial_user_backchannel_metrics: dict[str, list] = defaultdict(list)
         self._partial_agent_backchannel_metrics: dict[str, list] = defaultdict(list)
         # Per-class TP/total counts for the aux chunk classifier. Aggregated
         # across the epoch so macro acc isn't biased by per-batch composition.
@@ -1093,6 +1298,91 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     sync_dist=True,
                 )
 
+        # User-backchannel metrics are pooled across every enabled
+        # validation loader. They are diagnostic only and never enter the
+        # checkpoint score below.
+        if self._partial_user_backchannel_metrics:
+            count_totals = {
+                metric: _distributed_sum(torch.stack(values).sum())
+                for metric, values in self._partial_user_backchannel_metrics.items()
+                if values and not metric.endswith("_latency_frames")
+            }
+            event_count = count_totals["event_count"]
+            denominator = event_count.clamp(min=1).float()
+
+            def _latency_quantile(metric: str, q: float) -> Tensor:
+                values = self._partial_user_backchannel_metrics.get(metric, [])
+                if values:
+                    gathered = _distributed_concat_1d(torch.cat(values))
+                else:
+                    gathered = event_count.new_empty((0,), dtype=torch.float32)
+                if gathered.numel() == 0:
+                    return torch.full((), float("nan"), dtype=torch.float32, device=event_count.device)
+                return torch.quantile(gathered.float(), q) * self.core_cfg.frame_length_in_secs
+
+            end_name = (
+                "eob"
+                if self.user_backchannel_mode == USER_BACKCHANNEL_MODE_SOB_EOB
+                else "eou"
+            )
+            logged_metrics = {
+                "val_user_backchannel_num_samples": count_totals["num_samples"].float(),
+                "val_user_backchannel_num_events": event_count.float(),
+                "val_user_backchannel_sob_correct_rate": count_totals[
+                    "sob_correct_count"
+                ].float()
+                / denominator,
+                "val_user_backchannel_sou_confusion_rate": count_totals[
+                    "sou_confusion_count"
+                ].float()
+                / denominator,
+                "val_user_backchannel_no_start_marker_rate": count_totals[
+                    "no_start_marker_count"
+                ].float()
+                / denominator,
+                "val_user_backchannel_sob_spurious_rate": count_totals[
+                    "sob_spurious_count"
+                ].float()
+                / denominator,
+                "val_user_backchannel_sob_latency_p50_s": _latency_quantile(
+                    "sob_latency_frames", 0.5
+                ),
+                "val_user_backchannel_sob_latency_p90_s": _latency_quantile(
+                    "sob_latency_frames", 0.9
+                ),
+                f"val_user_backchannel_{end_name}_in_collar_rate": count_totals[
+                    "end_in_collar_count"
+                ].float()
+                / denominator,
+                f"val_user_backchannel_{end_name}_late_rate": count_totals[
+                    "end_late_count"
+                ].float()
+                / denominator,
+                f"val_user_backchannel_{end_name}_missing_rate": count_totals[
+                    "end_missing_count"
+                ].float()
+                / denominator,
+                f"val_user_backchannel_{end_name}_spurious_rate": count_totals[
+                    "end_spurious_count"
+                ].float()
+                / denominator,
+                f"val_user_backchannel_{end_name}_latency_p50_s": _latency_quantile(
+                    "end_latency_frames", 0.5
+                ),
+                f"val_user_backchannel_{end_name}_latency_p90_s": _latency_quantile(
+                    "end_latency_frames", 0.9
+                ),
+                f"val_user_backchannel_sob_{end_name}_paired_event_rate": count_totals[
+                    "paired_event_count"
+                ].float()
+                / denominator,
+            }
+            if self.user_backchannel_mode == USER_BACKCHANNEL_MODE_SOB_EOB:
+                logged_metrics["val_user_backchannel_eou_end_confusion_rate"] = count_totals[
+                    "eou_end_confusion_count"
+                ].float() / denominator
+            self.log_dict(logged_metrics, on_epoch=True, sync_dist=False)
+
         if getattr(getattr(self, "core_cfg", None), "enable_validation_checkpoint_score", False):
             score_mode = getattr(self.core_cfg, "validation_checkpoint_score_mode", "cohort_macro")
             if score_mode == "turn_ordinal_macro":
@@ -1172,6 +1462,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         self._partial_accuracies.clear()
         self._partial_boundary_metrics.clear()
         self._partial_ordinal_boundary_metrics.clear()
+        self._partial_user_backchannel_metrics.clear()
         self._partial_agent_backchannel_metrics.clear()
         self._partial_aux_pos_correct.clear()
         self._partial_aux_pos_total.clear()
@@ -1194,6 +1485,35 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             return None, None
         return sou_ids[0], eou_ids[0]
 
+    def _get_user_backchannel_token_ids(self) -> tuple[int, int]:
+        if self.user_backchannel_mode not in {
+            USER_BACKCHANNEL_MODE_SOB_EOU,
+            USER_BACKCHANNEL_MODE_SOB_EOB,
+        }:
+            raise RuntimeError("User backchannel tokens requested outside a boundary mode")
+        sob_ids = self.tokenizer.tokenizer.encode(
+            self.user_backchannel_start_token, add_special_tokens=False
+        )
+        if len(sob_ids) != 1:
+            raise ValueError(
+                "user backchannel SOB marker must encode to one token; "
+                f"got {self.user_backchannel_start_token!r}->{sob_ids}"
+            )
+        if self.user_backchannel_mode == USER_BACKCHANNEL_MODE_SOB_EOU:
+            _, end_id = self._get_boundary_token_ids()
+            if end_id is None:
+                raise ValueError("sob_eou mode requires a single-token EOU marker")
+            return sob_ids[0], end_id
+        eob_ids = self.tokenizer.tokenizer.encode(
+            self.user_backchannel_end_token, add_special_tokens=False
+        )
+        if len(eob_ids) != 1:
+            raise ValueError(
+                "user backchannel EOB marker must encode to one token; "
+                f"got {self.user_backchannel_end_token!r}->{eob_ids}"
+            )
+        return sob_ids[0], eob_ids[0]
+
     def _get_agent_backchannel_token_ids(self) -> tuple[int, int] | tuple[None, None]:
         if not self.core_cfg.enable_agent_backchannels:
             return None, None
@@ -1209,14 +1529,29 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             )
         return soab_ids[0], eoab_ids[0]
 
-    def _get_boundary_token_info(self) -> dict[int, tuple[Literal["sou", "eou", "soab", "eoab"], str]]:
+    def _get_boundary_token_info(
+        self,
+    ) -> dict[int, tuple[Literal["sou", "eou", "sob", "eob", "soab", "eoab"], str]]:
         """Map enabled single-token boundary IDs to their semantic type and token piece."""
-        token_info: dict[int, tuple[Literal["sou", "eou", "soab", "eoab"], str]] = {}
+        token_info: dict[
+            int, tuple[Literal["sou", "eou", "sob", "eob", "soab", "eoab"], str]
+        ] = {}
         if getattr(self.core_cfg, "add_utterance_boundary_tokens", False):
             sou_id, eou_id = self._get_boundary_token_ids()
             if sou_id is not None and eou_id is not None:
                 token_info[int(sou_id)] = ("sou", self.tokenizer.ids_to_tokens([sou_id])[0])
                 token_info[int(eou_id)] = ("eou", self.tokenizer.ids_to_tokens([eou_id])[0])
+        user_backchannel_mode = getattr(
+            self, "user_backchannel_mode", USER_BACKCHANNEL_MODE_IGNORE
+        )
+        if user_backchannel_mode in {
+            USER_BACKCHANNEL_MODE_SOB_EOU,
+            USER_BACKCHANNEL_MODE_SOB_EOB,
+        }:
+            sob_id, end_id = self._get_user_backchannel_token_ids()
+            token_info[int(sob_id)] = ("sob", self.tokenizer.ids_to_tokens([sob_id])[0])
+            if user_backchannel_mode == USER_BACKCHANNEL_MODE_SOB_EOB:
+                token_info[int(end_id)] = ("eob", self.tokenizer.ids_to_tokens([end_id])[0])
         if getattr(self.core_cfg, "enable_agent_backchannels", False):
             soab_id, eoab_id = self._get_agent_backchannel_token_ids()
             if soab_id is not None and eoab_id is not None:
@@ -1259,7 +1594,9 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         encoder_frames_consumed: int,
         sampled_token_ids: list[int],
         boundary_events: list[BoundaryEvent],
-        boundary_token_info: dict[int, tuple[Literal["sou", "eou", "soab", "eoab"], str]],
+        boundary_token_info: dict[
+            int, tuple[Literal["sou", "eou", "sob", "eob", "soab", "eoab"], str]
+        ],
     ) -> None:
         """Append one sampled token and its event when it is an enabled boundary."""
         token_id = int(token_id)
@@ -1303,7 +1640,11 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         )
 
     def _compute_boundary_metrics(
-        self, pred_ids: Tensor, target_ids: Tensor, input_tokens: Tensor
+        self,
+        pred_ids: Tensor,
+        target_ids: Tensor,
+        batch: StreamingSTTBatch,
+        prediction_exclusion_mask: Tensor | None = None,
     ) -> dict[str, Tensor]:
         sou_id, eou_id = self._get_boundary_token_ids()
         if sou_id is None or eou_id is None:
@@ -1312,11 +1653,50 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         return compute_boundary_token_metrics(
             pred_ids=pred_ids,
             target_ids=target_ids,
-            input_tokens=input_tokens,
+            input_tokens=batch.input_tokens,
             sou_id=sou_id,
             eou_id=eou_id,
             ignore_index=IGNORE_INDEX,
             audio_token_idx=AUDIO_TOKEN_IDX,
+            user_backchannel_event_ids=batch.user_backchannel_event_ids,
+            prediction_exclusion_mask=prediction_exclusion_mask,
+        )
+
+    def _compute_user_backchannel_metrics(
+        self,
+        pred_ids: Tensor,
+        target_ids: Tensor,
+        batch: StreamingSTTBatch,
+    ) -> dict[str, Tensor]:
+        if self.user_backchannel_mode not in {
+            USER_BACKCHANNEL_MODE_SOB_EOU,
+            USER_BACKCHANNEL_MODE_SOB_EOB,
+        }:
+            return {}
+        if (
+            batch.user_backchannel_event_ids is None
+            or batch.user_backchannel_reference_frames is None
+            or batch.num_user_backchannel_events is None
+            or batch.boundary_turn_ordinals is None
+        ):
+            raise ValueError("user backchannel validation requires user backchannel batch metadata")
+        sou_id, eou_id = self._get_boundary_token_ids()
+        sob_id, user_backchannel_end_id = self._get_user_backchannel_token_ids()
+        return compute_user_backchannel_metrics(
+            pred_ids=pred_ids,
+            target_ids=target_ids,
+            input_tokens=batch.input_tokens,
+            user_backchannel_event_ids=batch.user_backchannel_event_ids,
+            user_backchannel_reference_frames=batch.user_backchannel_reference_frames,
+            num_user_backchannel_events=batch.num_user_backchannel_events,
+            boundary_turn_ordinals=batch.boundary_turn_ordinals,
+            sob_id=sob_id,
+            user_backchannel_end_id=user_backchannel_end_id,
+            sou_id=sou_id,
+            eou_id=eou_id,
+            ignore_index=IGNORE_INDEX,
+            audio_token_idx=AUDIO_TOKEN_IDX,
+            collar_frames=math.ceil(1.5 / self.core_cfg.frame_length_in_secs),
         )
 
     def _compute_ordinal_boundary_metrics(
@@ -1324,6 +1704,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         pred_ids: Tensor,
         target_ids: Tensor,
         batch: StreamingSTTBatch,
+        prediction_exclusion_mask: Tensor | None = None,
     ) -> dict[str, Tensor]:
         if batch.boundary_turn_ordinals is None or batch.is_multiturn is None or batch.num_substantive_turns is None:
             return {}
@@ -1342,6 +1723,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             ignore_index=IGNORE_INDEX,
             audio_token_idx=AUDIO_TOKEN_IDX,
             max_turns=4,
+            prediction_exclusion_mask=prediction_exclusion_mask,
         )
 
     def validation_step(self, batch, batch_idx: int):
@@ -1399,10 +1781,23 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             ) / num_targets.clamp(min=1)
 
         pred_ids = outputs["logits"].argmax(dim=-1)
-        boundary_metrics = self._compute_boundary_metrics(pred_ids, target_ids, batch.input_tokens)
+        user_backchannel_metrics = self._compute_user_backchannel_metrics(
+            pred_ids, target_ids, batch
+        )
+        prediction_exclusion_mask = user_backchannel_metrics.pop(
+            "prediction_exclusion_mask", None
+        )
+        for metric, value in user_backchannel_metrics.items():
+            self._partial_user_backchannel_metrics[metric].append(value.detach())
+
+        boundary_metrics = self._compute_boundary_metrics(
+            pred_ids, target_ids, batch, prediction_exclusion_mask
+        )
         for metric, value in boundary_metrics.items():
             self._partial_boundary_metrics[name][metric].append(value.detach())
-        ordinal_boundary_metrics = self._compute_ordinal_boundary_metrics(pred_ids, target_ids, batch)
+        ordinal_boundary_metrics = self._compute_ordinal_boundary_metrics(
+            pred_ids, target_ids, batch, prediction_exclusion_mask
+        )
         for metric, value in ordinal_boundary_metrics.items():
             self._partial_ordinal_boundary_metrics[metric].append(value.detach())
 

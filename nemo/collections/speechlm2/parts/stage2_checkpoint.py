@@ -30,7 +30,7 @@ def _single_key_ending_with(keys, suffix: str) -> str:
     return matches[0]
 
 
-def _token_ids(model, tokens: tuple[str, str], *, label: str) -> list[int]:
+def _token_ids(model, tokens: tuple[str, ...], *, label: str) -> list[int]:
     tokenizer = getattr(model.tokenizer, "tokenizer", model.tokenizer)
     token_ids = []
     for token in tokens:
@@ -45,7 +45,7 @@ def prepare_asr_stage2_state_dict(
     model,
     source_state: Mapping[str, torch.Tensor],
     *,
-    boundary_tokens: tuple[str, str] = ("<sou>", "<eou>"),
+    boundary_tokens: tuple[str, ...] = ("<sou>", "<eou>"),
     text_tokens: tuple[str, str] = ("<|text_start|>", "<|text_end|>"),
     expected_source_vocab_size: int = 151672,
 ) -> dict[str, torch.Tensor]:
@@ -81,7 +81,7 @@ def prepare_asr_stage2_state_dict(
     if (
         len(source_shape) != 2
         or source_shape[0] != expected_source_vocab_size
-        or len(boundary_tokens) != len(text_tokens)
+        or not boundary_tokens
         or target_shape[0] != source_shape[0] + len(boundary_tokens)
         or target_shape[1] != source_shape[1]
     ):
@@ -93,8 +93,11 @@ def prepare_asr_stage2_state_dict(
     boundary_ids = _token_ids(model, boundary_tokens, label="Boundary")
     text_ids = _token_ids(model, text_tokens, label="Compact-text")
     source_text_ids = list(range(source_shape[0] - len(text_tokens), source_shape[0]))
-    expected_boundary_ids = source_text_ids
-    expected_text_ids = list(range(source_shape[0], target_shape[0]))
+    first_inserted_id = source_text_ids[0]
+    expected_boundary_ids = list(
+        range(first_inserted_id, first_inserted_id + len(boundary_tokens))
+    )
+    expected_text_ids = list(range(first_inserted_id + len(boundary_tokens), target_shape[0]))
     if boundary_ids != expected_boundary_ids:
         raise RuntimeError(
             f"Boundary tokens must occupy the source compact-text rows {expected_boundary_ids}; got {boundary_ids}"
@@ -137,7 +140,15 @@ def load_asr_stage2_weights(model, checkpoint_path: str) -> None:
     if "state_dict" not in checkpoint:
         raise KeyError(f"Checkpoint has no state_dict: {checkpoint_path}")
 
-    expanded_state = prepare_asr_stage2_state_dict(model, checkpoint["state_dict"])
+    boundary_tokens = ("<sou>", "<eou>")
+    user_backchannel_mode = getattr(model, "user_backchannel_mode", "ignore")
+    if user_backchannel_mode in {"sob_eou", "sob_eob"}:
+        boundary_tokens += (getattr(model, "user_backchannel_start_token", "<sob>"),)
+    if user_backchannel_mode == "sob_eob":
+        boundary_tokens += (getattr(model, "user_backchannel_end_token", "<eob>"),)
+    expanded_state = prepare_asr_stage2_state_dict(
+        model, checkpoint["state_dict"], boundary_tokens=boundary_tokens
+    )
     incompatible = model.load_state_dict(expanded_state, strict=True)
     if incompatible.missing_keys or incompatible.unexpected_keys:
         raise RuntimeError(f"Strict stage-2 load unexpectedly returned: {incompatible}")

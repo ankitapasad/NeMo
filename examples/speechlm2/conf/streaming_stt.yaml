@@ -21,6 +21,13 @@ model:
   # first-prediction detection-rate macro.
   # enable_validation_checkpoint_score: true
   # validation_checkpoint_score_mode: turn_ordinal_macro
+  # User backchannels are opt-in. Keeping the mode in model config
+  # makes checkpoint/HF vocabulary reconstruction self-contained.
+  user_backchannel_mode: ignore
+  user_backchannel_start_token: "<sob>"
+  user_backchannel_end_token: "<eob>"
+  user_backchannel_start_loss_weight: 3.0
+  user_backchannel_end_loss_weight: 5.0
 
   # LoRA (uncomment to enable)
   # lora:
@@ -65,8 +72,12 @@ data:
     blank_token: ${model.blank_token}
     system_role: system
     system_prompt: "Transcribe the audio into text."
-    # Lean multi-turn target-speaker backchannels are excluded from training targets.
-    target_backchannel_mode: ignore
+    # Lean multi-turn user backchannels: ignore | sob_eou | sob_eob.
+    user_backchannel_mode: ${model.user_backchannel_mode}
+    user_backchannel_start_token: ${model.user_backchannel_start_token}
+    user_backchannel_end_token: ${model.user_backchannel_end_token}
+    user_backchannel_start_delay_frames: 4
+    user_backchannel_end_delay_frames: 2
     # Aligner-only real-audio context on each side of every substantive turn.
     # Manifest SOU/EOU timestamps remain authoritative.
     multiturn_forced_alignment_buffer_s: 0.5
