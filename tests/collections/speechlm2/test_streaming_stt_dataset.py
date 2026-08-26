@@ -1885,6 +1885,157 @@ class TestLeanMultiTurnDataset:
         assert resolved[5].start_time == pytest.approx(2.2)
 
     @pytest.mark.parametrize(
+        ("text", "word_count"),
+        [("I", 1), ("Two words", 2), ("Three short words", 3)],
+    )
+    def test_short_unaligned_substantive_fragment_uses_annotated_fallback(self, text, word_count, caplog):
+        custom = _lean_multiturn_custom()
+        custom["sample_id"] = "manifest-row-id"
+        custom["curation"]["target"]["components"][2]["fragments"][0]["text"] = text
+        sample = parse_lean_multiturn_metadata(
+            custom,
+            audio_duration_secs=3.0,
+            cut_id="short-fallback",
+            user_backchannel_mode="ignore",
+        )
+
+        resolved = build_lean_multiturn_alignments(
+            sample,
+            [WordAlignment("Hello", 0.3, 0.6)],
+            audio_duration_secs=3.0,
+            start_token="<sou>",
+            end_token="<eou>",
+            start_delay_frames=2,
+            end_delay_frames=3,
+            unaligned_substantive_fallback_max_words=3,
+            cut_id="short-fallback",
+        )
+
+        assert [alignment.text for alignment in resolved[-3:]] == ["<sou>", text, "<eou>"]
+        assert (resolved[-2].start_time, resolved[-2].end_time) == pytest.approx((1.5, 2.2))
+        assert resolved[-2].delay_frames == resolved[-1].delay_frames == 3
+        assert "TTM_UNALIGNED_SUBSTANTIVE_FALLBACK" in caplog.text
+        assert "cut_id='short-fallback'" in caplog.text
+        assert "sample_id='manifest-row-id'" in caplog.text
+        assert "segment_idx=1 turn_ordinal=2 turn_id='turn-2'" in caplog.text
+        assert "source_sample_id='source-pause' source_sample_type='pause_within_turn'" in caplog.text
+        assert f"start_s=1.500 end_s=2.200 word_count={word_count} limit=3 text={text!r}" in caplog.text
+
+    def test_short_unaligned_only_substantive_fragment_can_fallback(self):
+        custom = _lean_multiturn_custom()
+        target = custom["curation"]["target"]
+        target["components"] = [target["components"][2]]
+        target["utterance_regions"] = [target["utterance_regions"][1]]
+        target["components"][0]["fragments"][0]["text"] = "I"
+        sample = parse_lean_multiturn_metadata(
+            custom,
+            audio_duration_secs=3.0,
+            cut_id="only-short-fallback",
+            user_backchannel_mode="ignore",
+        )
+
+        resolved = build_lean_multiturn_alignments(
+            sample,
+            [],
+            audio_duration_secs=3.0,
+            start_token="<sou>",
+            end_token="<eou>",
+            start_delay_frames=2,
+            end_delay_frames=3,
+            unaligned_substantive_fallback_max_words=3,
+            cut_id="only-short-fallback",
+        )
+
+        assert [alignment.text for alignment in resolved] == ["<sou>", "I", "<eou>"]
+
+    def test_unaligned_substantive_fragment_above_fallback_limit_remains_strict(self):
+        custom = _lean_multiturn_custom()
+        custom["curation"]["target"]["components"][2]["fragments"][0]["text"] = "Four words stay strict"
+        sample = parse_lean_multiturn_metadata(
+            custom,
+            audio_duration_secs=3.0,
+            cut_id="long-fallback",
+            user_backchannel_mode="ignore",
+        )
+
+        with pytest.raises(ValueError, match="target segment 1.*has no usable word alignments"):
+            build_lean_multiturn_alignments(
+                sample,
+                [WordAlignment("Hello", 0.3, 0.6)],
+                audio_duration_secs=3.0,
+                start_token="<sou>",
+                end_token="<eou>",
+                start_delay_frames=2,
+                end_delay_frames=3,
+                unaligned_substantive_fallback_max_words=3,
+                cut_id="long-fallback",
+            )
+
+    @pytest.mark.parametrize(
+        ("mode", "user_backchannel_end_token"),
+        [("ignore", None), ("sob_eou", "<eou>"), ("sob_eob", "<eob>")],
+    )
+    def test_short_substantive_fallback_is_consistent_across_user_backchannel_modes(
+        self, mode, user_backchannel_end_token
+    ):
+        custom = _lean_multiturn_custom()
+        custom["curation"]["target"]["components"][2]["fragments"][0]["text"] = "I"
+        sample = parse_lean_multiturn_metadata(
+            custom,
+            audio_duration_secs=3.0,
+            cut_id=f"fallback-{mode}",
+            user_backchannel_mode=mode,
+        )
+        alignments = [WordAlignment("Hello", 0.3, 0.6)]
+        if mode != "ignore":
+            alignments.append(WordAlignment("Mm-hmm", 0.91, 0.98))
+
+        resolved = build_lean_multiturn_alignments(
+            sample,
+            alignments,
+            audio_duration_secs=3.0,
+            start_token="<sou>",
+            end_token="<eou>",
+            start_delay_frames=2,
+            end_delay_frames=3,
+            user_backchannel_start_token="<sob>" if mode != "ignore" else None,
+            user_backchannel_end_token=user_backchannel_end_token,
+            user_backchannel_start_delay_frames=4,
+            user_backchannel_end_delay_frames=2,
+            unaligned_substantive_fallback_max_words=3,
+            cut_id=f"fallback-{mode}",
+        )
+
+        assert [alignment.text for alignment in resolved[-3:]] == ["<sou>", "I", "<eou>"]
+
+    def test_enabling_short_substantive_fallback_does_not_change_valid_alignments(self):
+        sample = parse_lean_multiturn_metadata(
+            _lean_multiturn_custom(),
+            audio_duration_secs=3.0,
+            cut_id="valid-ab",
+            user_backchannel_mode="ignore",
+        )
+        kwargs = dict(
+            audio_duration_secs=3.0,
+            start_token="<sou>",
+            end_token="<eou>",
+            start_delay_frames=2,
+            end_delay_frames=3,
+            cut_id="valid-ab",
+        )
+        alignments = [WordAlignment("Hello", 0.3, 0.6), WordAlignment("World", 1.6, 2.0)]
+
+        strict = build_lean_multiturn_alignments(sample, alignments, **kwargs)
+        fallback_enabled = build_lean_multiturn_alignments(
+            sample,
+            alignments,
+            unaligned_substantive_fallback_max_words=3,
+            **kwargs,
+        )
+
+        assert strict == fallback_enabled
+
+    @pytest.mark.parametrize(
         ("mode", "user_backchannel_end_token"),
         [("sob_eou", "<eou>"), ("sob_eob", "<eob>")],
     )
@@ -2078,6 +2229,7 @@ class TestBoundaryDelayConfig:
         assert cfg.user_backchannel_start_delay_frames == 4
         assert cfg.user_backchannel_end_delay_frames == 2
         assert cfg.multiturn_forced_alignment_buffer_s == 0.5
+        assert cfg.multiturn_unaligned_substantive_fallback_max_words == 0
 
     @pytest.mark.parametrize(
         "buffer_s",
@@ -2090,6 +2242,16 @@ class TestBoundaryDelayConfig:
                 frame_length_in_secs=FRAME_LEN,
                 chunk_size=CHUNK_SIZE,
                 multiturn_forced_alignment_buffer_s=buffer_s,
+            )
+
+    @pytest.mark.parametrize("max_words", [-1, 1.5, True, "3"])
+    def test_rejects_invalid_unaligned_substantive_fallback_limit(self, max_words):
+        with pytest.raises(ValueError, match="multiturn_unaligned_substantive_fallback_max_words"):
+            StreamingSTTDataConfig(
+                sample_rate=16000,
+                frame_length_in_secs=FRAME_LEN,
+                chunk_size=CHUNK_SIZE,
+                multiturn_unaligned_substantive_fallback_max_words=max_words,
             )
 
     @pytest.mark.parametrize("margin_secs", [0.16, 0.32])

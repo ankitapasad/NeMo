@@ -18,7 +18,7 @@ import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from numbers import Real
+from numbers import Integral, Real
 from typing import Any, Iterable, List, Optional, Union
 
 import numpy as np
@@ -84,6 +84,7 @@ class MultiTurnSample:
     segments: tuple[MultiTurnTargetSegment, ...]
     num_substantive_turns: int
     num_user_backchannel_events: int
+    sample_id: str | None = None
 
 
 def _require_mapping(value: Any, *, field: str, cut_id: str) -> Mapping[str, Any]:
@@ -296,6 +297,7 @@ def parse_lean_multiturn_metadata(
         segments=tuple(segments),
         num_substantive_turns=len(validated_regions),
         num_user_backchannel_events=user_backchannel_event_idx,
+        sample_id=custom.get("sample_id") if isinstance(custom.get("sample_id"), str) else None,
     )
 
 
@@ -492,6 +494,10 @@ class StreamingSTTDataConfig:
     # each lean multi-turn substantive region. This does not move the
     # authoritative manifest SOU/EOU timestamps.
     multiturn_forced_alignment_buffer_s: float = 0.5
+    # Opt-in annotated-timing fallback for short substantive fragments whose
+    # online forced alignment is empty or falls outside the target region.
+    # Zero preserves strict rejection of every unaligned substantive fragment.
+    multiturn_unaligned_substantive_fallback_max_words: int = 0
     # K — only effective in dynamic chunking (chunk_size == 0). Each audio
     # segment is rounded UP to a multiple of K frames (and total audio is
     # padded to K-multiple). The model implicitly learns to emit only at
@@ -552,6 +558,12 @@ class StreamingSTTDataConfig:
             or self.multiturn_forced_alignment_buffer_s < 0
         ):
             raise ValueError("multiturn_forced_alignment_buffer_s must be a non-negative finite number")
+        if (
+            isinstance(self.multiturn_unaligned_substantive_fallback_max_words, bool)
+            or not isinstance(self.multiturn_unaligned_substantive_fallback_max_words, Integral)
+            or self.multiturn_unaligned_substantive_fallback_max_words < 0
+        ):
+            raise ValueError("multiturn_unaligned_substantive_fallback_max_words must be a non-negative integer")
 
 
 def _normalize_legacy_text_token_config(cfg: DictConfig | dict) -> DictConfig | dict:
@@ -958,18 +970,20 @@ def build_lean_multiturn_alignments(
     user_backchannel_end_token: str | None = None,
     user_backchannel_start_delay_frames: int = 4,
     user_backchannel_end_delay_frames: int = 2,
+    unaligned_substantive_fallback_max_words: int = 0,
     cut_id: str = "<unknown>",
 ) -> List[WordAlignment]:
     """Select target words and add the configured per-segment boundaries.
 
     A word belongs to the first substantive region containing its midpoint and
     is consumed at most once. Words whose midpoints lie outside every region
-    are omitted. A non-empty turn with no selected word alignment is rejected.
-    Substantive turns use SOU/EOU. User-backchannel words inherit the default text
-    delay and each annotated fragment stays atomic as SOB, words, then the
-    configured EOU or EOB marker.
+    are omitted. A non-empty turn with no selected word alignment is rejected
+    unless its word count is within the explicit annotated-timing fallback
+    limit. Substantive turns use SOU/EOU. User-backchannel words inherit the
+    default text delay and each annotated fragment stays atomic as SOB, words,
+    then the configured EOU or EOB marker.
     """
-    if not alignments and sample.transcript:
+    if not alignments and sample.transcript and unaligned_substantive_fallback_max_words == 0:
         raise ValueError(f"Cut {cut_id!r} has a non-empty lean multi-turn transcript but no usable word alignments")
 
     ordered_alignments = sorted(alignments, key=lambda item: (item.start_time, item.end_time))
@@ -992,9 +1006,44 @@ def build_lean_multiturn_alignments(
                 segment_alignments.append(alignment)
 
         if segment.text and not segment_alignments:
-            raise ValueError(
-                f"Cut {cut_id!r} target segment {segment_idx} ({segment.text!r}) has no usable word alignments"
-            )
+            word_count = len(segment.text.split())
+            if (
+                segment.turn_ordinal
+                and unaligned_substantive_fallback_max_words > 0
+                and word_count <= unaligned_substantive_fallback_max_words
+            ):
+                logging.warning(
+                    "TTM_UNALIGNED_SUBSTANTIVE_FALLBACK cut_id=%r sample_id=%r segment_idx=%d "
+                    "turn_ordinal=%d turn_id=%r source_sample_id=%r source_sample_type=%r "
+                    "start_s=%.3f end_s=%.3f word_count=%d limit=%d text=%r",
+                    cut_id,
+                    sample.sample_id,
+                    segment_idx,
+                    segment.turn_ordinal,
+                    segment.turn_id,
+                    segment.source_sample_id,
+                    segment.source_sample_type,
+                    segment.start_time,
+                    segment.end_time,
+                    word_count,
+                    unaligned_substantive_fallback_max_words,
+                    segment.text,
+                )
+                # Pin the fallback text and EOU to the same ready frame. Stable
+                # alignment order then guarantees transcript-before-EOU targets.
+                segment_alignments = [
+                    WordAlignment(
+                        text=segment.text,
+                        start_time=segment.start_time,
+                        end_time=segment.end_time,
+                        delay_frames=end_delay_frames,
+                    )
+                ]
+            else:
+                raise ValueError(
+                    f"Cut {cut_id!r} target segment {segment_idx} ({segment.text!r}) "
+                    "has no usable word alignments"
+                )
 
         if segment.turn_ordinal:
             segment_alignments = add_gt_utterance_boundary_alignments(
@@ -2259,6 +2308,9 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
                             ),
                             user_backchannel_start_delay_frames=self.cfg.user_backchannel_start_delay_frames,
                             user_backchannel_end_delay_frames=self.cfg.user_backchannel_end_delay_frames,
+                            unaligned_substantive_fallback_max_words=(
+                                self.cfg.multiturn_unaligned_substantive_fallback_max_words
+                            ),
                             cut_id=cut_id,
                         )
                     )
@@ -2337,6 +2389,9 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
                         ),
                         user_backchannel_start_delay_frames=self.cfg.user_backchannel_start_delay_frames,
                         user_backchannel_end_delay_frames=self.cfg.user_backchannel_end_delay_frames,
+                        unaligned_substantive_fallback_max_words=(
+                            self.cfg.multiturn_unaligned_substantive_fallback_max_words
+                        ),
                         cut_id=str(getattr(cut, "id", "<unknown>")),
                     )
                 elif self.cfg.add_utterance_boundary_tokens:
