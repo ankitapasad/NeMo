@@ -1973,6 +1973,57 @@ class TestLeanMultiTurnDataset:
 
     @pytest.mark.parametrize(
         ("mode", "user_backchannel_end_token"),
+        [("sob_eou", "<eou>"), ("sob_eob", "<eob>")],
+    )
+    def test_unaligned_user_backchannel_uses_annotated_fragment_fallback(
+        self, mode, user_backchannel_end_token, caplog
+    ):
+        custom = _lean_multiturn_custom()
+        custom["sample_id"] = "manifest-row-id"
+        fragment = custom["curation"]["target"]["components"][1]["fragments"][0]
+        fragment.update(text="Oh.", start=0.9, duration=0.06)
+        sample = parse_lean_multiturn_metadata(
+            custom,
+            audio_duration_secs=3.0,
+            cut_id="unaligned-user-backchannel",
+            user_backchannel_mode=mode,
+        )
+
+        resolved = build_lean_multiturn_alignments(
+            sample,
+            [WordAlignment("Hello", 0.3, 0.6), WordAlignment("World", 1.6, 2.0)],
+            audio_duration_secs=3.0,
+            start_token="<sou>",
+            end_token="<eou>",
+            start_delay_frames=2,
+            end_delay_frames=3,
+            user_backchannel_start_token="<sob>",
+            user_backchannel_end_token=user_backchannel_end_token,
+            user_backchannel_start_delay_frames=4,
+            user_backchannel_end_delay_frames=2,
+            cut_id="unaligned-user-backchannel",
+        )
+
+        assert [alignment.text for alignment in resolved] == [
+            "<sou>",
+            "Hello",
+            "<eou>",
+            "<sob>",
+            "Oh.",
+            user_backchannel_end_token,
+            "<sou>",
+            "World",
+            "<eou>",
+        ]
+        assert [alignment.delay_frames for alignment in resolved[3:6]] == [4, None, 2]
+        assert (resolved[4].start_time, resolved[4].end_time) == pytest.approx((0.9, 0.96))
+        assert "TTM_UNALIGNED_USER_BACKCHANNEL_FALLBACK" in caplog.text
+        assert "cut_id='unaligned-user-backchannel' sample_id='manifest-row-id'" in caplog.text
+        assert "segment_idx=1 event_id=1 start_s=0.900 end_s=0.960" in caplog.text
+        assert "word_count=1 text='Oh.'" in caplog.text
+
+    @pytest.mark.parametrize(
+        ("mode", "user_backchannel_end_token"),
         [("ignore", None), ("sob_eou", "<eou>"), ("sob_eob", "<eob>")],
     )
     def test_short_substantive_fallback_is_consistent_across_user_backchannel_modes(

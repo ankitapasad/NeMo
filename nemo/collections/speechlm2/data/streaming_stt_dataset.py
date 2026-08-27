@@ -1008,6 +1008,35 @@ def build_lean_multiturn_alignments(
         if segment.text and not segment_alignments:
             word_count = len(segment.text.split())
             if (
+                segment.user_backchannel_event_id
+                and user_backchannel_start_token is not None
+                and user_backchannel_end_token is not None
+            ):
+                logging.warning(
+                    "TTM_UNALIGNED_USER_BACKCHANNEL_FALLBACK cut_id=%r sample_id=%r segment_idx=%d "
+                    "event_id=%d start_s=%.3f end_s=%.3f word_count=%d text=%r",
+                    cut_id,
+                    sample.sample_id,
+                    segment_idx,
+                    segment.user_backchannel_event_id,
+                    segment.start_time,
+                    segment.end_time,
+                    word_count,
+                    segment.text,
+                )
+                # The annotated fragment is the authoritative backchannel
+                # event. This second-line fallback also covers forced-aligner
+                # results that were locally usable but no longer land inside
+                # the fragment after timestamps are shifted into clip time.
+                segment_alignments = [
+                    WordAlignment(
+                        text=segment.text,
+                        start_time=segment.start_time,
+                        end_time=segment.end_time,
+                        delay_frames=None,
+                    )
+                ]
+            elif (
                 segment.turn_ordinal
                 and unaligned_substantive_fallback_max_words > 0
                 and word_count <= unaligned_substantive_fallback_max_words
