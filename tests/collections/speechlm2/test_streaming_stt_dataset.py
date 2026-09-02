@@ -1347,6 +1347,136 @@ class TestAgentBackchannelTargets:
 
 
 # ===========================================================================
+# Tests: StreamingSTTDataset on-the-fly audio augmentation
+# ===========================================================================
+class _RecordingAudioAugmenter:
+
+    def __init__(self):
+        self.calls = []
+
+    def augment_batch(self, cfg, audios, audio_lens):
+        self.calls.append((cfg, audios.clone(), audio_lens.clone()))
+        return audios + 1
+
+
+def _make_audio_augmentation_dataset(*, force=False):
+    dataset = StreamingSTTDataset(
+        cfg={
+            "sample_rate": 16000,
+            "frame_length_in_secs": FRAME_LEN,
+            "chunk_size": CHUNK_SIZE,
+            "audio_tag": AUDIO_TAG,
+            "blank_token": BLANK_TOKEN,
+            "force_use_noise_augmentation": force,
+            "use_noise_aug": True,
+            "noise_prob": 0.5,
+            "noise_aug_path": "/tmp/noise",
+            "noise_min_snr": -30,
+            "noise_max_snr": 60,
+            "noise_prob_scale_user_min_snr": -30,
+            "noise_prob_scale_user_max_snr": 60,
+            "use_room_ir_aug": True,
+            "roomir_prob": 0.8,
+            "roomir_aug_path": "/tmp/roomir",
+            "use_mic_ir_aug": True,
+            "micir_prob": 0.6,
+            "micir_aug_path": "/tmp/micir",
+            "use_codec_aug": True,
+            "codec_prob": 0.1,
+        },
+        tokenizer=_MockNemoTokenizer(_MockHFTokenizer()),
+    )
+    dataset.audio_augmenter = _RecordingAudioAugmenter()
+    return dataset
+
+
+def _get_audio_augmentation_batch(dataset, *, task="asr"):
+    return dataset.get_batch_data(
+        cuts=[SimpleNamespace(id="augmentation-test", custom={}, task=task)],
+        audios=torch.zeros(1, 16000),
+        audio_lens=torch.tensor([16000]),
+        alignments=[[WordAlignment(text="Hello", start_time=0.16, end_time=0.48)]],
+        text=["Hello"],
+    )
+
+
+def test_audio_augmentation_accepts_duplex_reference_config_fields():
+    dataset = _make_audio_augmentation_dataset(force=True)
+
+    assert dataset.cfg.noise_min_snr == -30
+    assert dataset.cfg.noise_max_snr == 60
+    assert dataset.cfg.roomir_prob == pytest.approx(0.8)
+    assert dataset.cfg.micir_prob == pytest.approx(0.6)
+    assert dataset.cfg.codec_prob == pytest.approx(0.1)
+
+
+def test_audio_augmentation_applies_on_the_fly_to_forced_asr_training_batch():
+    dataset = _make_audio_augmentation_dataset(force=True)
+
+    batch = _get_audio_augmentation_batch(dataset)
+
+    assert len(dataset.audio_augmenter.calls) == 1
+    cfg, original_audios, original_lens = dataset.audio_augmenter.calls[0]
+    assert cfg["force_use_noise_augmentation"] is True
+    assert cfg["noise_aug_path"] == "/tmp/noise"
+    assert torch.equal(original_audios, torch.zeros(1, 16000))
+    assert original_lens.tolist() == [16000]
+    assert torch.equal(batch.audios, torch.ones(1, 16000))
+    assert batch.audio_lens.tolist() == [16000]
+
+
+def test_audio_augmentation_changes_waveform_with_real_noise_file(tmp_path):
+    import numpy as np
+    import soundfile as sf
+
+    noise_dir = tmp_path / "noise" / "all"
+    noise_dir.mkdir(parents=True)
+    sf.write(noise_dir / "noise.wav", np.full(16000, 0.01, dtype=np.float32), 16000)
+    dataset = StreamingSTTDataset(
+        cfg={
+            "sample_rate": 16000,
+            "frame_length_in_secs": FRAME_LEN,
+            "chunk_size": CHUNK_SIZE,
+            "audio_tag": AUDIO_TAG,
+            "blank_token": BLANK_TOKEN,
+            "force_use_noise_augmentation": True,
+            "use_noise_aug": True,
+            "noise_prob": 1.0,
+            "noise_aug_path": str(tmp_path / "noise"),
+            "noise_min_snr": 20,
+            "noise_max_snr": 20,
+            "noise_prob_scale_user": 0.0,
+            "noise_prob_low_pass": 0.0,
+        },
+        tokenizer=_MockNemoTokenizer(_MockHFTokenizer()),
+    )
+
+    batch = _get_audio_augmentation_batch(dataset)
+
+    assert not torch.equal(batch.audios, torch.zeros(1, 16000))
+    assert torch.isfinite(batch.audios).all()
+
+
+def test_audio_augmentation_skips_asr_without_force_override():
+    dataset = _make_audio_augmentation_dataset(force=False)
+
+    batch = _get_audio_augmentation_batch(dataset)
+
+    assert dataset.audio_augmenter.calls == []
+    assert torch.equal(batch.audios, torch.zeros(1, 16000))
+
+
+def test_audio_augmentation_skips_validation_batches():
+    dataset = _make_audio_augmentation_dataset(force=True)
+
+    with torch.no_grad():
+        batch = _get_audio_augmentation_batch(dataset)
+
+    assert dataset.audio_augmenter.calls == []
+    assert torch.equal(batch.audios, torch.zeros(1, 16000))
+
+
+# ===========================================================================
 # Tests: StreamingSTTDataset boundary-token integration
 # ===========================================================================
 class TestStreamingSTTDatasetBoundaryIntegration:

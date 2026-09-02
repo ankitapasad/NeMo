@@ -39,6 +39,7 @@ from nemo.collections.speechlm2.parts.alignments import (
     add_utterance_boundary_alignments,
     get_word_alignments_for_batch,
 )
+from nemo.collections.speechlm2.parts.augmentation import AudioAugmenter
 from nemo.collections.speechlm2.parts.utils import to_dataclass
 
 AUDIO_TOKEN_IDX = -200
@@ -607,6 +608,31 @@ class StreamingSTTDataConfig:
     # online forced alignment is empty or falls outside the target region.
     # Zero preserves strict rejection of every unaligned substantive fragment.
     multiturn_unaligned_substantive_fallback_max_words: int = 0
+    # On-the-fly acoustic augmentation. Defaults are disabled so existing
+    # training and validation behavior is unchanged unless explicitly enabled.
+    force_use_noise_augmentation: bool = False
+    use_noise_aug: bool = False
+    noise_prob: float = 0.99
+    noise_aug_path: Optional[str] = None
+    noise_min_snr: int = 20
+    noise_max_snr: int = 50
+    noise_prob_scale_user: float = 0.3
+    noise_prob_scale_user_min_snr: float = -15.0
+    noise_prob_scale_user_max_snr: float = 24.0
+    snr_measure_dur: float = 0.0
+    noise_resample: bool = True
+    noise_prob_low_pass: float = 0.1
+    use_room_ir_aug: bool = False
+    roomir_prob: float = 0.0
+    roomir_aug_path: Optional[str] = None
+    roomir_use_loudness_norm: bool = True
+    use_mic_ir_aug: bool = False
+    micir_prob: float = 0.0
+    micir_aug_path: Optional[str] = None
+    micir_use_loudness_norm: bool = True
+    use_codec_aug: bool = False
+    codec_prob: float = 0.0
+    codec_settings: Optional[dict[str, list[str]]] = None
     # K — only effective in dynamic chunking (chunk_size == 0). Each audio
     # segment is rounded UP to a multiple of K frames (and total audio is
     # padded to K-multiple). The model implicitly learns to emit only at
@@ -1972,6 +1998,16 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
         self.cfg: StreamingSTTDataConfig = to_dataclass(
             StreamingSTTDataConfig, _normalize_legacy_text_token_config(cfg)
         )
+        self.audio_augmenter = None
+        if any(
+            (
+                self.cfg.use_noise_aug,
+                self.cfg.use_room_ir_aug,
+                self.cfg.use_mic_ir_aug,
+                self.cfg.use_codec_aug,
+            )
+        ):
+            self.audio_augmenter = AudioAugmenter(sample_rate=self.cfg.sample_rate)
         if self.cfg.compact_text_end_only_no_blank and not self.cfg.compact_template:
             raise ValueError("compact_text_end_only_no_blank=True requires compact_template=True")
         if (
@@ -2102,6 +2138,25 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
                     )
                 self._eob_id = eob_ids[0]
                 self._user_backchannel_end_id = self._eob_id
+
+    def _is_augmentation_task(self, task: str) -> bool:
+        if self.cfg.force_use_noise_augmentation:
+            return True
+        return task not in ("s2s_duplex_overlap_as_s2s_duplex", "asr")
+
+    def _apply_audio_augmentation(
+        self,
+        cuts: CutSet | list,
+        audios: torch.Tensor,
+        audio_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply configured acoustic augmentation to training batches only."""
+        if self.audio_augmenter is None or not torch.is_grad_enabled():
+            return audios
+        first_cut = next(iter(cuts), None)
+        if first_cut is None or not self._is_augmentation_task(getattr(first_cut, "task", "s2s_duplex")):
+            return audios
+        return self.audio_augmenter.augment_batch(vars(self.cfg), audios, audio_lens)
 
     def _get_multiturn_samples(
         self,
@@ -2738,6 +2793,8 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             target_token_lens = torch.tensor(
                 [target_tokens.shape[1] for _ in range(len(all_target_ids))], dtype=torch.long
             )
+
+        audios = self._apply_audio_augmentation(cuts, audios, audio_lens)
 
         return StreamingSTTBatch(
             audios=audios,
