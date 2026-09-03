@@ -86,7 +86,7 @@ data:
     force_use_noise_augmentation: true
     use_noise_aug: true
     noise_prob: 0.5
-    noise_aug_path: /lustre/fsw/portfolios/nemotron/projects/nemotron_speechprod_chat/data/ttm_otf_audio_augmentation_20260902/noise
+    noise_aug_path: /lustre/fsw/portfolios/nemotron/projects/nemotron_speechprod_chat/data/noise_augmentation_assets/noise
     noise_min_snr: 20
     noise_max_snr: 50
     noise_prob_scale_user: 0.3
@@ -97,11 +97,11 @@ data:
     noise_prob_low_pass: 0.1
     use_room_ir_aug: true
     roomir_prob: 0.8
-    roomir_aug_path: /lustre/fsw/portfolios/nemotron/projects/nemotron_speechprod_chat/data/ttm_otf_audio_augmentation_20260902/roomir
+    roomir_aug_path: /lustre/fsw/portfolios/nemotron/projects/nemotron_speechprod_chat/data/noise_augmentation_assets/roomir
     roomir_use_loudness_norm: true
     use_mic_ir_aug: true
     micir_prob: 0.6
-    micir_aug_path: /lustre/fsw/portfolios/nemotron/projects/nemotron_speechprod_chat/data/ttm_otf_audio_augmentation_20260902/micir
+    micir_aug_path: /lustre/fsw/portfolios/nemotron/projects/nemotron_speechprod_chat/data/noise_augmentation_assets/micir
     micir_use_loudness_norm: true
     use_codec_aug: true
     codec_prob: 0.1
