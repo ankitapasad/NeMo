@@ -58,6 +58,7 @@ from nemo.collections.speechlm2.data.streaming_stt_dataset import (
     parse_lean_multiturn_metadata,
 )
 from nemo.collections.speechlm2.parts.alignments import WordAlignment, add_utterance_boundary_alignments
+from nemo.collections.speechlm2.parts.augmentation import AudioAugmenter
 
 # ---------------------------------------------------------------------------
 # Shared constants & helpers matching the docstring example
@@ -1455,6 +1456,45 @@ def test_audio_augmentation_changes_waveform_with_real_noise_file(tmp_path):
 
     assert not torch.equal(batch.audios, torch.zeros(1, 16000))
     assert torch.isfinite(batch.audios).all()
+
+
+def test_numpy_backed_audio_augmentations_accept_bfloat16(tmp_path, monkeypatch):
+    import numpy as np
+    import soundfile as sf
+
+    ir_dir = tmp_path / "ir"
+    ir_dir.mkdir()
+    impulse = np.zeros(128, dtype=np.float32)
+    impulse[0] = 1.0
+    sf.write(ir_dir / "impulse.wav", impulse, 16000)
+
+    augmenter = AudioAugmenter(sample_rate=16000)
+    audio = torch.linspace(-0.25, 0.25, 1024, dtype=torch.float32).reshape(1, -1).to(torch.bfloat16)
+    audio_lens = torch.tensor([audio.shape[1]])
+
+    lowpassed = augmenter._apply_lowpass_filter(audio[0], cutoff=1000.0)
+    assert lowpassed.shape == audio[0].shape
+    assert torch.isfinite(lowpassed).all()
+
+    for method, folder_arg in (
+        (augmenter.add_room_ir_to_batch, "roomir_folder"),
+        (augmenter.add_mic_ir_to_batch, "micir_folder"),
+    ):
+        augmented = method(
+            audio.clone(),
+            audio_lens,
+            **{folder_arg: str(ir_dir)},
+            use_loudness_norm=False,
+        )
+        assert augmented.dtype == torch.bfloat16
+        assert augmented.shape == audio.shape
+        assert torch.isfinite(augmented).all()
+
+    monkeypatch.setattr(augmenter, "_apply_ffmpeg_codec", lambda waveform, _args: waveform)
+    augmented = augmenter.add_codec_to_batch(audio.clone(), audio_lens, codec_settings={"test": []})
+    assert augmented.dtype == torch.bfloat16
+    assert augmented.shape == audio.shape
+    assert torch.isfinite(augmented).all()
 
 
 def test_audio_augmentation_skips_asr_without_force_override():

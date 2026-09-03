@@ -135,7 +135,10 @@ class AudioAugmenter:
             self._lowpass_filter_cache[cache_key] = (b, a)
 
         b, a = self._lowpass_filter_cache[cache_key]
-        y_cpu = lfilter(b, a, audio.cpu().numpy())
+        # NumPy does not support torch.bfloat16, which is the dtype used by the
+        # streaming STT training path. Convert explicitly at the torch/NumPy
+        # boundary and cast the augmented result back at the caller boundary.
+        y_cpu = lfilter(b, a, audio.detach().to(device="cpu", dtype=torch.float32).numpy())
         y_gpu = torch.tensor(y_cpu, dtype=torch.float32, device=audio.device)
         return y_gpu
 
@@ -169,7 +172,9 @@ class AudioAugmenter:
             if len(ir.shape) > 1:
                 ir = np.mean(ir, axis=1)
 
-            audio_cpu = batch_audio[i, :audio_length].cpu().numpy()
+            audio_cpu = (
+                batch_audio[i, :audio_length].detach().to(device="cpu", dtype=torch.float32).numpy()
+            )
 
             if use_loudness_norm and PYLOUDNORM_AVAILABLE:
                 meter = pyln.Meter(self.sample_rate)
@@ -253,7 +258,9 @@ class AudioAugmenter:
             if len(ir.shape) > 1:
                 ir = np.mean(ir, axis=1)
 
-            audio_cpu = batch_audio[i, :audio_length].cpu().numpy()
+            audio_cpu = (
+                batch_audio[i, :audio_length].detach().to(device="cpu", dtype=torch.float32).numpy()
+            )
 
             if use_loudness_norm and PYLOUDNORM_AVAILABLE:
                 meter = pyln.Meter(self.sample_rate)
@@ -321,7 +328,9 @@ class AudioAugmenter:
 
             codec_name, codec_args = random.choice(list(codec_settings.items()))
 
-            audio_cpu = batch_audio[i, :audio_length].cpu().numpy()
+            audio_cpu = (
+                batch_audio[i, :audio_length].detach().to(device="cpu", dtype=torch.float32).numpy()
+            )
 
             try:
                 degraded = self._apply_ffmpeg_codec(audio_cpu, codec_args)
