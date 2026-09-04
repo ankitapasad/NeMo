@@ -2627,9 +2627,9 @@ def test_dataloader_from_tarred_nemo_manifest_with_offset(nemo_tarred_manifest_p
     )
 
 
-@pytest.fixture(scope="session")
-def nemo_tarred_multiturn_context_path(tmp_path_factory) -> Tuple[str, str, np.ndarray]:
-    """A v2 logical segment backed by a 10-second physical tar member."""
+@pytest.fixture(scope="session", params=["lean_multi_turn_v2", "lean_multi_turn_v3"])
+def nemo_tarred_multiturn_context_path(request, tmp_path_factory) -> Tuple[str, str, np.ndarray]:
+    """A supported lean multi-turn segment backed by a 10-second physical tar member."""
     from lhotse.serialization import SequentialJsonlWriter
     from lhotse.shar.writers import TarWriter
 
@@ -2654,7 +2654,7 @@ def nemo_tarred_multiturn_context_path(tmp_path_factory) -> Tuple[str, str, np.n
         "lang": "en",
         "shard_id": 0,
         "curation": {
-            "schema_version": "lean_multi_turn_v2",
+            "schema_version": request.param,
             "audio_context": {
                 "leading_sil": 1.0,
                 "trailing_sil": 1.0,
