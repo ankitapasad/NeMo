@@ -104,7 +104,7 @@ def _confirmed_fragment(text="Okay.", start=0.4, duration=0.2, status="confirmed
     }
 
 
-def _lean_multiturn_custom():
+def _lean_multiturn_custom(schema_version="lean_multi_turn_v2"):
     source_specs = [
         ("turn-1", "source-complete", "complete_turn"),
         ("turn-2", "source-pause", "pause_within_turn"),
@@ -134,7 +134,7 @@ def _lean_multiturn_custom():
         region["turn_id"], region["source_sample_id"], region["source_sample_type"] = source_spec
     return {
         "curation": {
-            "schema_version": "lean_multi_turn_v2",
+            "schema_version": schema_version,
             "target": {
                 "components": components,
                 "utterance_regions": regions,
@@ -1647,25 +1647,26 @@ class TestStreamingSTTDatasetBoundaryIntegration:
 
 class TestLeanMultiTurnDataset:
 
-    def test_parser_uses_real_regions_without_concatenating_rows(self):
+    @pytest.mark.parametrize("schema_version", ["lean_multi_turn_v2", "lean_multi_turn_v3"])
+    def test_parser_uses_real_regions_without_concatenating_rows(self, schema_version):
         ignored = parse_lean_multiturn_metadata(
-            _lean_multiturn_custom(),
+            _lean_multiturn_custom(schema_version),
             audio_duration_secs=3.0,
             cut_id="multi",
         )
         sob_eou = parse_lean_multiturn_metadata(
-            _lean_multiturn_custom(),
+            _lean_multiturn_custom(schema_version),
             audio_duration_secs=3.0,
             cut_id="multi",
             user_backchannel_mode="sob_eou",
         )
         sob_eob = parse_lean_multiturn_metadata(
-            _lean_multiturn_custom(),
+            _lean_multiturn_custom(schema_version),
             audio_duration_secs=3.0,
             cut_id="multi",
             user_backchannel_mode="sob_eob",
         )
-        assert ignored.schema_version == "lean_multi_turn_v2"
+        assert ignored.schema_version == schema_version
         assert ignored.num_substantive_turns == 2
         assert ignored.transcript == "Hello. World."
         assert [(segment.start_time, segment.end_time, segment.turn_ordinal) for segment in ignored.segments] == [

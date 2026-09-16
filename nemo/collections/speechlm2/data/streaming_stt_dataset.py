@@ -49,7 +49,7 @@ UTTERANCE_BOUNDARY_TIMESTAMP_SOURCES = {
     UTTERANCE_BOUNDARY_TIMESTAMP_SOURCE_ALIGNMENT,
     UTTERANCE_BOUNDARY_TIMESTAMP_SOURCE_GT_PREFERRED,
 }
-LEAN_MULTI_TURN_SCHEMA_VERSION = "lean_multi_turn_v2"
+LEAN_MULTI_TURN_SCHEMA_VERSIONS = frozenset({"lean_multi_turn_v2", "lean_multi_turn_v3"})
 LEAN_MULTI_TURN_SOURCE_SAMPLE_TYPES = {"complete_turn", "pause_within_turn"}
 USER_BACKCHANNEL_MODE_IGNORE = "ignore"
 USER_BACKCHANNEL_MODE_SOB_EOU = "sob_eou"
@@ -133,7 +133,7 @@ def parse_lean_multiturn_metadata(
         return None
     curation = _require_mapping(curation, field="curation", cut_id=cut_id)
     schema_version = curation.get("schema_version")
-    if schema_version != LEAN_MULTI_TURN_SCHEMA_VERSION:
+    if schema_version not in LEAN_MULTI_TURN_SCHEMA_VERSIONS:
         target = curation.get("target")
         if isinstance(target, Mapping) and "utterance_regions" in target:
             raise ValueError(
@@ -799,7 +799,7 @@ def build_agent_backchannel_alignments(
 
     duration = _validate_timestamp(audio_duration_secs, field="audio_duration_secs", cut_id=cut_id)
     eligible_ranges: list[tuple[float, float]]
-    if curation.get("schema_version") == LEAN_MULTI_TURN_SCHEMA_VERSION:
+    if curation.get("schema_version") in LEAN_MULTI_TURN_SCHEMA_VERSIONS:
         target = _require_mapping(curation.get("target"), field="curation.target", cut_id=cut_id)
         regions = _require_list(
             target.get("utterance_regions"), field="curation.target.utterance_regions", cut_id=cut_id

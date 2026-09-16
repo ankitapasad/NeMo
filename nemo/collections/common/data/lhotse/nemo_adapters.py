@@ -47,7 +47,7 @@ from nemo.utils import logging
 from nemo.utils.data_utils import is_datastore_path
 
 
-LEAN_MULTI_TURN_SCHEMA_VERSION = "lean_multi_turn_v2"
+LEAN_MULTI_TURN_SCHEMA_VERSIONS = frozenset({"lean_multi_turn_v2", "lean_multi_turn_v3"})
 _CONTEXT_SAMPLING_FIELDS = {
     "min_leading_s",
     "min_trailing_s",
@@ -211,23 +211,25 @@ def _sample_lean_multiturn_context(
     context_sampling: Mapping,
     seed: int,
 ) -> dict:
-    """Return a copied v2 row with a sampled real-audio crop and shifted relative timestamps."""
+    """Return a copied lean multi-turn row with a sampled crop and shifted relative timestamps."""
     data = copy.deepcopy(dict(data))
     sample_id = data.get("sample_id")
     if not isinstance(sample_id, str) or not sample_id:
         raise ValueError("context_sampling requires a non-empty sample_id")
     curation = data.get("curation")
-    if not isinstance(curation, Mapping) or curation.get("schema_version") != LEAN_MULTI_TURN_SCHEMA_VERSION:
+    if not isinstance(curation, Mapping) or curation.get("schema_version") not in LEAN_MULTI_TURN_SCHEMA_VERSIONS:
         schema_version = curation.get("schema_version") if isinstance(curation, Mapping) else None
         raise ValueError(
-            f"context_sampling is supported only for {LEAN_MULTI_TURN_SCHEMA_VERSION}; "
+            f"context_sampling is supported only for {sorted(LEAN_MULTI_TURN_SCHEMA_VERSIONS)}; "
             f"sample {sample_id!r} has schema {schema_version!r}"
         )
     audio_context = curation.get("audio_context")
     physical_audio = curation.get("physical_audio")
     target = curation.get("target")
     if not all(isinstance(item, Mapping) for item in (audio_context, physical_audio, target)):
-        raise ValueError(f"Sample {sample_id!r} is missing v2 audio_context, physical_audio, or target metadata")
+        raise ValueError(
+            f"Sample {sample_id!r} is missing lean multi-turn audio_context, physical_audio, or target metadata"
+        )
     if physical_audio.get("stores_all_available_transcript_bounded_context") is not True:
         raise ValueError(f"Sample {sample_id!r} physical member does not guarantee all available context")
 
@@ -589,7 +591,7 @@ class LazyNeMoTarredIterator:
     Override with an integer value for deterministic behaviour and consult Lhotse documentation for details:
     https://lhotse.readthedocs.io/en/latest/datasets.html#handling-random-seeds
 
-    ``context_sampling`` is an opt-in policy for ``lean_multi_turn_v2`` rows whose tar member stores all
+    ``context_sampling`` is an opt-in policy for supported lean multi-turn rows whose tar member stores all
     transcript-bounded context. It samples each side from its configured minimum through that row's full
     advertised availability before the in-memory subset is created, shifts row-relative timestamps, and enforces
     a maximum total cut duration. It is intentionally unsupported by the AIS batch path because that path does
