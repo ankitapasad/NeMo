@@ -49,7 +49,10 @@ UTTERANCE_BOUNDARY_TIMESTAMP_SOURCES = {
     UTTERANCE_BOUNDARY_TIMESTAMP_SOURCE_ALIGNMENT,
     UTTERANCE_BOUNDARY_TIMESTAMP_SOURCE_GT_PREFERRED,
 }
-LEAN_MULTI_TURN_SCHEMA_VERSIONS = frozenset({"lean_multi_turn_v2", "lean_multi_turn_v3"})
+LEAN_MULTI_TURN_SCHEMA_V4 = "lean_multi_turn_v4"
+LEAN_MULTI_TURN_SCHEMA_VERSIONS = frozenset(
+    {"lean_multi_turn_v2", "lean_multi_turn_v3", LEAN_MULTI_TURN_SCHEMA_V4}
+)
 LEAN_MULTI_TURN_SOURCE_SAMPLE_TYPES = {"complete_turn", "pause_within_turn"}
 USER_BACKCHANNEL_MODE_IGNORE = "ignore"
 USER_BACKCHANNEL_MODE_SOB_EOU = "sob_eou"
@@ -115,7 +118,10 @@ def parse_lean_multiturn_metadata(
 ) -> MultiTurnSample | None:
     """Parse a supported lean multi-turn row without synthesizing conversations.
 
-    Substantive components map one-for-one, in order, to ``utterance_regions``.
+    In v2/v3, substantive components map one-for-one, in order, to
+    ``utterance_regions``. In v4, each substantive component retains that
+    conversational-turn region while its ordered ``utterance_units`` expand to
+    independently bounded training segments.
     User backchannels are omitted in ``ignore`` mode. Boundary modes
     retain each annotated fragment as one distinct chronological event.
     """
@@ -208,6 +214,8 @@ def parse_lean_multiturn_metadata(
     segments: list[MultiTurnTargetSegment] = []
     transcript_pieces: list[str] = []
     complete_idx = 0
+    global_utterance_unit_idx = 0
+    utterance_unit_ids: set[str] = set()
     user_backchannel_event_idx = 0
     previous_component_start = -math.inf
     for component_idx, raw_component in enumerate(components):
@@ -260,20 +268,109 @@ def parse_lean_multiturn_metadata(
                         f"Cut {cut_id!r} {prefix} fragments must be contained in substantive "
                         f"utterance region {complete_idx}"
                     )
-            text = " ".join(fragment_text for _, _, fragment_text in validated_fragments)
-            complete_idx += 1
-            transcript_pieces.append(text)
-            segments.append(
-                MultiTurnTargetSegment(
-                    text=text,
-                    start_time=region_start,
-                    end_time=region_end,
-                    turn_ordinal=complete_idx,
-                    turn_id=region["turn_id"],
-                    source_sample_id=region["source_sample_id"],
-                    source_sample_type=region["source_sample_type"],
+            turn_ordinal = complete_idx + 1
+            if schema_version == LEAN_MULTI_TURN_SCHEMA_V4:
+                if component.get("substantive_turn_ordinal") != complete_idx:
+                    raise ValueError(
+                        f"Cut {cut_id!r} {prefix}.substantive_turn_ordinal must equal {complete_idx}"
+                    )
+                units = _require_list(
+                    component.get("utterance_units"), field=f"{prefix}.utterance_units", cut_id=cut_id
                 )
-            )
+                if not units:
+                    raise ValueError(f"Cut {cut_id!r} {prefix}.utterance_units must not be empty")
+                fragment_ids = []
+                for fragment_idx, raw_fragment in enumerate(fragments):
+                    fragment_prefix = f"{prefix}.fragments[{fragment_idx}]"
+                    fragment = _require_mapping(raw_fragment, field=fragment_prefix, cut_id=cut_id)
+                    fragment_id = fragment.get("source_fragment_id")
+                    if not isinstance(fragment_id, str) or not fragment_id:
+                        raise TypeError(
+                            f"Cut {cut_id!r} {fragment_prefix}.source_fragment_id must be a non-empty string"
+                        )
+                    fragment_ids.append(fragment_id)
+                if len(fragment_ids) != len(set(fragment_ids)):
+                    raise ValueError(f"Cut {cut_id!r} {prefix} has duplicate source_fragment_id values")
+
+                fragment_cursor = 0
+                for unit_idx, raw_unit in enumerate(units):
+                    unit_prefix = f"{prefix}.utterance_units[{unit_idx}]"
+                    unit = _require_mapping(raw_unit, field=unit_prefix, cut_id=cut_id)
+                    unit_id = unit.get("utterance_unit_id")
+                    if not isinstance(unit_id, str) or not unit_id:
+                        raise TypeError(f"Cut {cut_id!r} {unit_prefix}.utterance_unit_id must be a non-empty string")
+                    if unit_id in utterance_unit_ids:
+                        raise ValueError(f"Cut {cut_id!r} has duplicate utterance_unit_id {unit_id!r}")
+                    utterance_unit_ids.add(unit_id)
+                    if unit.get("utterance_unit_ordinal_within_turn") != unit_idx:
+                        raise ValueError(
+                            f"Cut {cut_id!r} {unit_prefix}.utterance_unit_ordinal_within_turn must equal {unit_idx}"
+                        )
+                    if unit.get("global_utterance_unit_ordinal") != global_utterance_unit_idx:
+                        raise ValueError(
+                            f"Cut {cut_id!r} {unit_prefix}.global_utterance_unit_ordinal must equal "
+                            f"{global_utterance_unit_idx}"
+                        )
+                    unit_fragment_ids = _require_list(
+                        unit.get("fragment_ids"), field=f"{unit_prefix}.fragment_ids", cut_id=cut_id
+                    )
+                    if not unit_fragment_ids or not all(
+                        isinstance(fragment_id, str) and fragment_id for fragment_id in unit_fragment_ids
+                    ):
+                        raise TypeError(
+                            f"Cut {cut_id!r} {unit_prefix}.fragment_ids must contain non-empty strings"
+                        )
+                    unit_end_cursor = fragment_cursor + len(unit_fragment_ids)
+                    if unit_fragment_ids != fragment_ids[fragment_cursor:unit_end_cursor]:
+                        raise ValueError(
+                            f"Cut {cut_id!r} {unit_prefix}.fragment_ids must partition component fragments in order"
+                        )
+                    first_start = validated_fragments[fragment_cursor][0]
+                    last_end = validated_fragments[unit_end_cursor - 1][1]
+                    unit_start = _validate_timestamp(unit.get("start"), field=f"{unit_prefix}.start", cut_id=cut_id)
+                    unit_end = _validate_timestamp(unit.get("end"), field=f"{unit_prefix}.end", cut_id=cut_id)
+                    if abs(unit_start - first_start) > 1e-6 or abs(unit_end - last_end) > 1e-6:
+                        raise ValueError(
+                            f"Cut {cut_id!r} {unit_prefix} timestamps must match its first/last fragment"
+                        )
+                    if unit_start < region_start - 1e-6 or unit_end > region_end + 1e-6:
+                        raise ValueError(f"Cut {cut_id!r} {unit_prefix} must be contained in its substantive turn")
+                    unit_text = " ".join(
+                        fragment_text
+                        for _, _, fragment_text in validated_fragments[fragment_cursor:unit_end_cursor]
+                    )
+                    transcript_pieces.append(unit_text)
+                    segments.append(
+                        MultiTurnTargetSegment(
+                            text=unit_text,
+                            start_time=unit_start,
+                            end_time=unit_end,
+                            turn_ordinal=turn_ordinal,
+                            turn_id=region["turn_id"],
+                            source_sample_id=region["source_sample_id"],
+                            source_sample_type=region["source_sample_type"],
+                        )
+                    )
+                    fragment_cursor = unit_end_cursor
+                    global_utterance_unit_idx += 1
+                if fragment_cursor != len(fragment_ids):
+                    raise ValueError(f"Cut {cut_id!r} {prefix}.utterance_units do not cover every fragment")
+            else:
+                text = " ".join(fragment_text for _, _, fragment_text in validated_fragments)
+                transcript_pieces.append(text)
+                segments.append(
+                    MultiTurnTargetSegment(
+                        text=text,
+                        start_time=region_start,
+                        end_time=region_end,
+                        turn_ordinal=turn_ordinal,
+                        turn_id=region["turn_id"],
+                        source_sample_id=region["source_sample_id"],
+                        source_sample_type=region["source_sample_type"],
+                    )
+                )
+                global_utterance_unit_idx += 1
+            complete_idx += 1
         elif user_backchannel_mode in {
             USER_BACKCHANNEL_MODE_SOB_EOU,
             USER_BACKCHANNEL_MODE_SOB_EOB,
@@ -289,6 +386,18 @@ def parse_lean_multiturn_metadata(
                         user_backchannel_event_id=user_backchannel_event_idx,
                     )
                 )
+
+    if schema_version == LEAN_MULTI_TURN_SCHEMA_V4:
+        declared_substantive_turns = curation.get("num_substantive_turns")
+        declared_utterance_units = curation.get("num_utterance_units")
+        if declared_substantive_turns != len(validated_regions):
+            raise ValueError(
+                f"Cut {cut_id!r} curation.num_substantive_turns must equal {len(validated_regions)}"
+            )
+        if declared_utterance_units != global_utterance_unit_idx:
+            raise ValueError(
+                f"Cut {cut_id!r} curation.num_utterance_units must equal {global_utterance_unit_idx}"
+            )
 
     segments.sort(key=lambda segment: (segment.start_time, segment.end_time, segment.turn_ordinal == 0))
     return MultiTurnSample(
@@ -2002,14 +2111,23 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
         samples = []
         for cut, duration_secs in zip(cuts, audio_durations_secs):
             cut_id = str(getattr(cut, "id", "<unknown>"))
-            samples.append(
-                parse_lean_multiturn_metadata(
-                    cut.custom or {},
-                    audio_duration_secs=duration_secs,
-                    cut_id=cut_id,
-                    user_backchannel_mode=self.cfg.user_backchannel_mode,
+            custom = cut.custom or {}
+            require_units = custom.get("require_utterance_unit_annotations", False)
+            if not isinstance(require_units, bool):
+                raise TypeError(
+                    f"Cut {cut_id!r} custom field 'require_utterance_unit_annotations' must be a boolean"
                 )
+            sample = parse_lean_multiturn_metadata(
+                custom,
+                audio_duration_secs=duration_secs,
+                cut_id=cut_id,
+                user_backchannel_mode=self.cfg.user_backchannel_mode,
             )
+            if require_units and (sample is None or sample.schema_version != LEAN_MULTI_TURN_SCHEMA_V4):
+                raise ValueError(
+                    f"Cut {cut_id!r} requires valid {LEAN_MULTI_TURN_SCHEMA_V4} utterance-unit annotations"
+                )
+            samples.append(sample)
         return samples
 
     @staticmethod

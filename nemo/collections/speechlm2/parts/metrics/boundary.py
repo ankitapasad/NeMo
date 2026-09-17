@@ -457,7 +457,7 @@ def compute_ordinal_boundary_timing_metrics(
     detection_tolerance_frames: int = 4,
     prediction_exclusion_mask: Tensor | None = None,
 ) -> dict[str, Tensor]:
-    """Classify the first boundary prediction inside each reference turn window.
+    """Classify the first boundary prediction inside each reference utterance-unit window.
 
     SOU turn-k window:
         previous reference EOU (or clip start) -> current reference EOU.
@@ -472,8 +472,11 @@ def compute_ordinal_boundary_timing_metrics(
 
     Windows are half-open except at clip end. Every prediction after the first
     in its window is spurious. Predictions outside all same-token reference
-    windows are also spurious. Rows without a kth substantive turn are excluded
-    from turn-k metrics.
+    windows are also spurious. Results remain grouped by substantive-turn
+    ordinal for backward-compatible metric names, but ``turn_k_num_samples``
+    counts reference utterance units in that turn. This is identical to the
+    legacy meaning for v2/v3 rows, which have exactly one unit per turn, while
+    allowing v4 rows to contain multiple ordered SOU/EOU pairs in one turn.
     """
     if pred_ids.shape != target_ids.shape or input_tokens.shape != target_ids.shape:
         raise ValueError("pred_ids, target_ids, and input_tokens must have identical shapes")
@@ -495,9 +498,8 @@ def compute_ordinal_boundary_timing_metrics(
     result: dict[str, Tensor] = {}
 
     for turn_ordinal in range(1, max_turns + 1):
-        eligible = is_multiturn.bool() & (num_substantive_turns >= turn_ordinal)
         prefix = f"turn_{turn_ordinal}"
-        result[f"{prefix}_num_samples"] = eligible.long().sum()
+        result[f"{prefix}_num_samples"] = torch.zeros((), dtype=torch.long, device=target_ids.device)
         for token_name in ("sou", "eou"):
             for outcome in ("early", "detection", "late", "missing", "spurious"):
                 result[f"{prefix}_{token_name}_{outcome}_count"] = torch.zeros(
@@ -514,21 +516,34 @@ def compute_ordinal_boundary_timing_metrics(
         if num_turns <= 0:
             raise ValueError("Multi-turn sample must contain at least one substantive turn")
 
-        reference_frames: dict[str, list[Tensor]] = {"sou": [], "eou": []}
-        for token_name, token_id in (("sou", sou_id), ("eou", eou_id)):
-            for turn_ordinal in range(1, num_turns + 1):
+        reference_units: list[tuple[int, Tensor, Tensor]] = []
+        for turn_ordinal in range(1, num_turns + 1):
+            turn_frames: dict[str, Tensor] = {}
+            for token_name, token_id in (("sou", sou_id), ("eou", eou_id)):
                 target_mask = (
                     valid_mask[sample_idx]
                     & (target_ids[sample_idx] == token_id)
                     & (boundary_turn_ordinals[sample_idx] == turn_ordinal)
                 )
-                frames = frame_idx[sample_idx][target_mask]
-                if frames.numel() != 1:
+                turn_frames[token_name] = frame_idx[sample_idx][target_mask]
+            if turn_frames["sou"].numel() == 0 or turn_frames["sou"].numel() != turn_frames["eou"].numel():
+                raise ValueError(
+                    f"Eligible sample has {turn_frames['sou'].numel()} SOU and "
+                    f"{turn_frames['eou'].numel()} EOU targets for substantive turn "
+                    f"{turn_ordinal}; expected a positive equal number"
+                )
+            for sou_frame, eou_frame in zip(turn_frames["sou"], turn_frames["eou"]):
+                if sou_frame > eou_frame:
                     raise ValueError(
-                        f"Eligible sample has {frames.numel()} {token_name.upper()} targets "
-                        f"for substantive turn {turn_ordinal}; expected exactly one"
+                        f"Eligible sample has SOU after EOU for substantive turn {turn_ordinal}"
                     )
-                reference_frames[token_name].append(frames[0])
+                reference_units.append((turn_ordinal, sou_frame, eou_frame))
+            if turn_ordinal <= max_turns:
+                result[f"turn_{turn_ordinal}_num_samples"] += turn_frames["sou"].numel()
+
+        for previous, current in zip(reference_units, reference_units[1:]):
+            if previous[2] > current[1]:
+                raise ValueError("Eligible sample has overlapping or out-of-order utterance-unit boundaries")
 
         clip_end_frame = frame_idx[sample_idx].max()
         for token_name, token_id in (("sou", sou_id), ("eou", eou_id)):
@@ -539,19 +554,19 @@ def compute_ordinal_boundary_timing_metrics(
             ]
             assigned_predictions = torch.zeros_like(prediction_frames, dtype=torch.bool)
 
-            for turn_ordinal in range(1, num_turns + 1):
+            for unit_idx, (turn_ordinal, sou_reference, eou_reference) in enumerate(reference_units):
                 if token_name == "sou":
                     window_start = (
-                        torch.zeros_like(reference_frames["eou"][0])
-                        if turn_ordinal == 1
-                        else reference_frames["eou"][turn_ordinal - 2]
+                        torch.zeros_like(eou_reference)
+                        if unit_idx == 0
+                        else reference_units[unit_idx - 1][2]
                     )
-                    window_end = reference_frames["eou"][turn_ordinal - 1]
+                    window_end = eou_reference
                     in_window = (prediction_frames >= window_start) & (prediction_frames < window_end)
                 else:
-                    window_start = reference_frames["sou"][turn_ordinal - 1]
-                    if turn_ordinal < num_turns:
-                        window_end = reference_frames["sou"][turn_ordinal]
+                    window_start = sou_reference
+                    if unit_idx + 1 < len(reference_units):
+                        window_end = reference_units[unit_idx + 1][1]
                         in_window = (prediction_frames >= window_start) & (prediction_frames < window_end)
                     else:
                         in_window = (prediction_frames >= window_start) & (prediction_frames <= clip_end_frame)
@@ -567,7 +582,7 @@ def compute_ordinal_boundary_timing_metrics(
                     continue
 
                 first_prediction = candidates[0]
-                reference = reference_frames[token_name][turn_ordinal - 1]
+                reference = sou_reference if token_name == "sou" else eou_reference
                 if token_name == "sou":
                     if first_prediction < reference:
                         outcome = "early"

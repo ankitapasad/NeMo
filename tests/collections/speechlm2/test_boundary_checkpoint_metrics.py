@@ -153,3 +153,66 @@ def test_ordinal_timing_metrics_classify_late_sou_and_early_eou():
 
     assert metrics["turn_1_sou_late_count"].item() == 1
     assert metrics["turn_1_eou_early_count"].item() == 1
+
+
+def test_ordinal_timing_metrics_score_multiple_utterance_units_within_one_turn():
+    sou_id, eou_id, regular_id, ignore_index, audio_token_idx = 10, 11, 1, -100, -200
+    target_ids = torch.full((1, 20), regular_id)
+    pred_ids = torch.full_like(target_ids, regular_id)
+    boundary_ordinals = torch.zeros_like(target_ids)
+
+    # Turn 1 has two utterance units; turn 2 has one. Predictions are exact.
+    for position, token_id, ordinal in (
+        (2, sou_id, 1),
+        (5, eou_id, 1),
+        (7, sou_id, 1),
+        (10, eou_id, 1),
+        (12, sou_id, 2),
+        (17, eou_id, 2),
+    ):
+        target_ids[0, position] = token_id
+        pred_ids[0, position] = token_id
+        boundary_ordinals[0, position] = ordinal
+
+    metrics = compute_ordinal_boundary_timing_metrics(
+        pred_ids=pred_ids,
+        target_ids=target_ids,
+        input_tokens=torch.full_like(target_ids, audio_token_idx),
+        boundary_turn_ordinals=boundary_ordinals,
+        is_multiturn=torch.tensor([True]),
+        num_substantive_turns=torch.tensor([2]),
+        sou_id=sou_id,
+        eou_id=eou_id,
+        ignore_index=ignore_index,
+        audio_token_idx=audio_token_idx,
+        max_turns=4,
+    )
+
+    assert metrics["turn_1_num_samples"].item() == 2
+    assert metrics["turn_1_sou_detection_count"].item() == 2
+    assert metrics["turn_1_eou_detection_count"].item() == 2
+    assert metrics["turn_2_num_samples"].item() == 1
+    assert metrics["turn_2_sou_detection_count"].item() == 1
+    assert metrics["turn_2_eou_detection_count"].item() == 1
+    assert metrics["sou_spurious_outside_count"].item() == 0
+    assert metrics["eou_spurious_outside_count"].item() == 0
+
+
+def test_ordinal_timing_metrics_reject_unpaired_utterance_unit_targets():
+    target_ids = torch.tensor([[10, 11, 10, 1]])
+    ordinals = torch.tensor([[1, 1, 1, 0]])
+
+    with pytest.raises(ValueError, match="2 SOU and 1 EOU"):
+        compute_ordinal_boundary_timing_metrics(
+            pred_ids=target_ids.clone(),
+            target_ids=target_ids,
+            input_tokens=torch.full_like(target_ids, -200),
+            boundary_turn_ordinals=ordinals,
+            is_multiturn=torch.tensor([True]),
+            num_substantive_turns=torch.tensor([1]),
+            sou_id=10,
+            eou_id=11,
+            ignore_index=-100,
+            audio_token_idx=-200,
+            max_turns=1,
+        )

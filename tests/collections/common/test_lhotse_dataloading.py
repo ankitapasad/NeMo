@@ -2627,7 +2627,7 @@ def test_dataloader_from_tarred_nemo_manifest_with_offset(nemo_tarred_manifest_p
     )
 
 
-@pytest.fixture(scope="session", params=["lean_multi_turn_v2", "lean_multi_turn_v3"])
+@pytest.fixture(scope="session", params=["lean_multi_turn_v2", "lean_multi_turn_v3", "lean_multi_turn_v4"])
 def nemo_tarred_multiturn_context_path(request, tmp_path_factory) -> Tuple[str, str, np.ndarray]:
     """A supported lean multi-turn segment backed by a 10-second physical tar member."""
     from lhotse.serialization import SequentialJsonlWriter
@@ -2712,6 +2712,22 @@ def nemo_tarred_multiturn_context_path(request, tmp_path_factory) -> Tuple[str, 
             },
         },
     }
+    if request.param == "lean_multi_turn_v4":
+        component = row["curation"]["target"]["components"][0]
+        component["substantive_turn_ordinal"] = 0
+        component["fragments"][0]["source_fragment_id"] = "fragment-1"
+        component["utterance_units"] = [
+            {
+                "utterance_unit_id": "unit-1",
+                "utterance_unit_ordinal_within_turn": 0,
+                "global_utterance_unit_ordinal": 0,
+                "fragment_ids": ["fragment-1"],
+                "start": 1.0,
+                "end": 4.0,
+            }
+        ]
+        row["curation"]["num_substantive_turns"] = 1
+        row["curation"]["num_utterance_units"] = 1
 
     with (
         TarWriter(f"{root}/audio_0.tar", shard_size=None) as tar_writer,
@@ -2769,6 +2785,10 @@ def test_tarred_multiturn_context_sampling_precedes_crop_and_shifts_timestamps(
     target = cut.custom["curation"]["target"]
     assert target["utterance_regions"][0]["start"] == pytest.approx(3.0)
     assert target["components"][0]["fragments"][0]["start"] == pytest.approx(3.0)
+    if target["components"][0].get("utterance_units"):
+        unit = target["components"][0]["utterance_units"][0]
+        assert unit["start"] == pytest.approx(3.0)
+        assert unit["end"] == pytest.approx(6.0)
     assert target["pause_regions"][0]["start"] == pytest.approx(4.0)
     other = cut.custom["curation"]["other_speaker"]["fragments"]
     assert [fragment["text"] for fragment in other] == ["retained leading context", "other"]

@@ -143,6 +143,60 @@ def _lean_multiturn_custom(schema_version="lean_multi_turn_v2"):
     }
 
 
+def _lean_multiturn_v4_custom():
+    custom = _lean_multiturn_custom("lean_multi_turn_v4")
+    first = custom["curation"]["target"]["components"][0]
+    first["fragments"] = [
+        {
+            "source_fragment_id": "fragment-1",
+            "start": 0.2,
+            "duration": 0.2,
+            "text": "Hello",
+        },
+        {
+            "source_fragment_id": "fragment-2",
+            "start": 0.5,
+            "duration": 0.2,
+            "text": "again.",
+        },
+    ]
+    first["substantive_turn_ordinal"] = 0
+    first["utterance_units"] = [
+        {
+            "utterance_unit_id": "unit-1",
+            "utterance_unit_ordinal_within_turn": 0,
+            "global_utterance_unit_ordinal": 0,
+            "fragment_ids": ["fragment-1"],
+            "start": 0.2,
+            "end": 0.4,
+        },
+        {
+            "utterance_unit_id": "unit-2",
+            "utterance_unit_ordinal_within_turn": 1,
+            "global_utterance_unit_ordinal": 1,
+            "fragment_ids": ["fragment-2"],
+            "start": 0.5,
+            "end": 0.7,
+        },
+    ]
+    second = custom["curation"]["target"]["components"][2]
+    second["substantive_turn_ordinal"] = 1
+    second["fragments"][0]["source_fragment_id"] = "fragment-3"
+    second["utterance_units"] = [
+        {
+            "utterance_unit_id": "unit-3",
+            "utterance_unit_ordinal_within_turn": 0,
+            "global_utterance_unit_ordinal": 2,
+            "fragment_ids": ["fragment-3"],
+            "start": 1.5,
+            "end": 2.2,
+        }
+    ]
+    custom["curation"]["num_substantive_turns"] = 2
+    custom["curation"]["num_utterance_units"] = 3
+    return custom
+
+
 def _make_messages(**overrides):
     """Convenience wrapper around get_llm_messages_for_sample with docstring defaults."""
     kw = dict(
@@ -1647,6 +1701,22 @@ class TestStreamingSTTDatasetBoundaryIntegration:
 
 class TestLeanMultiTurnDataset:
 
+    def test_per_loader_requirement_rejects_v3_but_accepts_v4(self):
+        dataset = object.__new__(StreamingSTTDataset)
+        dataset.cfg = SimpleNamespace(user_backchannel_mode="ignore")
+        legacy = _lean_multiturn_custom("lean_multi_turn_v3")
+        legacy["require_utterance_unit_annotations"] = True
+        with pytest.raises(ValueError, match="requires valid lean_multi_turn_v4"):
+            dataset._get_multiturn_samples(
+                [SimpleNamespace(id="legacy-required", custom=legacy)], [3.0]
+            )
+        annotated = _lean_multiturn_v4_custom()
+        annotated["require_utterance_unit_annotations"] = True
+        samples = dataset._get_multiturn_samples(
+            [SimpleNamespace(id="v4-required", custom=annotated)], [3.0]
+        )
+        assert samples[0].schema_version == "lean_multi_turn_v4"
+
     @pytest.mark.parametrize("schema_version", ["lean_multi_turn_v2", "lean_multi_turn_v3"])
     def test_parser_uses_real_regions_without_concatenating_rows(self, schema_version):
         ignored = parse_lean_multiturn_metadata(
@@ -1682,6 +1752,90 @@ class TestLeanMultiTurnDataset:
             "complete_turn",
             "pause_within_turn",
         ]
+
+    def test_v4_expands_internal_units_without_changing_parent_turn_count(self):
+        sample = parse_lean_multiturn_metadata(
+            _lean_multiturn_v4_custom(), audio_duration_secs=3.0, cut_id="v4-mixed"
+        )
+        assert sample.schema_version == "lean_multi_turn_v4"
+        assert sample.num_substantive_turns == 2
+        assert sample.transcript == "Hello again. World."
+        assert [(segment.text, segment.turn_ordinal) for segment in sample.segments] == [
+            ("Hello", 1),
+            ("again.", 1),
+            ("World.", 2),
+        ]
+
+        resolved = build_lean_multiturn_alignments(
+            sample,
+            [
+                WordAlignment("Hello", 0.22, 0.35),
+                WordAlignment("again", 0.52, 0.65),
+                WordAlignment("World", 1.6, 2.0),
+            ],
+            audio_duration_secs=3.0,
+            start_token="<sou>",
+            end_token="<eou>",
+            start_delay_frames=2,
+            end_delay_frames=3,
+            cut_id="v4-mixed",
+        )
+        markers = [item.text for item in resolved if item.text in {"<sou>", "<eou>"}]
+        assert markers == ["<sou>", "<eou>", "<sou>", "<eou>", "<sou>", "<eou>"]
+        assert all(pair != ("<eou>", "<eou>") for pair in zip(markers, markers[1:]))
+
+    def test_v4_all_continue_retains_one_pair_for_multi_fragment_turn(self):
+        custom = _lean_multiturn_v4_custom()
+        first = custom["curation"]["target"]["components"][0]
+        first["utterance_units"] = [
+            {
+                "utterance_unit_id": "unit-1-continued",
+                "utterance_unit_ordinal_within_turn": 0,
+                "global_utterance_unit_ordinal": 0,
+                "fragment_ids": ["fragment-1", "fragment-2"],
+                "start": 0.2,
+                "end": 0.7,
+            }
+        ]
+        second = custom["curation"]["target"]["components"][2]
+        second["utterance_units"][0]["global_utterance_unit_ordinal"] = 1
+        custom["curation"]["num_utterance_units"] = 2
+        sample = parse_lean_multiturn_metadata(custom, audio_duration_secs=3.0, cut_id="v4-continue")
+        assert [(segment.text, segment.turn_ordinal) for segment in sample.segments] == [
+            ("Hello again.", 1),
+            ("World.", 2),
+        ]
+
+    @pytest.mark.parametrize(
+        "mutation",
+        [
+            "reordered_fragments",
+            "stale_global_ordinal",
+            "wrong_substantive_ordinal",
+            "duplicate_unit_id",
+            "wrong_count",
+        ],
+    )
+    def test_v4_rejects_malformed_unit_contract(self, mutation):
+        custom = _lean_multiturn_v4_custom()
+        if mutation == "reordered_fragments":
+            custom["curation"]["target"]["components"][0]["utterance_units"][0]["fragment_ids"] = [
+                "fragment-2"
+            ]
+        elif mutation == "stale_global_ordinal":
+            custom["curation"]["target"]["components"][2]["utterance_units"][0][
+                "global_utterance_unit_ordinal"
+            ] = 7
+        elif mutation == "wrong_substantive_ordinal":
+            custom["curation"]["target"]["components"][2]["substantive_turn_ordinal"] = 0
+        elif mutation == "duplicate_unit_id":
+            custom["curation"]["target"]["components"][2]["utterance_units"][0][
+                "utterance_unit_id"
+            ] = "unit-1"
+        else:
+            custom["curation"]["num_utterance_units"] = 4
+        with pytest.raises(ValueError):
+            parse_lean_multiturn_metadata(custom, audio_duration_secs=3.0, cut_id=f"bad-{mutation}")
 
     def test_rejects_legacy_complete_turn_component_vocabulary(self):
         custom = _lean_multiturn_custom()

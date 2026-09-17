@@ -47,7 +47,9 @@ from nemo.utils import logging
 from nemo.utils.data_utils import is_datastore_path
 
 
-LEAN_MULTI_TURN_SCHEMA_VERSIONS = frozenset({"lean_multi_turn_v2", "lean_multi_turn_v3"})
+LEAN_MULTI_TURN_SCHEMA_VERSIONS = frozenset(
+    {"lean_multi_turn_v2", "lean_multi_turn_v3", "lean_multi_turn_v4"}
+)
 _CONTEXT_SAMPLING_FIELDS = {
     "min_leading_s",
     "min_trailing_s",
@@ -168,6 +170,25 @@ def _shift_start_fields(items, *, shift: float, field: str) -> None:
         if shifted_start < -1e-5:
             raise ValueError(f"{field}[{idx}].start becomes negative after context sampling: {shifted_start}")
         item["start"] = max(0.0, shifted_start)
+
+
+def _shift_utterance_unit_timestamps(items, *, shift: float, field: str) -> None:
+    """Shift the derived v4 unit bounds together with their source fragments."""
+    if items is None:
+        return
+    if not isinstance(items, list):
+        raise TypeError(f"{field} must be a list for context sampling")
+    for idx, item in enumerate(items):
+        if not isinstance(item, Mapping):
+            raise TypeError(f"{field}[{idx}] must be a mapping for context sampling")
+        if "start" not in item or "end" not in item:
+            raise ValueError(f"{field}[{idx}] is missing start or end for context sampling")
+        shifted_start = _finite_nonnegative_number(item["start"], field=f"{field}[{idx}].start") + shift
+        shifted_end = _finite_nonnegative_number(item["end"], field=f"{field}[{idx}].end") + shift
+        if shifted_start < -1e-5 or shifted_end < shifted_start:
+            raise ValueError(f"{field}[{idx}] has invalid bounds after context sampling")
+        item["start"] = max(0.0, shifted_start)
+        item["end"] = shifted_end
 
 
 def _shift_and_filter_context_intervals(
@@ -341,6 +362,11 @@ def _sample_lean_multiturn_context(
             raise TypeError(f"Sample {sample_id!r} target.components[{component_idx}] must be a mapping")
         _shift_start_fields(
             component.get("fragments"), shift=shift, field=f"target.components[{component_idx}].fragments"
+        )
+        _shift_utterance_unit_timestamps(
+            component.get("utterance_units"),
+            shift=shift,
+            field=f"target.components[{component_idx}].utterance_units",
         )
     _shift_start_fields(regions, shift=shift, field="target.utterance_regions")
     _shift_start_fields(target.get("pause_regions", []), shift=shift, field="target.pause_regions")
