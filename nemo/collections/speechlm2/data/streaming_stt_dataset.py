@@ -611,6 +611,10 @@ class StreamingSTTDataConfig:
     # On-the-fly acoustic augmentation. Defaults are disabled so existing
     # training and validation behavior is unchanged unless explicitly enabled.
     force_use_noise_augmentation: bool = False
+    # When enabled, noise_prob is a top-level augmented-batch probability.
+    # Every selected batch gets additive noise, followed by at most one of
+    # room IR, mic IR, or codec using their probabilities as categorical mass.
+    use_balanced_augmentation_controller: bool = False
     use_noise_aug: bool = False
     noise_prob: float = 0.99
     noise_aug_path: Optional[str] = None

@@ -383,6 +383,90 @@ class AudioAugmenter:
 
             return decoded
 
+    @staticmethod
+    def _probability(cfg, name: str, default: float) -> float:
+        """Read and validate a probability from an augmentation config."""
+        value = float(cfg.get(name, default))
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"{name} must be in [0, 1], got {value}")
+        return value
+
+    def _augment_batch_balanced(self, cfg, source_audio, source_audio_lens):
+        """Apply one gated additive-noise path with at most one extra effect.
+
+        ``noise_prob`` is the probability that a batch is augmented at all.
+        A selected batch always receives additive noise. The configured room,
+        mic, and codec probabilities are interpreted as mutually exclusive
+        categorical masses in that order; remaining mass selects no extra
+        effect. This makes the clean fraction explicit and prevents stacked
+        room-plus-microphone impulse responses.
+        """
+        noise_path = cfg.get('noise_aug_path', None)
+        if not cfg.get('use_noise_aug', None) or not noise_path:
+            raise ValueError("Balanced augmentation requires use_noise_aug=true and a noise_aug_path")
+
+        augmentation_prob = self._probability(cfg, 'noise_prob', 0.5)
+        roomir_prob = self._probability(cfg, 'roomir_prob', 0.0)
+        micir_prob = self._probability(cfg, 'micir_prob', 0.0)
+        codec_prob = self._probability(cfg, 'codec_prob', 0.0)
+        extra_prob = roomir_prob + micir_prob + codec_prob
+        if extra_prob > 1.0 + 1e-12:
+            raise ValueError(
+                "Balanced roomir_prob + micir_prob + codec_prob must be <= 1, "
+                f"got {extra_prob}"
+            )
+        if random.random() >= augmentation_prob:
+            return source_audio
+
+        source_audio = self.add_noise_to_batch(
+            source_audio,
+            os.path.join(noise_path, "*"),
+            snr_db=random.randint(cfg.get('noise_min_snr', 20), cfg.get('noise_max_snr', 50)),
+            noise_prob_scale_user=cfg.get('noise_prob_scale_user', 0.3),
+            noise_prob_scale_user_min_snr=cfg.get('noise_prob_scale_user_min_snr', -15),
+            noise_prob_scale_user_max_snr=cfg.get('noise_prob_scale_user_max_snr', 24),
+            snr_measure_dur=cfg.get('snr_measure_dur', 0.0),
+            noise_resample=cfg.get('noise_resample', True),
+            noise_prob_low_pass=cfg.get('noise_prob_low_pass', 0.1),
+        )
+
+        extra_draw = random.random()
+        if extra_draw < roomir_prob:
+            roomir_path = cfg.get('roomir_aug_path', None)
+            if not cfg.get('use_room_ir_aug', None) or not roomir_path:
+                raise ValueError(
+                    "Positive balanced roomir_prob requires use_room_ir_aug=true and roomir_aug_path"
+                )
+            source_audio = self.add_room_ir_to_batch(
+                source_audio,
+                source_audio_lens,
+                roomir_path,
+                use_loudness_norm=cfg.get('roomir_use_loudness_norm', True),
+            )
+        elif extra_draw < roomir_prob + micir_prob:
+            micir_path = cfg.get('micir_aug_path', None)
+            if not cfg.get('use_mic_ir_aug', None) or not micir_path:
+                raise ValueError(
+                    "Positive balanced micir_prob requires use_mic_ir_aug=true and micir_aug_path"
+                )
+            source_audio = self.add_mic_ir_to_batch(
+                source_audio,
+                source_audio_lens,
+                micir_path,
+                use_loudness_norm=cfg.get('micir_use_loudness_norm', True),
+            )
+        elif extra_draw < extra_prob:
+            if not cfg.get('use_codec_aug', None):
+                raise ValueError("Positive balanced codec_prob requires use_codec_aug=true")
+            codec_settings = cfg.get('codec_settings', None) or DEFAULT_CODEC_SETTINGS
+            source_audio = self.add_codec_to_batch(
+                source_audio,
+                source_audio_lens,
+                codec_settings,
+            )
+
+        return source_audio
+
     def augment_batch(self, cfg, source_audio, source_audio_lens):
         """Apply all configured augmentations to batch audio.
 
@@ -397,6 +481,9 @@ class AudioAugmenter:
         Returns:
             Augmented source_audio tensor.
         """
+        if cfg.get('use_balanced_augmentation_controller', False):
+            return self._augment_batch_balanced(cfg, source_audio, source_audio_lens)
+
         # 1. Noise augmentation
         if cfg.get('use_noise_aug', None):
             noise_prob = cfg.get('noise_prob', 0.99)
