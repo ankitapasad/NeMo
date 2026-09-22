@@ -299,9 +299,8 @@ def _compute_weighted_lm_loss(
     if turn_state_transition_types is not None:
         turn_state_masks = {
             "turn_state": turn_state_transition_types >= 0,
-            "turn_state_steady": turn_state_transition_types == TURN_STATE_STEADY,
-            "turn_state_open_entry": turn_state_transition_types == TURN_STATE_OPEN_ENTRY,
-            "turn_state_close_entry": turn_state_transition_types == TURN_STATE_CLOSE_ENTRY,
+            "turn_state_turn_entry": turn_state_transition_types == TURN_STATE_OPEN_ENTRY,
+            "turn_state_turn_exit": turn_state_transition_types == TURN_STATE_CLOSE_ENTRY,
             "turn_state_user_back_entry": turn_state_transition_types == TURN_STATE_USER_BACK_ENTRY,
             "turn_state_user_back_exit": turn_state_transition_types == TURN_STATE_USER_BACK_EXIT,
         }
@@ -362,21 +361,10 @@ def _compute_weighted_lm_loss(
             "eou_ratio": num_eou.float() / num_targets.clamp(min=1),
         }
         if turn_state_masks is not None:
-            num_turn_state = turn_state_masks["turn_state"].sum()
-            num_turn_state_transitions = (
-                turn_state_masks["turn_state"] & ~turn_state_masks["turn_state_steady"]
-            ).sum()
             metrics.update(
                 {
                     f"loss_{name}": per_token_loss[mask].sum() / mask.sum().clamp(min=1)
                     for name, mask in turn_state_masks.items()
-                }
-            )
-            metrics.update(
-                {
-                    "turn_state_ratio": num_turn_state.float() / num_targets.clamp(min=1),
-                    "turn_state_transition_ratio": num_turn_state_transitions.float()
-                    / num_turn_state.clamp(min=1),
                 }
             )
         if is_soab is not None:
@@ -1202,7 +1190,6 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         # decision token (blank=keep listening, user_footer_first=emit). Using the
         # input-axis audio mask here exactly mirrors the supervision the LM head
         # used to provide at audio positions before §4(a) masked them out.
-        cls_loss_log = torch.zeros((), device=loss.device)
         if use_aux and self.has_blank and audio_mask is not None and self._user_footer_first_id is not None:
             audio_mask_flat = audio_mask.flatten(0, 1)  # (B*L,)
             orig_targets_flat = batch.target_tokens.flatten(0, 1)  # pre-LM-CE-masking
@@ -1228,7 +1215,6 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 cls_loss = F.binary_cross_entropy_with_logits(cls_logits, cls_targets, pos_weight=pos_weight)
                 cls_w = self.core_cfg.chunk_classifier_loss_weight
                 loss = loss + cls_w * cls_loss
-                cls_loss_log = cls_loss.detach()
                 cls_pos_ratio = num_pos.float() / num_decisions.clamp(min=1).float()
                 self.log_dict(
                     {"loss_chunk_cls_pos_ratio": cls_pos_ratio},
@@ -1238,8 +1224,6 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         B, L = inputs["input_embeds"].shape[:2]
         train_metrics = {
             "loss": loss,
-            "loss_nonblank": loss_metrics["loss_nonblank"],
-            "loss_chunk_cls": cls_loss_log,
             "learning_rate": torch.as_tensor(
                 self.trainer.optimizers[0].param_groups[0]["lr"] if self._trainer is not None else 0
             ),
@@ -1248,13 +1232,6 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             "num_targets": num_targets.float(),
             "target_to_input_ratio": num_targets / (B * L),
         }
-        if self.has_blank:
-            train_metrics.update(
-                {
-                    "loss_blank": loss_metrics["loss_blank"],
-                    "blank_ratio": loss_metrics["blank_ratio"],
-                }
-            )
         if not self.core_cfg.enable_turn_state_tokens and self.core_cfg.add_utterance_boundary_tokens:
             train_metrics.update(
                 {
@@ -1270,13 +1247,10 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     name: loss_metrics[name]
                     for name in (
                         "loss_turn_state",
-                        "loss_turn_state_steady",
-                        "loss_turn_state_open_entry",
-                        "loss_turn_state_close_entry",
+                        "loss_turn_state_turn_entry",
+                        "loss_turn_state_turn_exit",
                         "loss_turn_state_user_back_entry",
                         "loss_turn_state_user_back_exit",
-                        "turn_state_ratio",
-                        "turn_state_transition_ratio",
                     )
                 }
             )
@@ -1330,6 +1304,9 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
     def on_validation_epoch_start(self) -> None:
         self._partial_val_losses: dict[str, list] = defaultdict(list)
+        self._partial_val_turn_state_losses: dict[str, dict[str, list]] = defaultdict(
+            lambda: defaultdict(list)
+        )
         self._partial_accuracies: dict[str, list] = defaultdict(list)
         self._partial_boundary_metrics: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
         self._partial_ordinal_boundary_metrics: dict[str, list] = defaultdict(list)
@@ -1351,6 +1328,42 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             val_losses.append(val_loss)
         if val_losses:
             self.log("val_loss", torch.stack(val_losses).mean(), on_epoch=True, sync_dist=True)
+
+        aggregate_state_loss_sums: dict[str, Tensor] = {}
+        aggregate_state_loss_counts: dict[str, Tensor] = {}
+        for name, metric_lists in self._partial_val_turn_state_losses.items():
+            for component in (
+                "turn_state",
+                "turn_state_turn_entry",
+                "turn_state_turn_exit",
+                "turn_state_user_back_entry",
+                "turn_state_user_back_exit",
+            ):
+                if f"{component}_loss_sum" not in metric_lists:
+                    continue
+                loss_sum = _distributed_sum(torch.stack(metric_lists[f"{component}_loss_sum"]).sum())
+                count = _distributed_sum(torch.stack(metric_lists[f"{component}_count"]).sum())
+                if count == 0:
+                    continue
+                self.log(
+                    f"val_loss_{component}_{name}",
+                    loss_sum / count,
+                    on_epoch=True,
+                    sync_dist=False,
+                )
+                aggregate_state_loss_sums[component] = aggregate_state_loss_sums.get(
+                    component, torch.zeros_like(loss_sum)
+                ) + loss_sum
+                aggregate_state_loss_counts[component] = aggregate_state_loss_counts.get(
+                    component, torch.zeros_like(count)
+                ) + count
+        for component, loss_sum in aggregate_state_loss_sums.items():
+            self.log(
+                f"val_loss_{component}",
+                loss_sum / aggregate_state_loss_counts[component],
+                on_epoch=True,
+                sync_dist=False,
+            )
 
         accuracies = []
         val_accuracy_by_name: dict[str, Tensor] = {}
@@ -1678,6 +1691,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             self.log("val_aux_macro_acc", torch.stack(macro_accs).mean(), on_epoch=True, sync_dist=True)
 
         self._partial_val_losses.clear()
+        self._partial_val_turn_state_losses.clear()
         self._partial_accuracies.clear()
         self._partial_boundary_metrics.clear()
         self._partial_ordinal_boundary_metrics.clear()
@@ -1993,12 +2007,34 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         num_targets = (target_ids != IGNORE_INDEX).long().sum()
 
         with loss_parallel():
-            loss = F.cross_entropy(
+            per_token_val_loss = F.cross_entropy(
                 outputs["logits"].flatten(0, 1),
                 target_ids.flatten(0, 1),
-                reduction="sum",
+                reduction="none",
                 ignore_index=IGNORE_INDEX,
-            ) / num_targets.clamp(min=1)
+            ).view_as(target_ids)
+            loss = per_token_val_loss.sum() / num_targets.clamp(min=1)
+
+        if batch.turn_state_mask is not None and batch.turn_state_transition_types is not None:
+            valid_state_mask = batch.turn_state_mask & target_ids.ne(IGNORE_INDEX)
+            state_loss_masks = {
+                "turn_state": valid_state_mask,
+                "turn_state_turn_entry": valid_state_mask
+                & batch.turn_state_transition_types.eq(TURN_STATE_OPEN_ENTRY),
+                "turn_state_turn_exit": valid_state_mask
+                & batch.turn_state_transition_types.eq(TURN_STATE_CLOSE_ENTRY),
+                "turn_state_user_back_entry": valid_state_mask
+                & batch.turn_state_transition_types.eq(TURN_STATE_USER_BACK_ENTRY),
+                "turn_state_user_back_exit": valid_state_mask
+                & batch.turn_state_transition_types.eq(TURN_STATE_USER_BACK_EXIT),
+            }
+            for component, mask in state_loss_masks.items():
+                self._partial_val_turn_state_losses[name][f"{component}_loss_sum"].append(
+                    per_token_val_loss[mask].sum().detach()
+                )
+                self._partial_val_turn_state_losses[name][f"{component}_count"].append(
+                    mask.sum().detach()
+                )
 
         pred_ids = outputs["logits"].argmax(dim=-1)
         if batch.turn_state_mask is not None and batch.turn_state_transition_types is not None:

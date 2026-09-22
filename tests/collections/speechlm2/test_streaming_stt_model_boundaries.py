@@ -557,13 +557,11 @@ def test_weighted_lm_loss_reports_turn_state_breakdown():
     expected = torch.tensor((1.0 + 2.0 + 3.0 * 2.0 + 4.0 * 5.0 + 5.0 * 3.0 + 6.0 * 5.0) / 17.0)
     assert torch.allclose(loss, expected)
     assert torch.allclose(metrics["loss_turn_state"], torch.tensor(4.0))
-    assert torch.allclose(metrics["loss_turn_state_steady"], torch.tensor(2.0))
-    assert torch.allclose(metrics["loss_turn_state_open_entry"], torch.tensor(3.0))
-    assert torch.allclose(metrics["loss_turn_state_close_entry"], torch.tensor(4.0))
+    assert torch.allclose(metrics["loss_turn_state_turn_entry"], torch.tensor(3.0))
+    assert torch.allclose(metrics["loss_turn_state_turn_exit"], torch.tensor(4.0))
     assert torch.allclose(metrics["loss_turn_state_user_back_entry"], torch.tensor(5.0))
     assert torch.allclose(metrics["loss_turn_state_user_back_exit"], torch.tensor(6.0))
-    assert torch.allclose(metrics["turn_state_ratio"], torch.tensor(5.0 / 6.0))
-    assert torch.allclose(metrics["turn_state_transition_ratio"], torch.tensor(4.0 / 5.0))
+    assert "loss_turn_state_steady" not in metrics
 
 
 def test_predicted_turn_state_events_track_off_reference_state_changes():
@@ -684,6 +682,36 @@ def test_validation_epoch_end_logs_only_pooled_output_backchannel_metrics():
     assert model.logged["val_unpaired_eoab_tokens_per_utterance"].item() == pytest.approx(2 / 3)
     assert model.logged["val_hardcoded_backchannel_rate"].item() == pytest.approx(3 / 4)
     assert not any("d7_complete" in metric or "d7_pause" in metric for metric in model.logged)
+
+
+def test_validation_epoch_end_logs_state_loss_breakdown_by_loader_and_overall():
+    model = _ValidationLogger()
+    model.core_cfg = SimpleNamespace(enable_validation_checkpoint_score=False)
+    streaming_stt_model.StreamingSTTModel.on_validation_epoch_start(model)
+    for name, loss_sum, count in (("complete", 6.0, 2), ("pause", 12.0, 3)):
+        for component in (
+            "turn_state",
+            "turn_state_turn_entry",
+            "turn_state_turn_exit",
+            "turn_state_user_back_entry",
+            "turn_state_user_back_exit",
+        ):
+            model._partial_val_turn_state_losses[name][f"{component}_loss_sum"].append(
+                torch.tensor(loss_sum)
+            )
+            model._partial_val_turn_state_losses[name][f"{component}_count"].append(
+                torch.tensor(count)
+            )
+
+    streaming_stt_model.StreamingSTTModel.on_validation_epoch_end(model)
+
+    assert model.logged["val_loss_turn_state_complete"].item() == pytest.approx(3.0)
+    assert model.logged["val_loss_turn_state_pause"].item() == pytest.approx(4.0)
+    assert model.logged["val_loss_turn_state"].item() == pytest.approx(18.0 / 5.0)
+    assert model.logged["val_loss_turn_state_turn_entry"].item() == pytest.approx(18.0 / 5.0)
+    assert model.logged["val_loss_turn_state_turn_exit"].item() == pytest.approx(18.0 / 5.0)
+    assert model.logged["val_loss_turn_state_user_back_entry"].item() == pytest.approx(18.0 / 5.0)
+    assert model.logged["val_loss_turn_state_user_back_exit"].item() == pytest.approx(18.0 / 5.0)
 
 
 def test_validation_epoch_end_checkpoint_score_equal_weights_three_cohorts():
