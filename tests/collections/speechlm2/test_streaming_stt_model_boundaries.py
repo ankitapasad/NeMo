@@ -530,6 +530,63 @@ def test_weighted_lm_loss_applies_independent_sob_and_eob_weights():
     assert "loss_eou_backchannel" not in metrics
 
 
+def test_weighted_lm_loss_reports_turn_state_breakdown():
+    per_token_loss = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 99.0])
+    targets = torch.tensor([10, 11, 12, 13, 14, 15, streaming_stt_model.IGNORE_INDEX])
+    transition_types = torch.tensor(
+        [
+            -1,
+            streaming_stt_model.TURN_STATE_STEADY,
+            streaming_stt_model.TURN_STATE_OPEN_ENTRY,
+            streaming_stt_model.TURN_STATE_CLOSE_ENTRY,
+            streaming_stt_model.TURN_STATE_USER_BACK_ENTRY,
+            streaming_stt_model.TURN_STATE_USER_BACK_EXIT,
+            -1,
+        ]
+    )
+
+    loss, metrics = streaming_stt_model._compute_weighted_lm_loss(
+        per_token_loss=per_token_loss,
+        flat_targets=targets,
+        blank_id=99,
+        has_blank=False,
+        blank_loss_weight=1.0,
+        turn_state_transition_types=transition_types,
+    )
+
+    expected = torch.tensor((1.0 + 2.0 + 3.0 * 2.0 + 4.0 * 5.0 + 5.0 * 3.0 + 6.0 * 5.0) / 17.0)
+    assert torch.allclose(loss, expected)
+    assert torch.allclose(metrics["loss_turn_state"], torch.tensor(4.0))
+    assert torch.allclose(metrics["loss_turn_state_steady"], torch.tensor(2.0))
+    assert torch.allclose(metrics["loss_turn_state_open_entry"], torch.tensor(3.0))
+    assert torch.allclose(metrics["loss_turn_state_close_entry"], torch.tensor(4.0))
+    assert torch.allclose(metrics["loss_turn_state_user_back_entry"], torch.tensor(5.0))
+    assert torch.allclose(metrics["loss_turn_state_user_back_exit"], torch.tensor(6.0))
+    assert torch.allclose(metrics["turn_state_ratio"], torch.tensor(5.0 / 6.0))
+    assert torch.allclose(metrics["turn_state_transition_ratio"], torch.tensor(4.0 / 5.0))
+
+
+def test_teacher_forced_turn_state_events_use_reference_history():
+    closed, open_, user_back = 10, 11, 12
+    references = [closed, open_, open_, user_back, closed]
+    predictions = [open_, open_, closed, user_back, closed]
+
+    events = streaming_stt_model._teacher_forced_turn_state_events(
+        predictions,
+        references,
+        open_id=open_,
+        closed_id=closed,
+        user_back_id=user_back,
+    )
+
+    # Chunk 0 is a spurious early open. Chunk 1 is the exact open detection.
+    assert events[streaming_stt_model.TURN_STATE_OPEN_ENTRY] == {0, 1}
+    # Chunk 2 predicts closed relative to the reference-open history.
+    assert events[streaming_stt_model.TURN_STATE_CLOSE_ENTRY] == {2}
+    assert events[streaming_stt_model.TURN_STATE_USER_BACK_ENTRY] == {3}
+    assert events[streaming_stt_model.TURN_STATE_USER_BACK_EXIT] == {4}
+
+
 class _ValidationLogger:
     def __init__(self):
         self.logged = {}
