@@ -423,12 +423,10 @@ def _compute_weighted_lm_loss(
     return loss, metrics
 
 
-def _teacher_forced_turn_state_events(
-    predictions: list[int], references: list[int], *, open_id: int, closed_id: int, user_back_id: int
+def _predicted_turn_state_events(
+    predictions: list[int], *, open_id: int, closed_id: int, user_back_id: int
 ) -> dict[int, set[int]]:
-    """Extract predicted transitions relative to the teacher-forced reference history."""
-    if len(predictions) != len(references):
-        raise ValueError("Turn-state predictions and references must have the same length")
+    """Extract state changes from the ordered teacher-forced state predictions."""
     state_ids = {open_id, closed_id, user_back_id}
     events = {
         TURN_STATE_OPEN_ENTRY: set(),
@@ -436,11 +434,9 @@ def _teacher_forced_turn_state_events(
         TURN_STATE_USER_BACK_ENTRY: set(),
         TURN_STATE_USER_BACK_EXIT: set(),
     }
-    previous_reference = closed_id
-    for chunk_idx, (prediction, reference) in enumerate(zip(predictions, references)):
-        if reference not in state_ids:
-            raise RuntimeError("Reference turn-state position does not contain a state token")
-        if prediction != previous_reference:
+    previous_prediction = closed_id
+    for chunk_idx, prediction in enumerate(predictions):
+        if prediction != previous_prediction:
             if prediction == open_id:
                 events[TURN_STATE_OPEN_ENTRY].add(chunk_idx)
             elif prediction == user_back_id:
@@ -448,11 +444,12 @@ def _teacher_forced_turn_state_events(
             elif prediction == closed_id:
                 transition_type = (
                     TURN_STATE_USER_BACK_EXIT
-                    if previous_reference == user_back_id
+                    if previous_prediction == user_back_id
                     else TURN_STATE_CLOSE_ENTRY
                 )
                 events[transition_type].add(chunk_idx)
-        previous_reference = reference
+        if prediction in state_ids:
+            previous_prediction = prediction
     return events
 
 
@@ -2031,10 +2028,8 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 if state_positions.numel() == 0:
                     continue
                 predictions = pred_ids[sample_idx, state_positions].tolist()
-                references = target_ids[sample_idx, state_positions].tolist()
-                predicted_by_type = _teacher_forced_turn_state_events(
+                predicted_by_type = _predicted_turn_state_events(
                     predictions,
-                    references,
                     open_id=state_token_ids["open"],
                     closed_id=state_token_ids["closed"],
                     user_back_id=state_token_ids["user_back"],
@@ -2049,8 +2044,18 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                         torch.where(sample_transition_types == transition_type)[0].tolist()
                     )
                     predicted_chunks = predicted_by_type[transition_type]
-                    matched_chunks = reference_chunks & predicted_chunks
-                    batch_correct[transition_type] += len(matched_chunks)
+                    expected_token_id = {
+                        TURN_STATE_OPEN_ENTRY: state_token_ids["open"],
+                        TURN_STATE_CLOSE_ENTRY: state_token_ids["closed"],
+                        TURN_STATE_USER_BACK_ENTRY: state_token_ids["user_back"],
+                        TURN_STATE_USER_BACK_EXIT: state_token_ids["closed"],
+                    }[transition_type]
+                    correctly_detected_chunks = {
+                        chunk_idx
+                        for chunk_idx in reference_chunks
+                        if predictions[chunk_idx] == expected_token_id
+                    }
+                    batch_correct[transition_type] += len(correctly_detected_chunks)
                     batch_total[transition_type] += len(reference_chunks)
                     batch_spurious[transition_type] += len(predicted_chunks - reference_chunks)
                     if transition_type in {TURN_STATE_OPEN_ENTRY, TURN_STATE_CLOSE_ENTRY}:
@@ -2062,7 +2067,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                                 )[0].tolist()
                             )
                             ordinal_correct[(transition_type, ordinal)] += len(
-                                ordinal_chunks & predicted_chunks
+                                ordinal_chunks & correctly_detected_chunks
                             )
                             ordinal_total[(transition_type, ordinal)] += len(ordinal_chunks)
 

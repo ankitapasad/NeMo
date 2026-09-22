@@ -566,22 +566,18 @@ def test_weighted_lm_loss_reports_turn_state_breakdown():
     assert torch.allclose(metrics["turn_state_transition_ratio"], torch.tensor(4.0 / 5.0))
 
 
-def test_teacher_forced_turn_state_events_use_reference_history():
+def test_predicted_turn_state_events_track_off_reference_state_changes():
     closed, open_, user_back = 10, 11, 12
-    references = [closed, open_, open_, user_back, closed]
     predictions = [open_, open_, closed, user_back, closed]
 
-    events = streaming_stt_model._teacher_forced_turn_state_events(
+    events = streaming_stt_model._predicted_turn_state_events(
         predictions,
-        references,
         open_id=open_,
         closed_id=closed,
         user_back_id=user_back,
     )
 
-    # Chunk 0 is a spurious early open. Chunk 1 is the exact open detection.
-    assert events[streaming_stt_model.TURN_STATE_OPEN_ENTRY] == {0, 1}
-    # Chunk 2 predicts closed relative to the reference-open history.
+    assert events[streaming_stt_model.TURN_STATE_OPEN_ENTRY] == {0}
     assert events[streaming_stt_model.TURN_STATE_CLOSE_ENTRY] == {2}
     assert events[streaming_stt_model.TURN_STATE_USER_BACK_ENTRY] == {3}
     assert events[streaming_stt_model.TURN_STATE_USER_BACK_EXIT] == {4}
