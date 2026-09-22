@@ -200,9 +200,11 @@ def build_turn_state_sequence(
             elif previous == user_back_token:
                 transition_types[chunk_idx] = TURN_STATE_USER_BACK_EXIT
                 transition_events[chunk_idx] = previous_event
-            else:
+            elif token == turn_closed_token:
                 transition_types[chunk_idx] = TURN_STATE_CLOSE_ENTRY
                 transition_ordinals[chunk_idx] = previous_ordinal
+            else:
+                raise RuntimeError(f"Unexpected turn-state token: {token!r}")
         previous = token
         previous_ordinal = owner_ordinals[chunk_idx]
         previous_event = owner_events[chunk_idx]
