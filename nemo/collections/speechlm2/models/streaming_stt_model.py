@@ -1238,10 +1238,8 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         B, L = inputs["input_embeds"].shape[:2]
         train_metrics = {
             "loss": loss,
-            "loss_blank": loss_metrics["loss_blank"],
             "loss_nonblank": loss_metrics["loss_nonblank"],
             "loss_chunk_cls": cls_loss_log,
-            "blank_ratio": loss_metrics["blank_ratio"],
             "learning_rate": torch.as_tensor(
                 self.trainer.optimizers[0].param_groups[0]["lr"] if self._trainer is not None else 0
             ),
@@ -1250,7 +1248,14 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             "num_targets": num_targets.float(),
             "target_to_input_ratio": num_targets / (B * L),
         }
-        if not self.core_cfg.enable_turn_state_tokens:
+        if self.has_blank:
+            train_metrics.update(
+                {
+                    "loss_blank": loss_metrics["loss_blank"],
+                    "blank_ratio": loss_metrics["blank_ratio"],
+                }
+            )
+        if not self.core_cfg.enable_turn_state_tokens and self.core_cfg.add_utterance_boundary_tokens:
             train_metrics.update(
                 {
                     "loss_sou": loss_metrics["loss_sou"],
