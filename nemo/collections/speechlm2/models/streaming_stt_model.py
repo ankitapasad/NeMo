@@ -39,6 +39,10 @@ from nemo.collections.speechlm2.data.streaming_stt_dataset import (
     USER_BACKCHANNEL_MODE_SOB_EOB,
     USER_BACKCHANNEL_MODE_SOB_EOU,
     USER_BACKCHANNEL_MODES,
+    TURN_STATE_CLOSE_ENTRY,
+    TURN_STATE_OPEN_ENTRY,
+    TURN_STATE_USER_BACK_ENTRY,
+    TURN_STATE_USER_BACK_EXIT,
     StreamingSTTBatch,
     StreamingSTTDataset,
     build_compact_turn_markers,
@@ -166,6 +170,15 @@ class StreamingSTTModelConfig:
     text_start_token: str = "<|text_start|>"
     text_end_token: str = "<|text_end|>"
     compact_text_end_only_no_blank: bool = False
+    enable_turn_state_tokens: bool = False
+    turn_open_token: str = "<turn_open>"
+    turn_closed_token: str = "<turn_closed>"
+    user_back_token: str = "<user_back>"
+    turn_state_steady_loss_weight: float = 1.0
+    turn_state_open_loss_weight: float = 2.0
+    turn_state_close_loss_weight: float = 5.0
+    turn_state_user_back_loss_weight: float = 3.0
+    turn_state_user_back_exit_loss_weight: float = 5.0
     add_utterance_boundary_tokens: bool = False
     utterance_start_token: str = "<sou>"
     utterance_end_token: str = "<eou>"
@@ -247,6 +260,12 @@ def _compute_weighted_lm_loss(
     eoab_id: Optional[int] = None,
     agent_backchannel_start_loss_weight: float = 1.0,
     agent_backchannel_end_loss_weight: float = 1.0,
+    turn_state_transition_types: Optional[Tensor] = None,
+    turn_state_steady_loss_weight: float = 1.0,
+    turn_state_open_loss_weight: float = 2.0,
+    turn_state_close_loss_weight: float = 5.0,
+    turn_state_user_back_loss_weight: float = 3.0,
+    turn_state_user_back_exit_loss_weight: float = 5.0,
 ) -> tuple[Tensor, dict[str, Tensor]]:
     valid_mask = flat_targets != IGNORE_INDEX
 
@@ -277,6 +296,22 @@ def _compute_weighted_lm_loss(
     num_eoab = is_eoab.sum() if is_eoab is not None else None
 
     loss_weights = torch.ones_like(per_token_loss)
+    if turn_state_transition_types is not None:
+        if turn_state_transition_types.shape != flat_targets.shape:
+            raise ValueError("turn_state_transition_types must match flattened targets")
+        state_weights = torch.full_like(loss_weights, turn_state_steady_loss_weight)
+        for transition_type, weight in (
+            (TURN_STATE_OPEN_ENTRY, turn_state_open_loss_weight),
+            (TURN_STATE_CLOSE_ENTRY, turn_state_close_loss_weight),
+            (TURN_STATE_USER_BACK_ENTRY, turn_state_user_back_loss_weight),
+            (TURN_STATE_USER_BACK_EXIT, turn_state_user_back_exit_loss_weight),
+        ):
+            state_weights = torch.where(
+                turn_state_transition_types == transition_type,
+                torch.full_like(state_weights, weight),
+                state_weights,
+            )
+        loss_weights = torch.where(turn_state_transition_types >= 0, state_weights, loss_weights)
     if num_blank > 0 and blank_loss_weight != 1.0 and has_blank:
         loss_weights = torch.where(is_blank, torch.full_like(loss_weights, blank_loss_weight), loss_weights)
     if sou_id is not None and utterance_start_loss_weight != 1.0:
@@ -506,9 +541,11 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         if self.core_cfg.validation_checkpoint_score_mode not in {
             "cohort_macro",
             "turn_ordinal_macro",
+            "turn_state_ordinal_macro",
         }:
             raise ValueError(
-                "validation_checkpoint_score_mode must be 'cohort_macro' or 'turn_ordinal_macro'; "
+                "validation_checkpoint_score_mode must be 'cohort_macro', 'turn_ordinal_macro', "
+                "or 'turn_state_ordinal_macro'; "
                 f"got {self.core_cfg.validation_checkpoint_score_mode!r}"
             )
         if self.core_cfg.compact_text_end_only_no_blank and not self.core_cfg.compact_template:
@@ -531,6 +568,13 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 "use_per_sample_utterance_boundary_tokens=True"
             )
         if data_cfg is not None:
+            data_state_enabled = bool(data_cfg.get("enable_turn_state_tokens", False))
+            if data_state_enabled != self.core_cfg.enable_turn_state_tokens:
+                raise ValueError("model and dataset enable_turn_state_tokens must match")
+            if self.core_cfg.enable_turn_state_tokens:
+                for key in ("turn_open_token", "turn_closed_token", "user_back_token"):
+                    if data_cfg.get(key, getattr(self.core_cfg, key)) != getattr(self.core_cfg, key):
+                        raise ValueError(f"model and dataset {key} must match")
             data_backchannels_enabled = bool(data_cfg.get("enable_agent_backchannels", False))
             if data_backchannels_enabled != self.core_cfg.enable_agent_backchannels:
                 raise ValueError(
@@ -552,6 +596,25 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             or self.core_cfg.agent_backchannel_start_token == self.core_cfg.agent_backchannel_end_token
         ):
             raise ValueError("agent backchannel start/end tokens must be non-empty and different")
+        if self.core_cfg.enable_turn_state_tokens:
+            state_tokens = {
+                self.core_cfg.turn_open_token,
+                self.core_cfg.turn_closed_token,
+                self.core_cfg.user_back_token,
+            }
+            if "" in state_tokens or len(state_tokens) != 3:
+                raise ValueError("turn-state tokens must be non-empty and pairwise distinct")
+            if any(
+                weight <= 0
+                for weight in (
+                    self.core_cfg.turn_state_steady_loss_weight,
+                    self.core_cfg.turn_state_open_loss_weight,
+                    self.core_cfg.turn_state_close_loss_weight,
+                    self.core_cfg.turn_state_user_back_loss_weight,
+                    self.core_cfg.turn_state_user_back_exit_loss_weight,
+                )
+            ):
+                raise ValueError("turn-state loss weights must be positive")
 
         # --- LLM ---
         self.tokenizer = AutoTokenizer(self.core_cfg.pretrained_llm, use_fast=True)
@@ -614,6 +677,20 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     "User backchannel tokens already in tokenizer: %s",
                     user_backchannel_tokens,
                 )
+
+        if self.core_cfg.enable_turn_state_tokens:
+            turn_state_tokens = [
+                self.core_cfg.turn_open_token,
+                self.core_cfg.turn_closed_token,
+                self.core_cfg.user_back_token,
+            ]
+            missing_turn_state_tokens = [
+                token for token in turn_state_tokens if not token_in_vocab(token, self.tokenizer)
+            ]
+            if missing_turn_state_tokens:
+                self.tokenizer.add_special_tokens({"additional_special_tokens": missing_turn_state_tokens})
+                self.llm.resize_token_embeddings(len(self.tokenizer.tokenizer))
+                logging.info("Added turn-state tokens to tokenizer: %s", missing_turn_state_tokens)
 
         if self.core_cfg.enable_agent_backchannels:
             backchannel_tokens = [
@@ -1044,6 +1121,20 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             eoab_id=eoab_id,
             agent_backchannel_start_loss_weight=self.core_cfg.agent_backchannel_start_loss_weight,
             agent_backchannel_end_loss_weight=self.core_cfg.agent_backchannel_end_loss_weight,
+            turn_state_transition_types=(
+                torch.where(
+                    batch.turn_state_mask.flatten(0, 1),
+                    batch.turn_state_transition_types.flatten(0, 1),
+                    torch.full_like(batch.turn_state_transition_types.flatten(0, 1), -1),
+                )
+                if batch.turn_state_mask is not None and batch.turn_state_transition_types is not None
+                else None
+            ),
+            turn_state_steady_loss_weight=self.core_cfg.turn_state_steady_loss_weight,
+            turn_state_open_loss_weight=self.core_cfg.turn_state_open_loss_weight,
+            turn_state_close_loss_weight=self.core_cfg.turn_state_close_loss_weight,
+            turn_state_user_back_loss_weight=self.core_cfg.turn_state_user_back_loss_weight,
+            turn_state_user_back_exit_loss_weight=self.core_cfg.turn_state_user_back_exit_loss_weight,
         )
 
         # --- Aux chunk-boundary classifier loss ---
@@ -1159,6 +1250,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         self._partial_ordinal_boundary_metrics: dict[str, list] = defaultdict(list)
         self._partial_user_backchannel_metrics: dict[str, list] = defaultdict(list)
         self._partial_agent_backchannel_metrics: dict[str, list] = defaultdict(list)
+        self._partial_turn_state_metrics: dict[str, list] = defaultdict(list)
         # Per-class TP/total counts for the aux chunk classifier. Aggregated
         # across the epoch so macro acc isn't biased by per-batch composition.
         self._partial_aux_pos_correct: dict[str, list] = defaultdict(list)
@@ -1383,9 +1475,70 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 ].float() / denominator
             self.log_dict(logged_metrics, on_epoch=True, sync_dist=False)
 
+        if self._partial_turn_state_metrics:
+            state_logs = {}
+            for metric, values in self._partial_turn_state_metrics.items():
+                if not metric.endswith("_correct"):
+                    continue
+                prefix = metric[: -len("_correct")]
+                total_values = self._partial_turn_state_metrics.get(f"{prefix}_total", [])
+                if total_values and torch.stack(total_values).sum() > 0:
+                    state_logs[f"val_turn_state_tf_{prefix}_detection_rate"] = (
+                        torch.stack(values).sum() / torch.stack(total_values).sum()
+                    )
+            for state_name in ("open", "closed", "user_back"):
+                correct = self._partial_turn_state_metrics.get(f"class_{state_name}_correct", [])
+                reference_total = self._partial_turn_state_metrics.get(
+                    f"class_{state_name}_reference_total", []
+                )
+                prediction_total = self._partial_turn_state_metrics.get(
+                    f"class_{state_name}_prediction_total", []
+                )
+                if correct and reference_total and torch.stack(reference_total).sum() > 0:
+                    state_logs[f"val_turn_state_tf_{state_name}_recall"] = (
+                        torch.stack(correct).sum() / torch.stack(reference_total).sum()
+                    )
+                if correct and prediction_total and torch.stack(prediction_total).sum() > 0:
+                    state_logs[f"val_turn_state_tf_{state_name}_precision"] = (
+                        torch.stack(correct).sum() / torch.stack(prediction_total).sum()
+                    )
+            for transition_name in ("open", "close", "user_back_entry", "user_back_exit"):
+                latency_sum = self._partial_turn_state_metrics.get(
+                    f"{transition_name}_latency_frames_sum", []
+                )
+                latency_count = self._partial_turn_state_metrics.get(
+                    f"{transition_name}_latency_count", []
+                )
+                if latency_sum and latency_count and torch.stack(latency_count).sum() > 0:
+                    state_logs[f"val_turn_state_tf_{transition_name}_latency_mean_s"] = (
+                        torch.stack(latency_sum).sum()
+                        / torch.stack(latency_count).sum()
+                        * self.core_cfg.frame_length_in_secs
+                        * self.core_cfg.chunk_size
+                    )
+            if state_logs:
+                self.log_dict(state_logs, on_epoch=True, sync_dist=True)
+
         if getattr(getattr(self, "core_cfg", None), "enable_validation_checkpoint_score", False):
             score_mode = getattr(self.core_cfg, "validation_checkpoint_score_mode", "cohort_macro")
-            if score_mode == "turn_ordinal_macro":
+            if score_mode == "turn_state_ordinal_macro":
+                ordinal_scores = []
+                for ordinal in range(1, 5):
+                    per_transition = []
+                    for transition_name in ("open", "close"):
+                        correct = self._partial_turn_state_metrics.get(
+                            f"{transition_name}_{ordinal}_correct", []
+                        )
+                        total = self._partial_turn_state_metrics.get(f"{transition_name}_{ordinal}_total", [])
+                        if not total or torch.stack(total).sum() == 0:
+                            raise RuntimeError(
+                                "turn_state_ordinal_macro requires open/close coverage for "
+                                f"substantive ordinal {ordinal}"
+                            )
+                        per_transition.append(torch.stack(correct).sum() / torch.stack(total).sum())
+                    ordinal_scores.append(torch.stack(per_transition).mean())
+                checkpoint_score = torch.stack(ordinal_scores).mean()
+            elif score_mode == "turn_ordinal_macro":
                 missing_turns = [turn for turn in range(1, 5) if turn not in ordinal_detection_by_turn]
                 if missing_turns:
                     raise RuntimeError(
@@ -1463,6 +1616,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         self._partial_boundary_metrics.clear()
         self._partial_ordinal_boundary_metrics.clear()
         self._partial_user_backchannel_metrics.clear()
+        self._partial_turn_state_metrics.clear()
         self._partial_agent_backchannel_metrics.clear()
         self._partial_aux_pos_correct.clear()
         self._partial_aux_pos_total.clear()
@@ -1781,8 +1935,96 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             ) / num_targets.clamp(min=1)
 
         pred_ids = outputs["logits"].argmax(dim=-1)
-        user_backchannel_metrics = self._compute_user_backchannel_metrics(
-            pred_ids, target_ids, batch
+        if batch.turn_state_mask is not None and batch.turn_state_transition_types is not None:
+            state_correct = pred_ids.eq(target_ids) & batch.turn_state_mask
+            state_token_ids = {
+                "open": self.tokenizer.tokenizer.encode(
+                    self.core_cfg.turn_open_token, add_special_tokens=False
+                )[0],
+                "closed": self.tokenizer.tokenizer.encode(
+                    self.core_cfg.turn_closed_token, add_special_tokens=False
+                )[0],
+                "user_back": self.tokenizer.tokenizer.encode(
+                    self.core_cfg.user_back_token, add_special_tokens=False
+                )[0],
+            }
+            for state_name, token_id in state_token_ids.items():
+                reference_mask = batch.turn_state_mask & target_ids.eq(token_id)
+                prediction_mask = batch.turn_state_mask & pred_ids.eq(token_id)
+                self._partial_turn_state_metrics[f"class_{state_name}_correct"].append(
+                    (reference_mask & prediction_mask).sum().detach()
+                )
+                self._partial_turn_state_metrics[f"class_{state_name}_reference_total"].append(
+                    reference_mask.sum().detach()
+                )
+                self._partial_turn_state_metrics[f"class_{state_name}_prediction_total"].append(
+                    prediction_mask.sum().detach()
+                )
+            for transition_type, transition_name in (
+                (TURN_STATE_OPEN_ENTRY, "open"),
+                (TURN_STATE_CLOSE_ENTRY, "close"),
+                (TURN_STATE_USER_BACK_ENTRY, "user_back_entry"),
+                (TURN_STATE_USER_BACK_EXIT, "user_back_exit"),
+            ):
+                transition_mask = batch.turn_state_mask & (
+                    batch.turn_state_transition_types == transition_type
+                )
+                if transition_type in {TURN_STATE_OPEN_ENTRY, TURN_STATE_CLOSE_ENTRY}:
+                    for ordinal in range(1, 5):
+                        ordinal_mask = transition_mask & (batch.turn_state_turn_ordinals == ordinal)
+                        self._partial_turn_state_metrics[f"{transition_name}_{ordinal}_correct"].append(
+                            (state_correct & ordinal_mask).sum().detach()
+                        )
+                        self._partial_turn_state_metrics[f"{transition_name}_{ordinal}_total"].append(
+                            ordinal_mask.sum().detach()
+                        )
+                else:
+                    self._partial_turn_state_metrics[f"{transition_name}_correct"].append(
+                        (state_correct & transition_mask).sum().detach()
+                    )
+                    self._partial_turn_state_metrics[f"{transition_name}_total"].append(
+                        transition_mask.sum().detach()
+                    )
+                target_state_id = {
+                    TURN_STATE_OPEN_ENTRY: state_token_ids["open"],
+                    TURN_STATE_CLOSE_ENTRY: state_token_ids["closed"],
+                    TURN_STATE_USER_BACK_ENTRY: state_token_ids["user_back"],
+                    TURN_STATE_USER_BACK_EXIT: state_token_ids["closed"],
+                }[transition_type]
+                latency_sum = torch.zeros((), device=pred_ids.device, dtype=torch.float32)
+                latency_count = torch.zeros((), device=pred_ids.device, dtype=torch.long)
+                for sample_idx in range(pred_ids.shape[0]):
+                    state_positions = torch.where(batch.turn_state_mask[sample_idx])[0]
+                    if state_positions.numel() == 0:
+                        continue
+                    sample_predictions = pred_ids[sample_idx, state_positions]
+                    predicted_transition_chunks = []
+                    previous_prediction = state_token_ids["closed"]
+                    for chunk_idx, prediction in enumerate(sample_predictions.tolist()):
+                        if prediction == target_state_id and prediction != previous_prediction:
+                            predicted_transition_chunks.append(chunk_idx)
+                        if prediction in state_token_ids.values():
+                            previous_prediction = prediction
+                    reference_positions = torch.where(transition_mask[sample_idx, state_positions])[0].tolist()
+                    for reference_chunk in reference_positions:
+                        if not predicted_transition_chunks:
+                            continue
+                        predicted_chunk = min(
+                            predicted_transition_chunks,
+                            key=lambda candidate: abs(candidate - reference_chunk),
+                        )
+                        latency_sum += predicted_chunk - reference_chunk
+                        latency_count += 1
+                self._partial_turn_state_metrics[f"{transition_name}_latency_frames_sum"].append(
+                    latency_sum.detach()
+                )
+                self._partial_turn_state_metrics[f"{transition_name}_latency_count"].append(
+                    latency_count.detach()
+                )
+        user_backchannel_metrics = (
+            {}
+            if self.core_cfg.enable_turn_state_tokens
+            else self._compute_user_backchannel_metrics(pred_ids, target_ids, batch)
         )
         prediction_exclusion_mask = user_backchannel_metrics.pop(
             "prediction_exclusion_mask", None
@@ -1790,13 +2032,17 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         for metric, value in user_backchannel_metrics.items():
             self._partial_user_backchannel_metrics[metric].append(value.detach())
 
-        boundary_metrics = self._compute_boundary_metrics(
-            pred_ids, target_ids, batch, prediction_exclusion_mask
+        boundary_metrics = (
+            {}
+            if self.core_cfg.enable_turn_state_tokens
+            else self._compute_boundary_metrics(pred_ids, target_ids, batch, prediction_exclusion_mask)
         )
         for metric, value in boundary_metrics.items():
             self._partial_boundary_metrics[name][metric].append(value.detach())
-        ordinal_boundary_metrics = self._compute_ordinal_boundary_metrics(
-            pred_ids, target_ids, batch, prediction_exclusion_mask
+        ordinal_boundary_metrics = (
+            {}
+            if self.core_cfg.enable_turn_state_tokens
+            else self._compute_ordinal_boundary_metrics(pred_ids, target_ids, batch, prediction_exclusion_mask)
         )
         for metric, value in ordinal_boundary_metrics.items():
             self._partial_ordinal_boundary_metrics[metric].append(value.detach())

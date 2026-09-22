@@ -38,6 +38,8 @@ import torch
 from nemo.collections.speechlm2.data.streaming_stt_dataset import (
     AUDIO_TOKEN_IDX,
     IGNORE_INDEX,
+    MultiTurnSample,
+    MultiTurnTargetSegment,
     StreamingSTTDataConfig,
     StreamingSTTDataset,
     _debug_boundary_window_positions,
@@ -50,12 +52,14 @@ from nemo.collections.speechlm2.data.streaming_stt_dataset import (
     build_compact_turn_markers,
     build_lean_multiturn_alignments,
     build_multiturn_marker_metadata,
+    build_turn_state_sequence,
     compute_word_spans,
     decode_with_blank,
     get_llm_messages_for_batch,
     get_llm_messages_for_sample,
     merge_agent_backchannel_alignments,
     parse_lean_multiturn_metadata,
+    apply_turn_state_to_messages,
 )
 from nemo.collections.speechlm2.parts.alignments import WordAlignment, add_utterance_boundary_alignments
 
@@ -72,6 +76,82 @@ DOCSTRING_ALIGNMENTS = [
     WordAlignment(text="Hello", start_time=0.16, end_time=0.48),
     WordAlignment(text="World", start_time=0.60, end_time=0.80),
 ]
+
+
+def test_turn_state_suffix_grammar_and_transition_metadata():
+    sample = MultiTurnSample(
+        schema_version="lean_multi_turn_v3",
+        transcript="hello mm again",
+        segments=(
+            MultiTurnTargetSegment("hello", 0.16, 0.64, turn_ordinal=1),
+            MultiTurnTargetSegment("mm", 0.80, 0.96, user_backchannel_event_id=1),
+            MultiTurnTargetSegment("again", 1.12, 1.44, turn_ordinal=2),
+        ),
+        num_substantive_turns=2,
+        num_user_backchannel_events=1,
+    )
+    state = build_turn_state_sequence(
+        sample,
+        audio_duration_secs=1.76,
+        frame_length_in_secs=0.08,
+        chunk_size=2,
+        turn_open_token="<turn_open>",
+        turn_closed_token="<turn_closed>",
+        user_back_token="<user_back>",
+        utterance_start_delay_frames=2,
+        utterance_end_delay_frames=2,
+        user_backchannel_start_delay_frames=4,
+        user_backchannel_end_delay_frames=2,
+    )
+    assert set(state.tokens) == {"<turn_open>", "<turn_closed>", "<user_back>"}
+    assert state.turn_ordinals.count(1) == 1
+    assert state.turn_ordinals.count(2) == 1
+    assert state.user_backchannel_event_ids.count(1) >= 1
+
+    messages = [{"role": "system", "content": "prompt"}]
+    for idx, token in enumerate(state.tokens):
+        messages.extend(
+            [
+                {"role": "user", "content": "<audio><audio>"},
+                {"role": "assistant", "content": "<blank>" if idx else "<sou>hello"},
+            ]
+        )
+    apply_turn_state_to_messages(
+        messages,
+        state,
+        blank_token="<blank>",
+        marker_tokens=("<sou>", "<eou>", "<sob>", "<eob>"),
+    )
+    outputs = [message["content"] for message in messages if message["role"] == "assistant"]
+    assert outputs[0] == f"hello{state.tokens[0]}"
+    assert all(output.endswith(token) for output, token in zip(outputs, state.tokens))
+    assert not any(marker in "".join(outputs) for marker in ("<blank>", "<sou>", "<eou>", "<sob>", "<eob>"))
+
+
+def test_turn_state_collapsed_event_defers_close_and_rejects_final_chunk():
+    sample = MultiTurnSample(
+        schema_version="lean_multi_turn_v3",
+        transcript="hi",
+        segments=(MultiTurnTargetSegment("hi", 0.01, 0.02, turn_ordinal=1),),
+        num_substantive_turns=1,
+        num_user_backchannel_events=0,
+    )
+    kwargs = dict(
+        sample=sample,
+        frame_length_in_secs=0.08,
+        chunk_size=2,
+        turn_open_token="<turn_open>",
+        turn_closed_token="<turn_closed>",
+        user_back_token="<user_back>",
+        utterance_start_delay_frames=2,
+        utterance_end_delay_frames=2,
+        user_backchannel_start_delay_frames=4,
+        user_backchannel_end_delay_frames=2,
+    )
+    state = build_turn_state_sequence(audio_duration_secs=0.48, **kwargs)
+    assert state.tokens == ("<turn_closed>", "<turn_open>", "<turn_closed>")
+    with pytest.raises(ValueError, match="no subsequent chunk"):
+        build_turn_state_sequence(audio_duration_secs=0.32, **kwargs)
 
 
 def test_debug_boundary_window_positions_preserve_original_indices():

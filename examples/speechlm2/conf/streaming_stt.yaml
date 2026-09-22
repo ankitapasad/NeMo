@@ -28,6 +28,15 @@ model:
   user_backchannel_end_token: "<eob>"
   user_backchannel_start_loss_weight: 3.0
   user_backchannel_end_loss_weight: 5.0
+  enable_turn_state_tokens: false
+  turn_open_token: "<turn_open>"
+  turn_closed_token: "<turn_closed>"
+  user_back_token: "<user_back>"
+  turn_state_steady_loss_weight: 1.0
+  turn_state_open_loss_weight: 2.0
+  turn_state_close_loss_weight: 5.0
+  turn_state_user_back_loss_weight: 3.0
+  turn_state_user_back_exit_loss_weight: 5.0
 
   # LoRA (uncomment to enable)
   # lora:
@@ -78,6 +87,10 @@ data:
     user_backchannel_end_token: ${model.user_backchannel_end_token}
     user_backchannel_start_delay_frames: 4
     user_backchannel_end_delay_frames: 2
+    enable_turn_state_tokens: ${model.enable_turn_state_tokens}
+    turn_open_token: ${model.turn_open_token}
+    turn_closed_token: ${model.turn_closed_token}
+    user_back_token: ${model.user_back_token}
     # Aligner-only real-audio context on each side of every substantive turn.
     # Manifest SOU/EOU timestamps remain authoritative.
     multiturn_forced_alignment_buffer_s: 0.5

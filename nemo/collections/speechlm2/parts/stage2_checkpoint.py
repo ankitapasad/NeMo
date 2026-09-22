@@ -146,6 +146,13 @@ def load_asr_stage2_weights(model, checkpoint_path: str) -> None:
         boundary_tokens += (getattr(model, "user_backchannel_start_token", "<sob>"),)
     if user_backchannel_mode == "sob_eob":
         boundary_tokens += (getattr(model, "user_backchannel_end_token", "<eob>"),)
+    core_cfg = getattr(model, "core_cfg", None)
+    if getattr(core_cfg, "enable_turn_state_tokens", False):
+        boundary_tokens += (
+            core_cfg.turn_open_token,
+            core_cfg.turn_closed_token,
+            core_cfg.user_back_token,
+        )
     expanded_state = prepare_asr_stage2_state_dict(
         model, checkpoint["state_dict"], boundary_tokens=boundary_tokens
     )

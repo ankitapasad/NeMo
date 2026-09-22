@@ -87,6 +87,158 @@ class MultiTurnSample:
     sample_id: str | None = None
 
 
+TURN_STATE_STEADY = 0
+TURN_STATE_OPEN_ENTRY = 1
+TURN_STATE_CLOSE_ENTRY = 2
+TURN_STATE_USER_BACK_ENTRY = 3
+TURN_STATE_USER_BACK_EXIT = 4
+
+
+@dataclass(frozen=True)
+class TurnStateSequence:
+    """One suffix state target and transition annotation per fixed audio chunk."""
+
+    tokens: tuple[str, ...]
+    transition_types: tuple[int, ...]
+    turn_ordinals: tuple[int, ...]
+    user_backchannel_event_ids: tuple[int, ...]
+
+
+def _delayed_marker_chunk(
+    timestamp: float, *, frame_length_in_secs: float, chunk_size: int, delay_frames: int
+) -> int:
+    ready_frame = math.ceil(timestamp / frame_length_in_secs) + delay_frames
+    return max(0, ready_frame - 1) // chunk_size
+
+
+def build_turn_state_sequence(
+    sample: MultiTurnSample,
+    *,
+    audio_duration_secs: float,
+    frame_length_in_secs: float,
+    chunk_size: int,
+    turn_open_token: str,
+    turn_closed_token: str,
+    user_back_token: str,
+    utterance_start_delay_frames: int,
+    utterance_end_delay_frames: int,
+    user_backchannel_start_delay_frames: int,
+    user_backchannel_end_delay_frames: int,
+    cut_id: str = "<unknown>",
+) -> TurnStateSequence:
+    """Build delayed SOU/EOU/SOB/EOB state semantics without emitting markers."""
+    if frame_length_in_secs <= 0 or chunk_size <= 0:
+        raise ValueError("turn-state targets require positive frame length and fixed chunk size")
+    num_frames = math.ceil(audio_duration_secs / frame_length_in_secs)
+    num_chunks = math.ceil(num_frames / chunk_size)
+    if num_chunks <= 0:
+        raise ValueError(f"Cut {cut_id!r} has no chunks for turn-state targets")
+
+    tokens = [turn_closed_token] * num_chunks
+    owner_ordinals = [0] * num_chunks
+    owner_events = [0] * num_chunks
+    substantive_intervals: list[tuple[int, int, int]] = []
+    backchannel_intervals: list[tuple[int, int, int]] = []
+    for segment in sample.segments:
+        if segment.turn_ordinal:
+            start_delay = utterance_start_delay_frames
+            end_delay = utterance_end_delay_frames
+            target = substantive_intervals
+            identity = segment.turn_ordinal
+        else:
+            start_delay = user_backchannel_start_delay_frames
+            end_delay = user_backchannel_end_delay_frames
+            target = backchannel_intervals
+            identity = segment.user_backchannel_event_id
+        start_chunk = _delayed_marker_chunk(
+            segment.start_time,
+            frame_length_in_secs=frame_length_in_secs,
+            chunk_size=chunk_size,
+            delay_frames=start_delay,
+        )
+        end_chunk = _delayed_marker_chunk(
+            segment.end_time,
+            frame_length_in_secs=frame_length_in_secs,
+            chunk_size=chunk_size,
+            delay_frames=end_delay,
+        )
+        if start_chunk >= num_chunks:
+            raise ValueError(f"Cut {cut_id!r} event start falls after the final chunk")
+        if end_chunk <= start_chunk:
+            end_chunk = start_chunk + 1
+            if end_chunk >= num_chunks:
+                raise ValueError(
+                    f"Cut {cut_id!r} has a collapsed event in the final chunk; "
+                    "no subsequent chunk exists for the deferred close"
+                )
+        target.append((start_chunk, min(end_chunk, num_chunks), identity))
+
+    for start_chunk, end_chunk, ordinal in substantive_intervals:
+        for chunk_idx in range(start_chunk, end_chunk):
+            tokens[chunk_idx] = turn_open_token
+            owner_ordinals[chunk_idx] = ordinal
+    for start_chunk, end_chunk, event_id in backchannel_intervals:
+        for chunk_idx in range(start_chunk, end_chunk):
+            tokens[chunk_idx] = user_back_token
+            owner_ordinals[chunk_idx] = 0
+            owner_events[chunk_idx] = event_id
+
+    transition_types = [TURN_STATE_STEADY] * num_chunks
+    transition_ordinals = [0] * num_chunks
+    transition_events = [0] * num_chunks
+    previous = turn_closed_token
+    previous_ordinal = 0
+    previous_event = 0
+    for chunk_idx, token in enumerate(tokens):
+        if token != previous:
+            if token == turn_open_token:
+                transition_types[chunk_idx] = TURN_STATE_OPEN_ENTRY
+                transition_ordinals[chunk_idx] = owner_ordinals[chunk_idx]
+            elif token == user_back_token:
+                transition_types[chunk_idx] = TURN_STATE_USER_BACK_ENTRY
+                transition_events[chunk_idx] = owner_events[chunk_idx]
+            elif previous == user_back_token:
+                transition_types[chunk_idx] = TURN_STATE_USER_BACK_EXIT
+                transition_events[chunk_idx] = previous_event
+            else:
+                transition_types[chunk_idx] = TURN_STATE_CLOSE_ENTRY
+                transition_ordinals[chunk_idx] = previous_ordinal
+        previous = token
+        previous_ordinal = owner_ordinals[chunk_idx]
+        previous_event = owner_events[chunk_idx]
+
+    return TurnStateSequence(
+        tokens=tuple(tokens),
+        transition_types=tuple(transition_types),
+        turn_ordinals=tuple(transition_ordinals),
+        user_backchannel_event_ids=tuple(transition_events),
+    )
+
+
+def apply_turn_state_to_messages(
+    messages: List[dict],
+    state: TurnStateSequence,
+    *,
+    blank_token: str,
+    marker_tokens: Iterable[str],
+) -> None:
+    """Remove legacy markers/blank and append exactly one state token per chunk."""
+    assistant_messages = [message for message in messages if message["role"] == "assistant"]
+    if len(assistant_messages) != len(state.tokens):
+        raise ValueError(
+            f"turn-state chunk/message mismatch: {len(state.tokens)} states for "
+            f"{len(assistant_messages)} assistant turns"
+        )
+    for message, state_token in zip(assistant_messages, state.tokens):
+        content = message["content"]
+        for marker in marker_tokens:
+            if marker:
+                content = content.replace(marker, "")
+        if content == blank_token:
+            content = ""
+        message["content"] = f"{content}{state_token}"
+
+
 def _require_mapping(value: Any, *, field: str, cut_id: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise TypeError(f"Cut {cut_id!r} field {field!r} must be a mapping")
@@ -447,6 +599,10 @@ class StreamingSTTBatch:
     user_backchannel_event_ids: Optional[torch.Tensor] = None
     user_backchannel_reference_frames: Optional[torch.Tensor] = None
     num_user_backchannel_events: Optional[torch.Tensor] = None
+    turn_state_mask: Optional[torch.Tensor] = None
+    turn_state_transition_types: Optional[torch.Tensor] = None
+    turn_state_turn_ordinals: Optional[torch.Tensor] = None
+    turn_state_event_ids: Optional[torch.Tensor] = None
     cuts: Optional[CutSet] = None
 
 
@@ -468,6 +624,10 @@ class StreamingSTTDataConfig:
     text_start_token: str = "<|text_start|>"
     text_end_token: str = "<|text_end|>"
     compact_text_end_only_no_blank: bool = False
+    enable_turn_state_tokens: bool = False
+    turn_open_token: str = "<turn_open>"
+    turn_closed_token: str = "<turn_closed>"
+    user_back_token: str = "<user_back>"
     add_utterance_boundary_tokens: bool = False
     use_per_sample_utterance_boundary_tokens: bool = False
     use_per_sample_utterance_boundary_timestamps: bool = False
@@ -506,6 +666,12 @@ class StreamingSTTDataConfig:
     chunk_step: int = 1
 
     def __post_init__(self):
+        if self.enable_turn_state_tokens:
+            if self.chunk_size <= 0:
+                raise ValueError("enable_turn_state_tokens=True requires positive fixed chunk_size")
+            state_tokens = {self.turn_open_token, self.turn_closed_token, self.user_back_token}
+            if "" in state_tokens or len(state_tokens) != 3:
+                raise ValueError("turn-state tokens must be non-empty and pairwise distinct")
         if self.utterance_start_boundary_delay_frames < 0:
             raise ValueError("utterance_start_boundary_delay_frames must be non-negative")
         if self.utterance_end_boundary_delay_frames < 0:
@@ -1647,7 +1813,7 @@ def _tokenize_compact_with_assistant_mask(
     messages: List[dict],
     tokenizer: AutoTokenizer,
     write_id: Optional[int],
-    eos_id: int,
+    eos_id: Optional[int],
     blank_token: Optional[str] = None,
     suppress_blank: bool = False,
 ) -> tuple[list[int], list[int]]:
@@ -1702,8 +1868,9 @@ def _tokenize_compact_with_assistant_mask(
                 input_ids.extend(asst_ids)
                 assistant_mask.extend([1] * len(asst_ids))
                 # eos
-                input_ids.append(eos_id)
-                assistant_mask.append(1)
+                if eos_id is not None:
+                    input_ids.append(eos_id)
+                    assistant_mask.append(1)
                 i += 1
         else:
             # Orphan assistant (shouldn't normally occur) — treat as standalone asst segment.
@@ -1714,8 +1881,9 @@ def _tokenize_compact_with_assistant_mask(
                 assistant_mask.append(1)
             input_ids.extend(asst_ids)
             assistant_mask.extend([1] * len(asst_ids))
-            input_ids.append(eos_id)
-            assistant_mask.append(1)
+            if eos_id is not None:
+                input_ids.append(eos_id)
+                assistant_mask.append(1)
             i += 1
 
     return input_ids, assistant_mask
@@ -1957,6 +2125,7 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
         self._sob_id = None
         self._eob_id = None
         self._user_backchannel_end_id = None
+        self._turn_state_ids: set[int] = set()
         if self.cfg.add_utterance_boundary_tokens:
             sou_ids = self.tokenizer.tokenizer.encode(self.cfg.utterance_start_token, add_special_tokens=False)
             eou_ids = self.tokenizer.tokenizer.encode(self.cfg.utterance_end_token, add_special_tokens=False)
@@ -1993,6 +2162,14 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
                     )
                 self._eob_id = eob_ids[0]
                 self._user_backchannel_end_id = self._eob_id
+        if self.cfg.enable_turn_state_tokens:
+            encoded = [
+                self.tokenizer.tokenizer.encode(token, add_special_tokens=False)
+                for token in (self.cfg.turn_open_token, self.cfg.turn_closed_token, self.cfg.user_back_token)
+            ]
+            if any(len(ids) != 1 for ids in encoded):
+                raise ValueError(f"turn-state tokens must each encode to one token; got {encoded}")
+            self._turn_state_ids = {ids[0] for ids in encoded}
 
     def _get_multiturn_samples(
         self,
@@ -2482,20 +2659,59 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             ),
         )
 
+        turn_states: list[TurnStateSequence | None] = [None] * len(multiturn_samples)
+        if self.cfg.enable_turn_state_tokens:
+            for sample_idx, (cut, sample, duration_secs) in enumerate(
+                zip(cuts, multiturn_samples, audio_durations_secs)
+            ):
+                if sample is None:
+                    continue
+                state = build_turn_state_sequence(
+                    sample,
+                    audio_duration_secs=duration_secs,
+                    frame_length_in_secs=self.cfg.frame_length_in_secs,
+                    chunk_size=self.cfg.chunk_size,
+                    turn_open_token=self.cfg.turn_open_token,
+                    turn_closed_token=self.cfg.turn_closed_token,
+                    user_back_token=self.cfg.user_back_token,
+                    utterance_start_delay_frames=self.cfg.utterance_start_boundary_delay_frames,
+                    utterance_end_delay_frames=self.cfg.utterance_end_boundary_delay_frames,
+                    user_backchannel_start_delay_frames=self.cfg.user_backchannel_start_delay_frames,
+                    user_backchannel_end_delay_frames=self.cfg.user_backchannel_end_delay_frames,
+                    cut_id=str(getattr(cut, "id", "<unknown>")),
+                )
+                apply_turn_state_to_messages(
+                    batch_messages[sample_idx],
+                    state,
+                    blank_token=self.cfg.blank_token,
+                    marker_tokens=(
+                        self.cfg.utterance_start_token,
+                        self.cfg.utterance_end_token,
+                        self.cfg.user_backchannel_start_token,
+                        self.cfg.user_backchannel_end_token,
+                    ),
+                )
+                turn_states[sample_idx] = state
+
         all_input_ids = []
         all_target_ids = []
         all_boundary_turn_ordinals = []
         all_user_backchannel_event_ids = []
         all_user_backchannel_reference_frames = []
+        all_turn_state_masks = []
+        all_turn_state_transition_types = []
+        all_turn_state_turn_ordinals = []
+        all_turn_state_event_ids = []
 
         for sample_idx, messages in enumerate(batch_messages):
             # Tokenize and compute assistant content mask.
             if self.cfg.compact_template:
+                is_state_sample = turn_states[sample_idx] is not None
                 input_ids, assistant_mask = _tokenize_compact_with_assistant_mask(
                     messages,
                     self.tokenizer,
-                    self._write_id,
-                    self._compact_eos_id,
+                    None if is_state_sample else self._write_id,
+                    None if is_state_sample else self._compact_eos_id,
                     blank_token=self.cfg.blank_token,
                     suppress_blank=self.cfg.compact_text_end_only_no_blank,
                 )
@@ -2570,8 +2786,12 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             boundary_turn_ordinals = [0] * len(target_ids)
             user_backchannel_event_ids = [0] * len(target_ids)
             user_backchannel_reference_frames = [-1] * len(target_ids)
+            turn_state_mask = [False] * len(target_ids)
+            turn_state_transition_types = [TURN_STATE_STEADY] * len(target_ids)
+            turn_state_turn_ordinals = [0] * len(target_ids)
+            turn_state_event_ids = [0] * len(target_ids)
             multiturn_sample = multiturn_samples[sample_idx]
-            if multiturn_sample is not None:
+            if multiturn_sample is not None and turn_states[sample_idx] is None:
                 (
                     boundary_turn_ordinals,
                     user_backchannel_event_ids,
@@ -2587,6 +2807,20 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
                     sample_idx=sample_idx,
                 )
 
+            state = turn_states[sample_idx]
+            if state is not None:
+                state_positions = [idx for idx, token_id in enumerate(target_ids) if token_id in self._turn_state_ids]
+                if len(state_positions) != len(state.tokens):
+                    raise ValueError(
+                        f"sample {sample_idx} encoded {len(state_positions)} state targets for "
+                        f"{len(state.tokens)} chunks"
+                    )
+                for chunk_idx, target_idx in enumerate(state_positions):
+                    turn_state_mask[target_idx] = True
+                    turn_state_transition_types[target_idx] = state.transition_types[chunk_idx]
+                    turn_state_turn_ordinals[target_idx] = state.turn_ordinals[chunk_idx]
+                    turn_state_event_ids[target_idx] = state.user_backchannel_event_ids[chunk_idx]
+
             all_input_ids.append(torch.tensor(input_ids, dtype=torch.long))
             all_target_ids.append(torch.tensor(target_ids, dtype=torch.long))
             all_boundary_turn_ordinals.append(torch.tensor(boundary_turn_ordinals, dtype=torch.long))
@@ -2594,6 +2828,10 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             all_user_backchannel_reference_frames.append(
                 torch.tensor(user_backchannel_reference_frames, dtype=torch.long)
             )
+            all_turn_state_masks.append(torch.tensor(turn_state_mask, dtype=torch.bool))
+            all_turn_state_transition_types.append(torch.tensor(turn_state_transition_types, dtype=torch.long))
+            all_turn_state_turn_ordinals.append(torch.tensor(turn_state_turn_ordinals, dtype=torch.long))
+            all_turn_state_event_ids.append(torch.tensor(turn_state_event_ids, dtype=torch.long))
 
         if self.cfg.chunk_size >= 0:  # fixed chunking or dynamic chunking: right-pad
             input_tokens = right_collate_vectors(all_input_ids, padding_value=self.tokenizer.pad_id)
@@ -2603,6 +2841,10 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             user_backchannel_reference_frames = right_collate_vectors(
                 all_user_backchannel_reference_frames, padding_value=-1
             )
+            turn_state_mask = right_collate_vectors(all_turn_state_masks, padding_value=False)
+            turn_state_transition_types = right_collate_vectors(all_turn_state_transition_types, padding_value=0)
+            turn_state_turn_ordinals = right_collate_vectors(all_turn_state_turn_ordinals, padding_value=0)
+            turn_state_event_ids = right_collate_vectors(all_turn_state_event_ids, padding_value=0)
             input_token_lens = torch.tensor([len(ids) for ids in all_input_ids], dtype=torch.long)
             target_token_lens = torch.tensor([len(ids) for ids in all_target_ids], dtype=torch.long)
         else:  # offline mode: left-pad
@@ -2613,6 +2855,10 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             user_backchannel_reference_frames = left_collate_vectors(
                 all_user_backchannel_reference_frames, padding_value=-1
             )
+            turn_state_mask = left_collate_vectors(all_turn_state_masks, padding_value=False)
+            turn_state_transition_types = left_collate_vectors(all_turn_state_transition_types, padding_value=0)
+            turn_state_turn_ordinals = left_collate_vectors(all_turn_state_turn_ordinals, padding_value=0)
+            turn_state_event_ids = left_collate_vectors(all_turn_state_event_ids, padding_value=0)
             # length is the same size as input_tokens.shape[1] since they're left-padded
             input_token_lens = torch.tensor(
                 [input_tokens.shape[1] for _ in range(len(all_input_ids))], dtype=torch.long
@@ -2635,4 +2881,8 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             user_backchannel_event_ids=user_backchannel_event_ids,
             user_backchannel_reference_frames=user_backchannel_reference_frames,
             num_user_backchannel_events=num_user_backchannel_events,
+            turn_state_mask=turn_state_mask,
+            turn_state_transition_types=turn_state_transition_types,
+            turn_state_turn_ordinals=turn_state_turn_ordinals,
+            turn_state_event_ids=turn_state_event_ids,
         )

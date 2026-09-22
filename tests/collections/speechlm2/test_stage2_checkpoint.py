@@ -52,6 +52,7 @@ def _source_state(source_rows=4, hidden=3):
         ("<sou>", "<eou>"),
         ("<sou>", "<eou>", "<sob>"),
         ("<sou>", "<eou>", "<sob>", "<eob>"),
+        ("<sou>", "<eou>", "<sob>", "<eob>", "<turn_open>", "<turn_closed>", "<user_back>"),
     ],
 )
 def test_strict_vocab_expansion_preserves_inserted_rows_and_remaps_compact_text(
