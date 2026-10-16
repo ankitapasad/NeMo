@@ -102,7 +102,7 @@ def worker(args, plan):
                                       data_cfg=cfg.data.dataset, dataset_cls=StreamingSTTDataset)
             if cfg.get('init_weights_from_checkpoint'):
                 from nemo.collections.speechlm2.parts.stage2_checkpoint import load_asr_stage2_weights
-                load_asr_stage2_weights(model, cfg.init_weights_from_checkpoint)
+                load_asr_stage2_weights(model, cfg.init_weights_from_checkpoint, lora_merge=cfg.get("init_lora_merge"))
         dataset = StreamingSTTDataset(cfg=cfg.data.dataset, tokenizer=model.tokenizer, defer_get_batch=True)
 
         def formatted(cuts):

@@ -60,7 +60,7 @@ def train(cfg):
             init_checkpoint = cfg.get("init_weights_from_checkpoint", None)
             if not init_checkpoint:
                 raise ValueError("init_weights_from_checkpoint is required for fresh stage-2 training")
-            load_asr_stage2_weights(model, init_checkpoint)
+            load_asr_stage2_weights(model, init_checkpoint, lora_merge=cfg.get("init_lora_merge"))
         else:
             logging.info("Resuming full stage-2 training state from: %s", trainer.ckpt_path)
 

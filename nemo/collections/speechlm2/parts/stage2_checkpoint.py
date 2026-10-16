@@ -130,7 +130,45 @@ def prepare_asr_stage2_state_dict(
     return expanded_state
 
 
-def load_asr_stage2_weights(model, checkpoint_path: str) -> None:
+def _source_lora_merge_config(checkpoint, fallback=None):
+    """Read source scaling; never infer alpha from rank or silently ignore variants."""
+    saved = checkpoint.get('hyper_parameters', {}).get('cfg', {}).get('lora', {}) or {}
+    if not isinstance(saved, Mapping):
+        raise ValueError('Checkpoint hyper_parameters.cfg.lora must be a mapping')
+    # This initializer currently supports the historical standard Q/V adapter.
+    # These settings change scaling, tensor layout or extra trained modules.
+    for key in ('use_rslora', 'use_dora', 'fan_in_fan_out', 'lora_bias',
+                'rank_pattern', 'alpha_pattern', 'modules_to_save', 'layer_replication',
+                'target_parameters'):
+        if saved.get(key):
+            raise ValueError(f'Automatic ASR LoRA merge does not support source setting {key}={saved[key]!r}')
+    if saved.get('bias', 'none') != 'none':
+        raise ValueError('Automatic ASR LoRA merge supports source bias=none only')
+    targets = saved.get('target_modules')
+    if targets is not None and (isinstance(targets, str) or set(targets) != {'q_proj', 'v_proj'}):
+        raise ValueError('Automatic ASR LoRA merge currently supports q_proj/v_proj source adapters only')
+    fallback = {} if fallback is None else fallback
+    if not isinstance(fallback, Mapping) or set(fallback) - {'rank', 'alpha'}:
+        raise ValueError('Top-level init_lora_merge may contain only rank and alpha')
+    resolved = {}
+    for target, source in (('rank', 'r'), ('alpha', 'lora_alpha')):
+        value = saved.get(source)
+        if value is not None and target in fallback and fallback[target] != value:
+            raise ValueError(f'init_lora_merge.{target} conflicts with checkpoint lora.{source}={value!r}')
+        if value is None:
+            value = fallback.get(target)
+        if value is None:
+            raise ValueError(
+                f'ASR checkpoint contains LoRA weights but hyper_parameters.cfg.lora.{source} is missing. '
+                f'Set init_lora_merge.{target} at the top level of the training YAML to the source '
+                'checkpoint setting. Alpha cannot be inferred from adapter weights.'
+            )
+        resolved[target] = value
+    return resolved
+
+
+def load_asr_stage2_weights(model, checkpoint_path: str, *, lora_merge=None) -> None:
+    # Fresh ASR initialization only; the entry point skips this on full-state resume.
     checkpoint_path = Path(checkpoint_path)
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"ASR stage-2 checkpoint is not a readable file: {checkpoint_path}")
@@ -140,18 +178,36 @@ def load_asr_stage2_weights(model, checkpoint_path: str) -> None:
     if "state_dict" not in checkpoint:
         raise KeyError(f"Checkpoint has no state_dict: {checkpoint_path}")
 
+    source_has_lora = any('.lora_' in name for name in checkpoint['state_dict'])
+    target_has_lora = any('.lora_' in name for name in model.state_dict())
+    merge_config = None
+    if lora_merge is not None and (not source_has_lora or target_has_lora):
+        raise ValueError('init_lora_merge is only valid for a LoRA source and an adapter-free full-FT target')
+    if source_has_lora and not target_has_lora:
+        merge_config = _source_lora_merge_config(checkpoint, lora_merge)
+
     boundary_tokens = ("<sou>", "<eou>")
     user_backchannel_mode = getattr(model, "user_backchannel_mode", "ignore")
     if user_backchannel_mode in {"sob_eou", "sob_eob"}:
         boundary_tokens += (getattr(model, "user_backchannel_start_token", "<sob>"),)
     if user_backchannel_mode == "sob_eob":
         boundary_tokens += (getattr(model, "user_backchannel_end_token", "<eob>"),)
-    expanded_state = prepare_asr_stage2_state_dict(
-        model, checkpoint["state_dict"], boundary_tokens=boundary_tokens
-    )
-    incompatible = model.load_state_dict(expanded_state, strict=True)
-    if incompatible.missing_keys or incompatible.unexpected_keys:
-        raise RuntimeError(f"Strict stage-2 load unexpectedly returned: {incompatible}")
-    del expanded_state
+    from contextlib import nullcontext
+
+    initialization = nullcontext()
+    if merge_config is not None:
+        from nemo.collections.speechlm2.parts.lora_checkpoint import full_finetuning_lora_init
+
+        initialization = full_finetuning_lora_init(model, **merge_config)
+
+    with initialization:
+        expanded_state = prepare_asr_stage2_state_dict(
+            model, checkpoint["state_dict"], boundary_tokens=boundary_tokens
+        )
+        incompatible = model.load_state_dict(expanded_state, strict=True)
+        if incompatible.missing_keys or incompatible.unexpected_keys:
+            raise RuntimeError(f"Strict stage-2 load unexpectedly returned: {incompatible}")
+        del expanded_state
     del checkpoint
-    logging.info("ASR stage-2 weights loaded with a strict state-dict match")
+    logging.info("ASR stage-2 weights loaded with a strict state-dict match%s",
+                 " and PEFT adapters merged for full finetuning" if merge_config is not None else "")

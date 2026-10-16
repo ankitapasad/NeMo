@@ -1,0 +1,30 @@
+# Fresh ASR-LoRA -> boundary training. Resume uses the saved full-FT checkpoint.
+defaults:
+  - streaming_stt
+  - _self_
+
+init_weights_from_checkpoint: ???
+# LoRA is detected and rank/alpha read from the ASR checkpoint automatically.
+# Only for missing source metadata: init_lora_merge: {rank: <source-r>, alpha: <source-alpha>}
+
+model:
+  # No model.lora key: the target model is adapter-free from construction.
+  freeze_llm_model: false
+  freeze_speech_encoder: true
+  freeze_modality_adapter: false
+  freeze_modality_proj: false
+  freeze_llm_head: false
+  freeze_embed_tokens: false
+  freeze_params: []
+  prevent_freeze_params: []
+  compact_template: true
+  use_text_tokens: true
+  user_backchannel_mode: sob_eob
+  optimizer:
+    lr: 1e-5
+
+data:
+  dataset:
+    compact_template: true
+    use_text_tokens: true
+    user_backchannel_mode: sob_eob
