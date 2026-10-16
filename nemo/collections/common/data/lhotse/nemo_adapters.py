@@ -15,6 +15,7 @@
 """Lhotse adapters for NeMo datasets including Parquet support."""
 import copy
 import hashlib
+import json
 import math
 import os
 import random
@@ -43,16 +44,24 @@ from lhotse.serialization import open_best
 from lhotse.utils import compute_num_samples, ifnone
 
 from nemo.collections.common.parts.preprocessing.manifest import get_full_path
+from nemo.collections.common.data.lhotse.precomputed_alignments import (
+    project_precomputed_word_alignments as _project_precomputed_word_alignments,
+)
 from nemo.utils import logging
 from nemo.utils.data_utils import is_datastore_path
 
 
 LEAN_MULTI_TURN_SCHEMA_VERSIONS = frozenset({"lean_multi_turn_v2", "lean_multi_turn_v3"})
-_CONTEXT_SAMPLING_FIELDS = {
+_CONTEXT_SAMPLING_REQUIRED_FIELDS = {
     "min_leading_s",
     "min_trailing_s",
     "max_duration_s",
 }
+_CONTEXT_SAMPLING_OPTIONAL_FIELDS = {
+    "max_leading_s",
+    "max_trailing_s",
+}
+_CONTEXT_SAMPLING_FIELDS = _CONTEXT_SAMPLING_REQUIRED_FIELDS | _CONTEXT_SAMPLING_OPTIONAL_FIELDS | {"analysis_mode"}
 
 
 def _finite_nonnegative_number(value, *, field: str) -> float:
@@ -73,6 +82,30 @@ def _finite_number(value, *, field: str) -> float:
     return value
 
 
+def _finite_context_max(value, *, field: str) -> float:
+    """Normalize an optional context maximum; ``-1`` means unbounded."""
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise TypeError(
+            f"context_sampling.{field} must be -1 or a non-negative finite number; got {value!r}"
+        )
+    value = float(value)
+    if not math.isfinite(value) or value < -1 or (-1 < value < 0):
+        raise ValueError(
+            f"context_sampling.{field} must be -1 or a non-negative finite number; got {value!r}"
+        )
+    return value
+
+
+def _manifest_row_identity(data):
+    """Preserve original row coordinates across metadata and decoded-audio readers.
+
+    Analysis uses this only when no explicit sample_id exists. Do not use decoded
+    Cut IDs: tar subsegments and metadata cuts have different naming conventions.
+    """
+    return json.dumps([str(data['audio_filepath']), float(data.get('offset') or 0.0),
+                       float(data['duration'])], separators=(',', ':'))
+
+
 def _validate_context_sampling_config(config: Mapping | None) -> dict | None:
     if config is None:
         return None
@@ -81,14 +114,43 @@ def _validate_context_sampling_config(config: Mapping | None) -> dict | None:
     unknown = set(config) - _CONTEXT_SAMPLING_FIELDS
     if unknown:
         raise ValueError(f"context_sampling has unsupported fields: {sorted(unknown)}")
-    missing = _CONTEXT_SAMPLING_FIELDS - set(config)
+    missing = _CONTEXT_SAMPLING_REQUIRED_FIELDS - set(config)
     if missing:
         raise ValueError(f"context_sampling is missing required fields: {sorted(missing)}")
 
-    normalized = {key: _finite_nonnegative_number(config[key], field=key) for key in _CONTEXT_SAMPLING_FIELDS}
+    normalized = {
+        key: _finite_nonnegative_number(config[key], field=key) for key in _CONTEXT_SAMPLING_REQUIRED_FIELDS
+    }
+    for key in _CONTEXT_SAMPLING_OPTIONAL_FIELDS:
+        normalized[key] = _finite_context_max(config.get(key, -1), field=key)
+    mode = config.get("analysis_mode", "sampled")
+    if mode not in ("sampled", "minimum", "maximum_leading", "maximum_trailing"):
+        raise ValueError(f"Unsupported context analysis_mode: {mode!r}")
+    normalized["analysis_mode"] = mode
     if normalized["max_duration_s"] <= 0:
         raise ValueError("context_sampling.max_duration_s must be positive")
+    for side in ("leading", "trailing"):
+        minimum = normalized[f"min_{side}_s"]
+        maximum = normalized[f"max_{side}_s"]
+        if maximum != -1 and maximum < minimum:
+            raise ValueError(
+                f"context_sampling.max_{side}_s={maximum} must be -1 or at least "
+                f"context_sampling.min_{side}_s={minimum}"
+            )
     return normalized
+
+
+def context_corner_pair(mode, *, leading_low, leading_high, trailing_low, trailing_high, total_budget):
+    """Deterministic feasible crop corners for analysis; training defaults to sampling."""
+    if mode == "minimum":
+        return leading_low, trailing_low
+    if mode == "maximum_leading":
+        lead = min(leading_high, total_budget - trailing_low)
+        return lead, min(trailing_high, total_budget - lead)
+    if mode == "maximum_trailing":
+        trail = min(trailing_high, total_budget - leading_low)
+        return min(leading_high, total_budget - trail), trail
+    raise ValueError(f"Unsupported context corner: {mode!r}")
 
 
 def _uniform_context_pair(
@@ -204,15 +266,11 @@ def _shift_and_filter_context_intervals(
     items[:] = retained
 
 
-def _sample_lean_multiturn_context(
-    data: Mapping,
-    *,
-    recording_duration: float,
-    context_sampling: Mapping,
-    seed: int,
-) -> dict:
-    """Return a copied lean multi-turn row with a sampled crop and shifted relative timestamps."""
-    data = copy.deepcopy(dict(data))
+def _lean_multiturn_context_geometry(data: Mapping, *, recording_duration: float, context_sampling: Mapping) -> dict:
+    """Native crop constraints shared by training and metadata estimation.
+
+    Bounds are analytic; they are not extrema of a finite set of random draws.
+    """
     sample_id = data.get("sample_id")
     if not isinstance(sample_id, str) or not sample_id:
         raise ValueError("context_sampling requires a non-empty sample_id")
@@ -242,7 +300,10 @@ def _sample_lean_multiturn_context(
             f"but decoded tar member duration is {recording_duration}"
         )
 
-    old_offset = _finite_nonnegative_number(data.get("offset", 0.0), field="manifest.offset")
+    old_offset = _finite_number(data.get("offset", 0.0), field="manifest.offset")
+    if old_offset < -1e-3:
+        raise ValueError(f"manifest.offset must be non-negative within 1 ms tolerance; got {old_offset}")
+    old_offset = max(0.0, old_offset)
     old_duration = _finite_nonnegative_number(data.get("duration"), field="manifest.duration")
     current_leading = _finite_nonnegative_number(audio_context.get("leading_sil"), field="audio_context.leading_sil")
     current_trailing = _finite_nonnegative_number(
@@ -293,27 +354,129 @@ def _sample_lean_multiturn_context(
     available_leading = min(available_leading, physical_leading)
     available_trailing = min(available_trailing, physical_trailing)
 
-    leading_high = available_leading
-    trailing_high = available_trailing
-    if leading_high + tolerance < context_sampling["min_leading_s"]:
+    required_alignment_leading = 0.0
+    required_alignment_trailing = 0.0
+    if data.get("word_alignment_mode") == "precomputed_required":
+        alignment_starts = []
+        alignment_ends = []
+        components = target.get("components")
+        if not isinstance(components, list) or not components:
+            raise ValueError(f"Sample {sample_id!r} has no target components for precomputed alignment")
+        for component_idx, component in enumerate(components):
+            record = component.get("precomputed_word_alignment") if isinstance(component, Mapping) else None
+            words = record.get("words") if isinstance(record, Mapping) else None
+            if not isinstance(words, list) or not words:
+                raise ValueError(
+                    f"Sample {sample_id!r} target.components[{component_idx}] has no precomputed words"
+                )
+            for word_idx, word in enumerate(words):
+                alignment_starts.append(
+                    _finite_nonnegative_number(
+                        word.get("start"),
+                        field=f"target.components[{component_idx}].precomputed_word_alignment.words[{word_idx}].start",
+                    )
+                )
+                alignment_ends.append(
+                    _finite_nonnegative_number(
+                        word.get("end"),
+                        field=f"target.components[{component_idx}].precomputed_word_alignment.words[{word_idx}].end",
+                    )
+                )
+        required_alignment_leading = max(0.0, target_start_in_member - min(alignment_starts))
+        required_alignment_trailing = max(0.0, max(alignment_ends) - target_end_in_member)
+
+    configured_max_leading = context_sampling["max_leading_s"]
+    configured_max_trailing = context_sampling["max_trailing_s"]
+    leading_high = (
+        available_leading
+        if configured_max_leading == -1
+        else min(available_leading, configured_max_leading)
+    )
+    trailing_high = (
+        available_trailing
+        if configured_max_trailing == -1
+        else min(available_trailing, configured_max_trailing)
+    )
+    effective_min_leading = max(context_sampling["min_leading_s"], required_alignment_leading)
+    effective_min_trailing = max(context_sampling["min_trailing_s"], required_alignment_trailing)
+    if leading_high + tolerance < effective_min_leading:
         raise ValueError(
             f"Sample {sample_id!r} has only {leading_high}s available leading context, below "
-            f"context_sampling.min_leading_s={context_sampling['min_leading_s']}"
+            f"required minimum={effective_min_leading}"
         )
-    if trailing_high + tolerance < context_sampling["min_trailing_s"]:
+    if trailing_high + tolerance < effective_min_trailing:
         raise ValueError(
             f"Sample {sample_id!r} has only {trailing_high}s available trailing context, below "
-            f"context_sampling.min_trailing_s={context_sampling['min_trailing_s']}"
+            f"required minimum={effective_min_trailing}"
         )
-    leading_low = min(context_sampling["min_leading_s"], leading_high)
-    trailing_low = min(context_sampling["min_trailing_s"], trailing_high)
+    leading_low = min(effective_min_leading, leading_high)
+    trailing_low = min(effective_min_trailing, trailing_high)
     core_duration = last_end - first_start
     total_budget = context_sampling["max_duration_s"] - core_duration
+    if leading_low + trailing_low > total_budget + 1e-9:
+        raise ValueError("Minimum available leading/trailing context does not fit max_duration_s")
+    return {
+        "sample_id": sample_id,
+        "old_offset": old_offset,
+        "old_duration": old_duration,
+        "source_start": source_start,
+        "core_duration": core_duration,
+        "total_budget": total_budget,
+        "target_start_in_member": target_start_in_member,
+        "leading_low": leading_low,
+        "leading_high": leading_high,
+        "trailing_low": trailing_low,
+        "trailing_high": trailing_high,
+        "configured_max_leading": configured_max_leading,
+        "configured_max_trailing": configured_max_trailing,
+        "required_alignment_leading": required_alignment_leading,
+        "required_alignment_trailing": required_alignment_trailing,
+        "tolerance": tolerance,
+        "min_duration": core_duration + leading_low + trailing_low,
+        "max_duration": max(core_duration + leading_low + trailing_low,
+                            min(context_sampling["max_duration_s"], core_duration + leading_high + trailing_high)),
+    }
+
+
+def _sample_lean_multiturn_context(
+    data: Mapping,
+    *,
+    recording_duration: float,
+    context_sampling: Mapping,
+    seed: int,
+) -> dict:
+    """Return a copied lean multi-turn row with a sampled crop and shifted relative timestamps."""
+    data = copy.deepcopy(dict(data))
+    geometry = _lean_multiturn_context_geometry(
+        data, recording_duration=recording_duration, context_sampling=context_sampling
+    )
+    sample_id = geometry["sample_id"]
+    old_offset = geometry["old_offset"]
+    old_duration = geometry["old_duration"]
+    source_start = geometry["source_start"]
+    core_duration = geometry["core_duration"]
+    total_budget = geometry["total_budget"]
+    target_start_in_member = geometry["target_start_in_member"]
+    leading_low = geometry["leading_low"]
+    leading_high = geometry["leading_high"]
+    trailing_low = geometry["trailing_low"]
+    trailing_high = geometry["trailing_high"]
+    configured_max_leading = geometry["configured_max_leading"]
+    configured_max_trailing = geometry["configured_max_trailing"]
+    required_alignment_leading = geometry["required_alignment_leading"]
+    required_alignment_trailing = geometry["required_alignment_trailing"]
+    tolerance = geometry["tolerance"]
+    curation = data["curation"]
+    audio_context = curation["audio_context"]
+    target = curation["target"]
+    regions = target["utterance_regions"]
     stable_seed = int.from_bytes(
         hashlib.blake2b(f"{seed}\0{sample_id}".encode("utf-8"), digest_size=8).digest(), "big"
     )
-    leading, trailing = _uniform_context_pair(
-        random.Random(stable_seed),
+    mode = context_sampling.get("analysis_mode", "sampled")
+    select_pair = _uniform_context_pair if mode == "sampled" else context_corner_pair
+    leading, trailing = select_pair(
+        random.Random(stable_seed) if mode == "sampled" else mode,
         leading_low=leading_low,
         leading_high=leading_high,
         trailing_low=trailing_low,
@@ -365,6 +528,9 @@ def _sample_lean_multiturn_context(
             )
 
     data["offset"] = max(0.0, new_offset)
+    # Keep a fixed duration for exposure accounting. It includes the
+    # manifest's minimum context but excludes extra context sampled here.
+    data["data_seen_accounting_duration_s"] = old_duration
     data["duration"] = new_duration
     data["source_audio_offset"] = source_start + data["offset"]
     audio_context["leading_sil"] = leading
@@ -376,6 +542,12 @@ def _sample_lean_multiturn_context(
             "policy": "dataloader_uniform_available_transcript_bounded",
             "selected_leading_s": leading,
             "selected_trailing_s": trailing,
+            "configured_max_leading_s": configured_max_leading,
+            "configured_max_trailing_s": configured_max_trailing,
+            "effective_max_leading_s": leading_high,
+            "effective_max_trailing_s": trailing_high,
+            "required_alignment_leading_s": required_alignment_leading,
+            "required_alignment_trailing_s": required_alignment_trailing,
             "max_total_duration_s": context_sampling["max_duration_s"],
         }
     )
@@ -436,6 +608,7 @@ class LazyNeMoIterator:
         shuffle_shards: bool = False,
         shard_seed: int | Literal["randomized", "trng"] = "trng",
         extra_fields: list[dict[str, str]] | None = None,
+        context_sampling: Mapping | None = None,
     ) -> None:
         self.path = path
         self.shuffle_shards = shuffle_shards
@@ -451,6 +624,9 @@ class LazyNeMoIterator:
         self.text_field = text_field
         self.lang_field = lang_field
         self.metadata_only = metadata_only
+        self.context_sampling = _validate_context_sampling_config(context_sampling)
+        if self.context_sampling is not None and not metadata_only:
+            raise ValueError("Non-tarred context sampling is supported only for metadata estimation")
         self.extra_fields = extra_fields
         validate_extra_fields(self.extra_fields)
 
@@ -462,6 +638,23 @@ class LazyNeMoIterator:
             # filter out entries with valid "_skipme" values.
             if data.get("_skipme", False):
                 continue
+            data['_manifest_row_id'] = _manifest_row_identity(data)
+            if self.context_sampling is not None:
+                # Metadata-only estimation trusts the validated physical-member duration.
+                # Actual training independently verifies it against the audio header.
+                physical_duration = data.get("curation", {}).get("physical_audio", {}).get("duration")
+                physical_duration = _finite_nonnegative_number(physical_duration, field="physical_audio.duration")
+                geometry = _lean_multiturn_context_geometry(
+                    data, recording_duration=physical_duration, context_sampling=self.context_sampling
+                )
+                data = _sample_lean_multiturn_context(
+                    data, recording_duration=physical_duration, context_sampling=self.context_sampling, seed=seed
+                )
+                data["context_duration_bounds"] = {
+                    "min_duration": geometry["min_duration"], "max_duration": geometry["max_duration"],
+                    "recording_duration_source": "manifest_physical_audio_metadata",
+                }
+            data = _project_precomputed_word_alignments(data)
             audio_path = get_full_path(str(data.pop("audio_filepath")), str(self.path), force_cache=False)
             duration = data.pop("duration")
             offset = data.pop("offset", None)
@@ -762,6 +955,7 @@ class LazyNeMoTarredIterator:
                     entries_processed += 1
                     continue
 
+                data = _project_precomputed_word_alignments(data)
                 # Construct URL: tar_path/audio_filename
                 audio_url = f"{tar_path.rstrip('/')}/{audio_filename.lstrip('/')}"
 
@@ -901,6 +1095,7 @@ class LazyNeMoTarredIterator:
                         # filter out entries with valid "_skipme" values.
                         if data.get("_skipme", False):
                             continue
+                        data['_manifest_row_id'] = _manifest_row_identity(data)
                         if self.context_sampling is not None:
                             data = _sample_lean_multiturn_context(
                                 data,
@@ -908,6 +1103,7 @@ class LazyNeMoTarredIterator:
                                 context_sampling=self.context_sampling,
                                 seed=seed,
                             )
+                        data = _project_precomputed_word_alignments(data)
                         # Cut the recording into corresponding segment and discard audio data outside the segment.
                         cut = make_cut_with_subset_inmemory_recording(
                             recording, offset=data.get("offset", 0.0), duration=data.get("duration")

@@ -33,6 +33,7 @@ token and boundary records are opt-in through ``log_boundary_events=true``.
 
 from __future__ import annotations
 
+import copy
 import math
 import os
 from dataclasses import asdict, dataclass, field
@@ -105,6 +106,12 @@ def _output_record(
                 "boundary_events": [asdict(event) for event in generation_record.boundary_events],
             }
         )
+    if generation_record is not None and getattr(generation_record, "token_probability_chunks", None) is not None:
+        output["token_probabilities"] = {
+            **generation_record.token_probability_metadata,
+            "clip_id": output["clip_id"],
+            "chunks": generation_record.token_probability_chunks,
+        }
     return output
 
 
@@ -114,6 +121,13 @@ class ToAudio(torch.utils.data.Dataset):
     def __getitem__(self, cuts: CutSet):
         audios, audio_lens = cuts.load_audio(collate=True)
         return {"cuts": cuts, "audios": audios, "audio_lens": audio_lens}
+
+
+def preserve_probability_duration(cut):
+    """Save the unpadded endpoint; top-level for worker serialization."""
+    cut = copy.copy(cut)
+    cut.custom = dict(cut.custom or {}, probability_audio_duration=cut.duration)
+    return cut
 
 
 @dataclass
@@ -167,6 +181,7 @@ class StreamingSTTEvalConfig:
     # Collect stream-relative SOU/EOU event timestamps and include them in
     # output records. This is opt-in because it adds diagnostic bookkeeping.
     log_boundary_events: bool = False
+    log_token_probabilities: bool = False
     generation_config: StreamingSTTGenerationConfig = field(default_factory=StreamingSTTGenerationConfig)
 
 
@@ -197,6 +212,10 @@ def main(cfg: StreamingSTTEvalConfig):
         logging.info(f"Resampling cuts from {sample_cut.sampling_rate} to {model.sampling_rate} Hz")
         cuts = CutSet.from_cuts(c.resample(model.sampling_rate) for c in cuts)
     cuts = cuts.sort_by_duration()
+    if cfg.log_token_probabilities:
+        if cfg.output_manifest is None:
+            raise ValueError("log_token_probabilities requires output_manifest")
+        cuts = cuts.map(preserve_probability_duration)
     cuts = cuts.map(partial(pad_extra_duration, extra_duration=cfg.pad_extra_duration))
     sampler = lhotse.dataset.DynamicCutSampler(
         cuts,
@@ -249,7 +268,12 @@ def main(cfg: StreamingSTTEvalConfig):
                 dynamic_max_chunk_size=cfg.dynamic_max_chunk_size,
                 lm_head_emit_threshold=cfg.lm_head_emit_threshold,
                 debug_logs=batch_debug_logs,
-                return_generation_records=cfg.log_boundary_events,
+                return_generation_records=cfg.log_boundary_events or cfg.log_token_probabilities,
+                return_token_probabilities=cfg.log_token_probabilities,
+                probability_audio_durations=(
+                    [cut.custom["probability_audio_duration"] for cut in batch["cuts"]]
+                    if cfg.log_token_probabilities else None
+                ),
             )
             batch_infer_duration = perf_counter() - ts
             batch_cuts = list(batch["cuts"])
@@ -269,7 +293,7 @@ def main(cfg: StreamingSTTEvalConfig):
                     debug_log_writer.write({"id": cut.id, "duration": cut.duration, "frames": frames})
 
             generation_records: list[Optional[StreamingGenerationRecord]]
-            if cfg.log_boundary_events:
+            if cfg.log_boundary_events or cfg.log_token_probabilities:
                 if not all(isinstance(result, StreamingGenerationRecord) for result in batch_results):
                     raise RuntimeError("log_boundary_events=true requires detailed StreamingGenerationRecord outputs")
                 generation_records = list(batch_results)

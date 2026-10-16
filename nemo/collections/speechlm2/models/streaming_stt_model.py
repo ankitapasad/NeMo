@@ -27,6 +27,8 @@ from torch import Tensor, nn
 from torch.distributed.tensor.parallel import loss_parallel
 from transformers import AutoModel, GenerationConfig
 
+from nemo.collections.speechlm2.data.data_seen_tracker import DataSeenTracker
+
 from nemo.collections.asr.inference.streaming.buffering.cache_feature_bufferer import BatchedCacheFeatureBufferer
 from nemo.collections.asr.inference.streaming.framing.request import Frame
 from nemo.collections.asr.inference.utils.context_manager import CacheAwareContext
@@ -45,6 +47,7 @@ from nemo.collections.speechlm2.data.streaming_stt_dataset import (
     decode_with_blank,
     parse_chat_template_ids,
 )
+from nemo.collections.speechlm2.parts.token_probability_capture import TokenProbabilityCapture, tracked_tokens
 from nemo.collections.speechlm2.parts.alignments import ForcedAligner
 from nemo.collections.speechlm2.parts.hf_hub import HFHubMixin
 from nemo.collections.speechlm2.parts.lora import maybe_install_lora
@@ -149,6 +152,15 @@ class StreamingSTTModelConfig:
     freeze_llm_head: bool
     freeze_embed_tokens: bool
     chunk_size: int
+    # Supported blocks consumed through self.cfg by setup_perception,
+    # maybe_install_lora and configure_optimizers. Declaring them here avoids
+    # incorrectly reporting these active settings as ignored by the model.
+    freeze_params: list[str] = field(default_factory=list)
+    prevent_freeze_params: list[str] = field(default_factory=list)
+    lora: Optional[dict] = None
+    perception: Optional[dict] = None
+    optimizer: Optional[dict] = None
+    lr_scheduler: Optional[dict] = None
     audio_tag: str = "<audio>"
     att_context_size: Optional[List[int]] = None
     audio_pad_to: Optional[int] = None
@@ -435,6 +447,8 @@ class StreamingGenerationRecord:
     sampled_token_ids: list[int]
     sampled_token_pieces: list[str]
     boundary_events: list[BoundaryEvent]
+    token_probability_chunks: Optional[list[dict]] = None
+    token_probability_metadata: Optional[dict] = None
 
 
 class StreamingSTTModel(LightningModule, HFHubMixin):
@@ -451,10 +465,12 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             f"serialization in PTL checkpoints (we got: '{type(cfg)=}')."
         )
         super().__init__()
+        self.data_seen_tracker = DataSeenTracker.from_env()
         cfg = _normalize_legacy_text_token_config(cfg)
         self.save_hyperparameters()
         self.cfg = DictConfig(cfg)
         self.core_cfg: StreamingSTTModelConfig = to_dataclass(StreamingSTTModelConfig, cfg)
+
         # Keep user-backchannel semantics in the model config so they survive
         # checkpoint/HF serialization and are available without a dataset at
         # inference time. Training requires the model and dataset views to agree.
@@ -937,13 +953,14 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
     # ------------------------------------------------------------------
 
     def training_step(self, batch: StreamingSTTBatch, batch_idx: int):
+        accounting_batch = batch
         # Keep frozen modules in eval mode (disables dropout / batch-norm updates).
         for m in (self.perception.preprocessor, self.perception.encoder, self.llm):
             if is_frozen(m):
                 m.eval()
 
         if self.forced_aligner is not None:
-            alignments = self.dataset.get_online_alignments(
+            alignments = self.dataset.get_mixed_alignments(
                 cuts=batch.cuts,
                 audios=batch.audios,
                 audio_lens=batch.audio_lens,
@@ -1143,7 +1160,25 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     }
                 )
         self.log_dict(train_metrics, on_step=True)
+        if self.data_seen_tracker is not None:
+            self.data_seen_tracker.update(accounting_batch)
+            if self.data_seen_tracker.should_sync(self.global_step):
+                self.log_dict(self.data_seen_tracker.sync(self.device), on_step=True, sync_dist=False)
         return {"loss": loss}
+
+    def on_save_checkpoint(self, checkpoint: dict) -> None:
+        if self.data_seen_tracker is not None:
+            # Lightning invokes model checkpoint hooks on every DDP rank before
+            # the strategy's rank-zero filesystem write. Include partial log
+            # intervals so resumed counters never silently lose consumed rows.
+            self.data_seen_tracker.sync(self.device)
+            checkpoint["data_seen_tracker"] = self.data_seen_tracker.state_dict()
+
+    def on_load_checkpoint(self, checkpoint: dict) -> None:
+        if self.data_seen_tracker is not None:
+            if "data_seen_tracker" not in checkpoint:
+                raise ValueError("Tracked training resume is missing exposure counters")
+            self.data_seen_tracker.load_state_dict(checkpoint["data_seen_tracker"])
 
     def configure_optimizers(self):
         return configure_optimizers(self)
@@ -1574,7 +1609,9 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             )
 
         records = []
+        capture = getattr(self, "_token_probability_capture", None)
         for text, token_ids, events in zip(decoded_texts, sampled_token_ids, boundary_events):
+            original_token_list = token_ids
             token_ids = [int(token_id) for token_id in token_ids]
             token_pieces = list(self.tokenizer.ids_to_tokens(token_ids))
             records.append(
@@ -1583,6 +1620,10 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     sampled_token_ids=token_ids,
                     sampled_token_pieces=token_pieces,
                     boundary_events=list(events),
+                    token_probability_chunks=(
+                        capture.finish_stream(original_token_list, token_pieces) if capture is not None else None
+                    ),
+                    token_probability_metadata=capture.metadata() if capture is not None else None,
                 )
             )
         return records
@@ -1594,12 +1635,13 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         encoder_frames_consumed: int,
         sampled_token_ids: list[int],
         boundary_events: list[BoundaryEvent],
-        boundary_token_info: dict[
-            int, tuple[Literal["sou", "eou", "sob", "eob", "soab", "eoab"], str]
-        ],
+        boundary_token_info: dict[int, tuple[str, str]],
     ) -> None:
         """Append one sampled token and its event when it is an enabled boundary."""
         token_id = int(token_id)
+        capture = getattr(self, "_token_probability_capture", None)
+        if capture is not None:
+            capture.append(token_id, int(encoder_frames_consumed), sampled_token_ids)
         sampled_token_ids.append(token_id)
         token_info = boundary_token_info.get(token_id)
         if token_info is None:
@@ -1737,7 +1779,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
     def _eval_step(self, batch: StreamingSTTBatch, name: str, batch_idx: int = 0) -> None:
         if self.forced_aligner is not None:
-            alignments = self.dataset.get_online_alignments(
+            alignments = self.dataset.get_mixed_alignments(
                 cuts=batch.cuts,
                 audios=batch.audios,
                 audio_lens=batch.audio_lens,
@@ -1996,7 +2038,15 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         )
         self._inference_cache_ready = True
 
-    def _sample_token(
+    def _sample_token(self, logits, generated_ids=None, generation_config=None, **generation_kwargs):
+        capture = getattr(self, "_token_probability_capture", None)
+        values = capture.before_sample(logits) if capture is not None else None
+        selected = self._sample_token_impl(logits, generated_ids, generation_config, **generation_kwargs)
+        if capture is not None:
+            capture.after_sample(selected, values)
+        return selected
+
+    def _sample_token_impl(
         self,
         logits: Tensor,
         generated_ids: list[list[int]] | list[int] | None = None,
@@ -3381,6 +3431,8 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         lm_head_emit_threshold: Optional[float] = None,
         debug_logs: Optional[list] = None,
         return_generation_records: bool = False,
+        return_token_probabilities: bool = False,
+        probability_audio_durations: Optional[List[float]] = None,
         **generation_kwargs,
     ) -> list[str] | list[StreamingGenerationRecord]:
         """
@@ -3401,61 +3453,99 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             return_generation_records: When True, return one
                 :class:`StreamingGenerationRecord` per sample. Detailed records
                 are supported only for positive streaming chunk sizes.
+            return_token_probabilities: Capture raw boundary probabilities for
+                every actual selected token. Requires detailed records and positive
+                fixed-chunk FSM decoding. Does not alter decoding settings.
+            probability_audio_durations: Optional original unpadded clip durations,
+                one per stream, bounded by the supplied waveform lengths.
             generation_kwargs: Per-call overrides for generation parameters.
 
         Returns:
             A list of transcription strings by default, or detailed generation
             records when ``return_generation_records=True``.
         """
-        self._ensure_inference_cache()
+        if getattr(self, "_token_probability_capture", None) is not None:
+            raise RuntimeError("concurrent/nested probability capture on the same model is unsupported")
+        capture = None
+        durations = None
+        if return_token_probabilities:
+            if not return_generation_records or self.core_cfg.chunk_size <= 0:
+                raise ValueError("probability capture requires detailed records and positive fixed chunks")
+            if not use_state_machine_inference:
+                raise ValueError("probability capture supports the native FSM path; select it explicitly")
+            durations = [int(n) / self.sampling_rate for n in audio_lens.tolist()]
+            if probability_audio_durations is not None:
+                if len(probability_audio_durations) != len(durations) or any(
+                    not math.isfinite(d) or d < 0 or d > available + 1e-6
+                    for d, available in zip(probability_audio_durations, durations)
+                ):
+                    raise ValueError("invalid original audio durations for probability capture")
+                durations = list(probability_audio_durations)
+            capture = TokenProbabilityCapture(
+                tracked_tokens(self), float(self.core_cfg.frame_length_in_secs), int(self.core_cfg.chunk_size)
+            )
+        self._token_probability_capture = capture
+        try:
+            self._ensure_inference_cache()
 
-        with move_embedding(self):
-            B = audios.shape[0]
-            n_samples_list = [int(audio_lens[b].item()) for b in range(B)]
+            with move_embedding(self):
+                B = audios.shape[0]
+                n_samples_list = [int(audio_lens[b].item()) for b in range(B)]
 
-            if return_generation_records and self.core_cfg.chunk_size <= 0:
-                raise ValueError(
-                    "return_generation_records=True requires a positive streaming chunk_size; "
-                    f"got {self.core_cfg.chunk_size}"
-                )
+                if return_generation_records and self.core_cfg.chunk_size <= 0:
+                    raise ValueError(
+                        "return_generation_records=True requires a positive streaming chunk_size; "
+                        f"got {self.core_cfg.chunk_size}"
+                    )
 
-            if self.core_cfg.chunk_size < 0:
-                results = self._generate_offline(
-                    audios,
-                    n_samples_list,
-                    system_prompt,
-                    max_new_tokens,
-                    generation_config,
-                    **generation_kwargs,
-                )
-            elif self.core_cfg.chunk_size == 0 or use_state_machine_inference:
-                # Dynamic chunking (chunk_size=0) or state machine inference opted in for chunk_size > 0.
-                # Note that for chunk_size > 0, use_state_machine_inference is not recommended.
-                results = self._generate_dynamic_streaming(
-                    audios,
-                    n_samples_list,
-                    system_prompt,
-                    max_new_tokens,
-                    generation_config,
-                    use_offline_embs=use_offline_embs,
-                    dynamic_min_chunk_size=dynamic_min_chunk_size,
-                    dynamic_max_chunk_size=dynamic_max_chunk_size,
-                    lm_head_emit_threshold=lm_head_emit_threshold,
-                    debug_logs=debug_logs,
-                    return_generation_records=return_generation_records,
-                    **generation_kwargs,
-                )
-            else:
-                # Static chunking (chunk_size > 0): bulk prefill + auto-regressive decode.
-                results = self._generate_chunked_streaming(
-                    audios,
-                    n_samples_list,
-                    system_prompt,
-                    max_new_tokens,
-                    generation_config,
-                    use_offline_embs=use_offline_embs,
-                    return_generation_records=return_generation_records,
-                    **generation_kwargs,
-                )
+                if self.core_cfg.chunk_size < 0:
+                    results = self._generate_offline(
+                        audios,
+                        n_samples_list,
+                        system_prompt,
+                        max_new_tokens,
+                        generation_config,
+                        **generation_kwargs,
+                    )
+                elif (
+                    self.core_cfg.chunk_size == 0
+                    or use_state_machine_inference
+                ):
+                    # Dynamic chunking (chunk_size=0) or state machine inference opted in for chunk_size > 0.
+                    results = self._generate_dynamic_streaming(
+                        audios,
+                        n_samples_list,
+                        system_prompt,
+                        max_new_tokens,
+                        generation_config,
+                        use_offline_embs=use_offline_embs,
+                        dynamic_min_chunk_size=dynamic_min_chunk_size,
+                        dynamic_max_chunk_size=dynamic_max_chunk_size,
+                        lm_head_emit_threshold=lm_head_emit_threshold,
+                        debug_logs=debug_logs,
+                        return_generation_records=return_generation_records,
+                        **generation_kwargs,
+                    )
+                else:
+                    # Static chunking (chunk_size > 0): bulk prefill + auto-regressive decode.
+                    results = self._generate_chunked_streaming(
+                        audios,
+                        n_samples_list,
+                        system_prompt,
+                        max_new_tokens,
+                        generation_config,
+                        use_offline_embs=use_offline_embs,
+                        return_generation_records=return_generation_records,
+                        **generation_kwargs,
+                    )
 
-        return results
+            if capture is not None:
+                capture.assert_consumed()
+                if len(results) != len(durations):
+                    raise ValueError("probability record/clip count mismatch")
+                for record, duration in zip(results, durations):
+                    for chunk in record.token_probability_chunks:
+                        chunk["valid_audio_end_seconds"] = min(duration, chunk["audio_time_seconds"])
+            return results
+        finally:
+            self._token_probability_capture = None

@@ -1340,7 +1340,7 @@ def read_nemo_manifest(config) -> tuple[CutSet, bool]:
     # and other data statistics.
     metadata_only = config.get("metadata_only", False)
     force_finite = config.get("force_finite", False)
-    notar_kwargs = {"metadata_only": metadata_only}
+    notar_kwargs = {"metadata_only": metadata_only, "context_sampling": config.get("context_sampling")}
     is_tarred = config.get("tarred_audio_filepaths") is not None
     if isinstance(config.manifest_filepath, (str, Path)):
         if is_tarred and not metadata_only:

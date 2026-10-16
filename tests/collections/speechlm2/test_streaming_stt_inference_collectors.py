@@ -324,3 +324,29 @@ def test_detailed_records_reject_nonpositive_chunk_sizes(monkeypatch, chunk_size
 
     with pytest.raises(ValueError, match="positive streaming chunk_size"):
         _call_generate(model, detailed=True)
+
+
+@pytest.mark.parametrize('text_token', range(40, 48))
+def test_boundary_probability_capture_matches_same_decode(monkeypatch, text_token):
+    """Eight scripted clips, all four user boundary tokens, including footer."""
+    from nemo.collections.speechlm2.parts.token_probability_capture import TokenProbabilityCapture
+
+    monkeypatch.setattr(streaming_stt_model, 'decode_with_blank', lambda ids, *_a: list(ids))
+    results = []
+    for enabled in (False, True):
+        model = _fake_dynamic_model([0, 10, text_token, 11, 12, 13, 9, 0])
+        model._sample_token_impl = MethodType(streaming_stt_model.StreamingSTTModel._sample_token_impl, model)
+        model._sample_token = MethodType(streaming_stt_model.StreamingSTTModel._sample_token, model)
+        capture = TokenProbabilityCapture({name: dict(token_id=idx, token_piece=f'<{name}>')
+                                          for name, idx in zip(('sou', 'eou', 'sob', 'eob'), (10,11,12,13))}, .1, 2)
+        model._token_probability_capture = capture if enabled else None
+        results.append(_run_dynamic(model, detailed=True)[0])
+        if enabled:
+            capture.assert_consumed()
+    off, on = results
+    assert off.pred_text_unnormalized == on.pred_text_unnormalized
+    assert off.sampled_token_ids == on.sampled_token_ids == [10, text_token, 11, 12, 13, 9]
+    assert off.boundary_events == on.boundary_events
+    points = [p for c in on.token_probability_chunks for p in c['predictions']]
+    assert [p['selected_token_id'] for p in points] == on.sampled_token_ids
+    assert all(set(p['probabilities']) == {'sou', 'eou', 'sob', 'eob'} for p in points)

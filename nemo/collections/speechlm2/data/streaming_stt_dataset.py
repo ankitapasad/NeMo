@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import logging
 import math
 import os
@@ -30,6 +31,9 @@ from lhotse.dataset.collation import collate_audio
 from omegaconf import DictConfig
 from torch.nn import CrossEntropyLoss
 from torch.nn.utils.rnn import pad_sequence
+
+from nemo.collections.speechlm2.data.data_seen_tracker import exposure_metadata
+from nemo.collections.speechlm2.parts.transcript_pnc import remove_transcript_pnc
 
 from nemo.collections.common.tokenizers import AutoTokenizer
 from nemo.collections.speechlm2.data.salm_dataset import left_collate_vectors
@@ -448,6 +452,10 @@ class StreamingSTTBatch:
     user_backchannel_reference_frames: Optional[torch.Tensor] = None
     num_user_backchannel_events: Optional[torch.Tensor] = None
     cuts: Optional[CutSet] = None
+    sample_ids: Optional[List[str]] = None
+    accounting_durations_s: Optional[List[float]] = None
+    mixture_sources: Optional[List[str]] = None
+    turn_buckets: Optional[List[str]] = None
 
 
 @dataclass
@@ -463,6 +471,7 @@ class StreamingSTTDataConfig:
     system_prompt: str = "Transcribe the audio into text."
     prompt_field: str = "system_prompt"
     compact_template: bool = False
+    transcript_pnc: bool = True
     write_token: str = "<|im_start|>"
     use_text_tokens: bool = False
     text_start_token: str = "<|text_start|>"
@@ -2143,6 +2152,88 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             sample_alignments.sort(key=lambda item: (item.start_time, item.end_time))
         return batch_alignments
 
+    def get_mixed_alignments(
+        self,
+        *,
+        cuts: CutSet | list,
+        audios: torch.Tensor,
+        audio_lens: torch.Tensor,
+        text: List[str],
+        forced_aligner: ForcedAligner,
+    ) -> List[List[WordAlignment]]:
+        """Resolve mandatory saved DAI alignments and online-align only other rows.
+
+        A row opts into the strict path with
+        ``custom.word_alignment_mode=precomputed_required``.  Absence of the
+        field retains the legacy online path, which is how the ASR sub-mixture
+        continues to operate.  Unknown modes and missing saved DAI words are
+        errors rather than implicit online fallbacks.
+        """
+        cut_list = list(cuts)
+        if not (len(cut_list) == len(text) == int(audios.shape[0]) == int(audio_lens.shape[0])):
+            raise ValueError("Mixed alignment batch fields have inconsistent lengths")
+
+        resolved: List[List[WordAlignment] | None] = [None] * len(cut_list)
+        online_indices: list[int] = []
+        audit_path = os.environ.get("NEMO_ALIGNMENT_ROUTE_AUDIT_PATH")
+
+        def audit(cut, route: str) -> None:
+            if not audit_path:
+                return
+            custom = cut.custom or {}
+            with open(audit_path, "a", encoding="utf-8") as stream:
+                stream.write(
+                    json.dumps(
+                        {
+                            "event": "alignment_route",
+                            "cut_id": getattr(cut, "id", None),
+                            "sample_id": custom.get("sample_id"),
+                            "mode": custom.get("word_alignment_mode", "online"),
+                            "route": route,
+                        },
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+
+        for idx, cut in enumerate(cut_list):
+            custom = cut.custom or {}
+            mode = custom.get("word_alignment_mode", "online")
+            if mode == "precomputed_required":
+                saved = get_word_alignments_for_batch([cut])[0]
+                if not saved:
+                    raise ValueError(
+                        f"Cut {getattr(cut, 'id', '<unknown>')!r} requires precomputed word alignments "
+                        "but none were supplied"
+                    )
+                resolved[idx] = saved
+                audit(cut, "embedded_precomputed")
+            elif mode == "online":
+                online_indices.append(idx)
+            else:
+                raise ValueError(
+                    f"Cut {getattr(cut, 'id', '<unknown>')!r} has unsupported "
+                    f"word_alignment_mode={mode!r}"
+                )
+
+        if online_indices:
+            index = torch.tensor(online_indices, dtype=torch.long, device=audios.device)
+            online = self.get_online_alignments(
+                cuts=[cut_list[idx] for idx in online_indices],
+                audios=audios.index_select(0, index),
+                audio_lens=audio_lens.index_select(0, index),
+                text=[text[idx] for idx in online_indices],
+                forced_aligner=forced_aligner,
+            )
+            for idx, words in zip(online_indices, online):
+                resolved[idx] = words
+                audit(cut_list[idx], "online_forced_aligner")
+
+        if any(words is None for words in resolved):
+            raise RuntimeError("Mixed alignment resolver left an unresolved batch entry")
+        return [words for words in resolved if words is not None]
+
+
     def __getitem__(self, cuts: CutSet) -> StreamingSTTBatch | None:
         try:
             audios, audio_lens, cuts = collate_audio(cuts, fault_tolerant=True)
@@ -2170,6 +2261,7 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
         if self.defer_get_batch:
             return StreamingSTTBatch(
                 cuts=cuts,
+                **exposure_metadata(cuts),
                 audios=audios,
                 audio_lens=audio_lens,
                 text=text,
@@ -2483,6 +2575,19 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
         )
 
         all_input_ids = []
+        if not self.cfg.transcript_pnc:
+            # Align on original text, then normalize lexical targets only.
+            # Boundary scheduling and reference metadata remain unchanged.
+            protected_tokens = (
+                self.cfg.blank_token, self.cfg.utterance_start_token, self.cfg.utterance_end_token,
+                self.cfg.user_backchannel_start_token, self.cfg.user_backchannel_end_token,
+                self.cfg.agent_backchannel_start_token, self.cfg.agent_backchannel_end_token,
+                self.cfg.text_start_token, self.cfg.text_end_token, self.cfg.write_token,
+            )
+            batch_messages = [
+                remove_transcript_pnc(messages, protected_tokens=protected_tokens, blank_token=self.cfg.blank_token)
+                for messages in batch_messages
+            ]
         all_target_ids = []
         all_boundary_turn_ordinals = []
         all_user_backchannel_event_ids = []
@@ -2622,6 +2727,7 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             )
 
         return StreamingSTTBatch(
+            **exposure_metadata(cuts),
             audios=audios,
             audio_lens=audio_lens,
             input_tokens=input_tokens,
