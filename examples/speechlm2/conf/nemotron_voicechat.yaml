@@ -42,7 +42,7 @@ data:
   validation_ds:
     datasets:
       evaluation_set:
-        shar_path: /lustre/fsw/portfolios/llmservice/users/kevinhu/duplex/ultrachat_v2/shar_duplex/manifest_000020 # Path to the Lhotse WebDataset tar shards manifest
+        shar_path: ??? # Path to the Lhotse WebDataset tar shards manifest
 
     sample_rate: ${data.target_sample_rate} # Audio will be resampled to this rate if necessary
     batch_size: 4 # Number of samples processed per GPU during evaluation
