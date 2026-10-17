@@ -420,4 +420,66 @@ While there are no publicly available datasets specifically formatted for Duplex
 3. CallHome
 4. Synthetic conversation datasets generated using TTS
 
-You would need to format these datasets as Lhotse manifests with appropriate speaker role annotations to use them with the speechlm2 S2S models. 
+You would need to format these datasets as Lhotse manifests with appropriate speaker role annotations to use them with the speechlm2 S2S models.
+Streaming STT waveform augmentation
+----------------------------------
+
+``StreamingSTTDataset`` supports opt-in on-the-fly additive noise, room and
+microphone impulse responses, and codec effects through ``data.dataset``.
+All effect switches default to ``false``. Paths are supplied by the caller;
+no augmentation assets or cluster-specific recipes are included.
+
+With ``augmentation_mode=noise_plus_at_most_one``, ``noise_prob`` is a single
+batch-level gate. A selected batch receives additive noise at an integer SNR
+sampled from ``noise_min_snr`` through ``noise_max_snr`` (inclusive), followed
+by at most one extra effect. ``roomir_prob``, ``micir_prob`` and ``codec_prob``
+are mutually exclusive categorical probabilities conditional on that gate;
+their sum must not exceed one. Remaining probability selects no extra effect.
+This mode requires ``use_noise_aug=true`` and ``noise_aug_path``.
+``noise_prob_scale_user`` and ``noise_prob_low_pass`` control per-example user
+scaling and low-pass filtering of the added noise. Noise WAVs are discovered
+one directory level beneath ``noise_aug_path``; IR WAVs are directly beneath
+their respective IR paths. Codec effects require FFmpeg on ``PATH``.
+
+Speech-volume bounds are ``speech_attenuation_min_db`` and
+``speech_attenuation_max_db``. A sampled integer value ``d`` multiplies speech by
+``10 ** (-d / 20)``: negative values amplify and positive values attenuate.
+The legacy ``noise_prob_scale_user_min_snr`` / ``noise_prob_scale_user_max_snr``
+keys remain fallback aliases when the corresponding new key is unset. Explicit
+new keys take precedence; use only one naming scheme in a recipe.
+
+Streaming STT defaults to ``noise_snr_measure_region=first_turn``. Speech power
+is measured between the first substantive turn's annotated start and end in the
+cropped waveform, excluding preceding/following context and batch padding.
+Pauses inside that turn remain included; this is not a VAD speech-only mask.
+Single-turn GT bounds are used when present; ASR without turn annotations uses
+the first aligned word's start through the last aligned word's end. Missing,
+empty or invalid bounds raise an error instead of silently measuring padding.
+``snr_measure_dur=0`` measures the entire selected span; a positive value limits
+the measurement to that many seconds from the span's start. The final noise is
+normalized on the same span after concatenation, cropping and optional low-pass
+filtering, before any room/mic/codec effects. Noise is still added over the full
+waveform. SNR after subsequent IR/codec effects is not guaranteed.
+
+``noise_snr_measure_region=full_waveform`` retains the legacy measurement path.
+Existing duplex callers that do not supply a speech span also retain that path.
+These new defaults do not describe the historical noise-campaign runs.
+
+With ``augmentation_mode=independent_stack``, each effect has an independent gate
+and effects may stack. ``force_use_noise_augmentation=true`` includes ASR and overlap tasks
+that the default task filter excludes; it does not override the evaluation
+guard. The task filter follows the first cut, as in the existing duplex path.
+
+Waveform augmentation runs after alignment and target construction, preserving
+text, boundary targets, audio lengths and exposure-accounting metadata. In the
+online-alignment path the deferred loader batch stays clean for alignment;
+augmentation occurs when ``get_batch_data`` builds the training batch.
+NumPy/FFmpeg boundaries explicitly convert BF16 input to float32; the batch
+retains its original dtype. No-grad/inference-mode calls bypass augmentation.
+Custom evaluation code must likewise disable gradients when building batches
+(or disable the effect switches), including in any dataset worker processes.
+
+The old ``use_balanced_augmentation_controller`` flag is retained as a fallback:
+``true`` maps to ``noise_plus_at_most_one`` and ``false`` to ``independent_stack``.
+An explicit ``augmentation_mode`` takes precedence. Its default is null so old
+recipes keep their behavior; with neither option set, the mode is ``independent_stack``.

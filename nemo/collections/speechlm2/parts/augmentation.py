@@ -56,10 +56,27 @@ class AudioAugmenter:
         snr_measure_dur: float = 0.0,
         noise_resample: bool = True,
         noise_prob_low_pass: float = 0.1,
+        *,
+        speech_attenuation_min_db: Optional[float] = None,
+        speech_attenuation_max_db: Optional[float] = None,
+        speech_power_spans=None,
     ) -> torch.Tensor:
         """Add noise to batch audio with specified SNR."""
         batch_size = batch_audio.shape[0]
         audio_length = batch_audio.shape[1]
+        # The legacy SNR-named bounds are attenuation, not speech/noise ratios.
+        attenuation_min = (noise_prob_scale_user_min_snr if speech_attenuation_min_db is None
+                           else speech_attenuation_min_db)
+        attenuation_max = (noise_prob_scale_user_max_snr if speech_attenuation_max_db is None
+                           else speech_attenuation_max_db)
+        if not np.isfinite([attenuation_min, attenuation_max]).all() or attenuation_min > attenuation_max:
+            raise ValueError("Speech attenuation bounds must be finite and ordered")
+        if speech_power_spans is not None:
+            if len(speech_power_spans) != batch_size:
+                raise ValueError("Require one speech power span per recording")
+            for start, end in speech_power_spans:
+                if not (0 <= start < end <= audio_length):
+                    raise ValueError("Speech power span must be nonempty and inside the waveform")
 
         if noise_folder not in self._noise_files_cache:
             noise_files = [f for f in glob.glob(os.path.join(noise_folder, "*.wav"))]
@@ -83,11 +100,8 @@ class AudioAugmenter:
                 return scaling_factor
 
             if random.random() < noise_prob_scale_user:
-                scaling_factor = get_scale_factor(
-                    batch_audio[i],
-                    batch_audio[i],
-                    random.randint(int(noise_prob_scale_user_min_snr), int(noise_prob_scale_user_max_snr)),
-                )
+                attenuation_db = random.randint(int(attenuation_min), int(attenuation_max))
+                scaling_factor = 10.0 ** (-attenuation_db / 20.0)
                 batch_audio[i] = batch_audio[i] * scaling_factor
 
             def get_noise(noise_files):
@@ -101,8 +115,9 @@ class AudioAugmenter:
                     noise = np.mean(noise, axis=1)
 
                 noise_tensor = torch.tensor(noise, dtype=batch_audio.dtype, device=batch_audio.device)
-                scaling_factor = get_scale_factor(batch_audio[i], noise_tensor, snr_db)
-                noise_tensor = noise_tensor * scaling_factor
+                if speech_power_spans is None:
+                    scaling_factor = get_scale_factor(batch_audio[i], noise_tensor, snr_db)
+                    noise_tensor = noise_tensor * scaling_factor
                 return noise_tensor
 
             noise = get_noise(noise_files)
@@ -121,6 +136,14 @@ class AudioAugmenter:
                 cutoff = 1000.0
                 noise = self._apply_lowpass_filter(noise, cutoff)
 
+            if speech_power_spans is not None:
+                start, end = speech_power_spans[i]
+                # Normalize the actual mixed noise after cropping/filtering.
+                # Float32 power avoids BF16 reduction/underflow errors.
+                signal = batch_audio[i, start:end].float()
+                reference_noise = noise[start:end].float()
+                scale = get_scale_factor(signal, reference_noise, snr_db)
+                noise = noise * scale
             batch_audio[i] = batch_audio[i] + noise
 
         return batch_audio
@@ -135,7 +158,10 @@ class AudioAugmenter:
             self._lowpass_filter_cache[cache_key] = (b, a)
 
         b, a = self._lowpass_filter_cache[cache_key]
-        y_cpu = lfilter(b, a, audio.cpu().numpy())
+        # NumPy does not support torch.bfloat16, which is the dtype used by the
+        # streaming STT training path. Convert explicitly at the torch/NumPy
+        # boundary and cast the augmented result back at the caller boundary.
+        y_cpu = lfilter(b, a, audio.detach().to(device="cpu", dtype=torch.float32).numpy())
         y_gpu = torch.tensor(y_cpu, dtype=torch.float32, device=audio.device)
         return y_gpu
 
@@ -169,7 +195,9 @@ class AudioAugmenter:
             if len(ir.shape) > 1:
                 ir = np.mean(ir, axis=1)
 
-            audio_cpu = batch_audio[i, :audio_length].cpu().numpy()
+            audio_cpu = (
+                batch_audio[i, :audio_length].detach().to(device="cpu", dtype=torch.float32).numpy()
+            )
 
             if use_loudness_norm and PYLOUDNORM_AVAILABLE:
                 meter = pyln.Meter(self.sample_rate)
@@ -253,7 +281,9 @@ class AudioAugmenter:
             if len(ir.shape) > 1:
                 ir = np.mean(ir, axis=1)
 
-            audio_cpu = batch_audio[i, :audio_length].cpu().numpy()
+            audio_cpu = (
+                batch_audio[i, :audio_length].detach().to(device="cpu", dtype=torch.float32).numpy()
+            )
 
             if use_loudness_norm and PYLOUDNORM_AVAILABLE:
                 meter = pyln.Meter(self.sample_rate)
@@ -321,7 +351,9 @@ class AudioAugmenter:
 
             codec_name, codec_args = random.choice(list(codec_settings.items()))
 
-            audio_cpu = batch_audio[i, :audio_length].cpu().numpy()
+            audio_cpu = (
+                batch_audio[i, :audio_length].detach().to(device="cpu", dtype=torch.float32).numpy()
+            )
 
             try:
                 degraded = self._apply_ffmpeg_codec(audio_cpu, codec_args)
@@ -374,11 +406,98 @@ class AudioAugmenter:
 
             return decoded
 
-    def augment_batch(self, cfg, source_audio, source_audio_lens):
+    @staticmethod
+    def _probability(cfg, name: str, default: float) -> float:
+        """Read and validate a probability from an augmentation config."""
+        value = float(cfg.get(name, default))
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"{name} must be in [0, 1], got {value}")
+        return value
+
+    def _augment_batch_balanced(self, cfg, source_audio, source_audio_lens, speech_power_spans=None):
+        """Apply one gated additive-noise path with at most one extra effect.
+
+        ``noise_prob`` is the probability that a batch is augmented at all.
+        A selected batch always receives additive noise. The configured room,
+        mic, and codec probabilities are interpreted as mutually exclusive
+        categorical masses in that order; remaining mass selects no extra
+        effect. This makes the clean fraction explicit and prevents stacked
+        room-plus-microphone impulse responses.
+        """
+        noise_path = cfg.get('noise_aug_path', None)
+        if not cfg.get('use_noise_aug', None) or not noise_path:
+            raise ValueError("Balanced augmentation requires use_noise_aug=true and a noise_aug_path")
+
+        augmentation_prob = self._probability(cfg, 'noise_prob', 0.5)
+        roomir_prob = self._probability(cfg, 'roomir_prob', 0.0)
+        micir_prob = self._probability(cfg, 'micir_prob', 0.0)
+        codec_prob = self._probability(cfg, 'codec_prob', 0.0)
+        extra_prob = roomir_prob + micir_prob + codec_prob
+        if extra_prob > 1.0 + 1e-12:
+            raise ValueError(
+                "Balanced roomir_prob + micir_prob + codec_prob must be <= 1, "
+                f"got {extra_prob}"
+            )
+        if random.random() >= augmentation_prob:
+            return source_audio
+
+        source_audio = self.add_noise_to_batch(
+            source_audio,
+            os.path.join(noise_path, "*"),
+            snr_db=random.randint(cfg.get('noise_min_snr', 20), cfg.get('noise_max_snr', 50)),
+            noise_prob_scale_user=cfg.get('noise_prob_scale_user', 0.3),
+            noise_prob_scale_user_min_snr=cfg.get('noise_prob_scale_user_min_snr', -15),
+            noise_prob_scale_user_max_snr=cfg.get('noise_prob_scale_user_max_snr', 24),
+            snr_measure_dur=cfg.get('snr_measure_dur', 0.0),
+            noise_resample=cfg.get('noise_resample', True),
+            noise_prob_low_pass=cfg.get('noise_prob_low_pass', 0.1),
+            speech_attenuation_min_db=cfg.get("speech_attenuation_min_db"),
+            speech_attenuation_max_db=cfg.get("speech_attenuation_max_db"),
+            speech_power_spans=speech_power_spans,
+        )
+
+        extra_draw = random.random()
+        if extra_draw < roomir_prob:
+            roomir_path = cfg.get('roomir_aug_path', None)
+            if not cfg.get('use_room_ir_aug', None) or not roomir_path:
+                raise ValueError(
+                    "Positive balanced roomir_prob requires use_room_ir_aug=true and roomir_aug_path"
+                )
+            source_audio = self.add_room_ir_to_batch(
+                source_audio,
+                source_audio_lens,
+                roomir_path,
+                use_loudness_norm=cfg.get('roomir_use_loudness_norm', True),
+            )
+        elif extra_draw < roomir_prob + micir_prob:
+            micir_path = cfg.get('micir_aug_path', None)
+            if not cfg.get('use_mic_ir_aug', None) or not micir_path:
+                raise ValueError(
+                    "Positive balanced micir_prob requires use_mic_ir_aug=true and micir_aug_path"
+                )
+            source_audio = self.add_mic_ir_to_batch(
+                source_audio,
+                source_audio_lens,
+                micir_path,
+                use_loudness_norm=cfg.get('micir_use_loudness_norm', True),
+            )
+        elif extra_draw < extra_prob:
+            if not cfg.get('use_codec_aug', None):
+                raise ValueError("Positive balanced codec_prob requires use_codec_aug=true")
+            codec_settings = cfg.get('codec_settings', None) or DEFAULT_CODEC_SETTINGS
+            source_audio = self.add_codec_to_batch(
+                source_audio,
+                source_audio_lens,
+                codec_settings,
+            )
+
+        return source_audio
+
+    def augment_batch(self, cfg, source_audio, source_audio_lens, speech_power_spans=None):
         """Apply all configured augmentations to batch audio.
 
         Applies augmentations in order: noise -> room IR -> mic IR -> codec.
-        Each augmentation is independently controlled by its own config flag and probability.
+        Independent mode allows stacking; noise_plus_at_most_one selects at most one auxiliary effect.
 
         Args:
             cfg: Model configuration with augmentation settings.
@@ -388,6 +507,15 @@ class AudioAugmenter:
         Returns:
             Augmented source_audio tensor.
         """
+        mode = cfg.get("augmentation_mode")
+        if mode is None:
+            mode = ("noise_plus_at_most_one" if cfg.get("use_balanced_augmentation_controller", False)
+                    else "independent_stack")
+        if mode not in {"independent_stack", "noise_plus_at_most_one"}:
+            raise ValueError("augmentation_mode must be independent_stack or noise_plus_at_most_one")
+        if mode == "noise_plus_at_most_one":
+            return self._augment_batch_balanced(cfg, source_audio, source_audio_lens, speech_power_spans)
+
         # 1. Noise augmentation
         if cfg.get('use_noise_aug', None):
             noise_prob = cfg.get('noise_prob', 0.99)
@@ -403,6 +531,9 @@ class AudioAugmenter:
                     snr_measure_dur=cfg.get('snr_measure_dur', 0.0),
                     noise_resample=cfg.get('noise_resample', True),
                     noise_prob_low_pass=cfg.get('noise_prob_low_pass', 0.1),
+                    speech_attenuation_min_db=cfg.get("speech_attenuation_min_db"),
+                    speech_attenuation_max_db=cfg.get("speech_attenuation_max_db"),
+                    speech_power_spans=speech_power_spans,
                 )
 
         # 2. Room impulse response augmentation

@@ -82,6 +82,37 @@ data:
     # Manifest SOU/EOU timestamps remain authoritative.
     multiturn_forced_alignment_buffer_s: 0.5
 
+    # Optional waveform augmentation; no effects are enabled by default.
+    # The balanced controller uses noise_prob as one batch-level gate, then
+    # additive noise plus at most one room/mic/codec effect.
+    force_use_noise_augmentation: false
+    # independent_stack or noise_plus_at_most_one. Null uses the legacy flag below.
+    augmentation_mode: null
+    use_balanced_augmentation_controller: false
+    use_noise_aug: false
+    noise_prob: 0.99
+    noise_aug_path: null
+    noise_min_snr: 20
+    noise_max_snr: 50
+    noise_prob_scale_user: 0.3
+    speech_attenuation_min_db: -15.0
+    speech_attenuation_max_db: 24.0
+    noise_snr_measure_region: first_turn
+    snr_measure_dur: 0.0
+    noise_resample: true
+    noise_prob_low_pass: 0.1
+    use_room_ir_aug: false
+    roomir_prob: 0.0
+    roomir_aug_path: null
+    roomir_use_loudness_norm: true
+    use_mic_ir_aug: false
+    micir_prob: 0.0
+    micir_aug_path: null
+    micir_use_loudness_norm: true
+    use_codec_aug: false
+    codec_prob: 0.0
+    codec_settings: null
+
   # --- Lhotse dataloader config ---
   train_ds:
     sample_rate: ${data.dataset.sample_rate}

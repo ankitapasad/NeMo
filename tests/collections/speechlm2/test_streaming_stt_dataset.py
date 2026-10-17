@@ -3625,3 +3625,112 @@ class TestCompactTemplate:
         # and decode_with_blank splits on `eos_token_id`. The training sequence's
         # per-turn eos_id plays exactly that role. Verify the trailing token is eos.
         assert input_ids[-1] == eos_id
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_otf_noise_preserves_targets_and_exposure_metadata(tmp_path, monkeypatch, dtype):
+    import dataclasses
+    import numpy as np
+    import soundfile as sf
+    from nemo.collections.speechlm2.parts.augmentation import AudioAugmenter
+
+    monkeypatch.setenv("NEMO_DATA_SEEN_TOTALS_PATH", str(tmp_path / "totals.json"))
+    monkeypatch.setenv("NEMO_DATA_SEEN_LABEL_MODE", "explicit")
+    noise_dir = tmp_path / "noise" / "source"
+    noise_dir.mkdir(parents=True)
+    sf.write(noise_dir / "noise.wav", np.random.default_rng(9).normal(0, 0.1, 16000).astype(np.float32), 16000)
+    dataset = TestStreamingSTTDatasetBoundaryIntegration()._make_dataset()
+    cuts = [SimpleNamespace(id="otf-test", duration=1.0, custom={"sample_id": "stable-id", "data_seen_source": "test", "data_seen_category": "complete_turn"}, task="asr")]
+    audio = torch.sin(torch.arange(16000) * 0.05).reshape(1, -1).to(dtype)
+    lengths = torch.tensor([16000])
+    kwargs = dict(cuts=cuts, audio_lens=lengths, alignments=[[WordAlignment("Hello", 0.16, 0.48)]], text=["Hello"])
+    clean = dataset.get_batch_data(audios=audio.clone(), **kwargs)
+    dataset.cfg.force_use_noise_augmentation = True
+    dataset.cfg.use_balanced_augmentation_controller = True
+    dataset.cfg.use_noise_aug = True
+    dataset.cfg.noise_aug_path = str(noise_dir.parent)
+    dataset.cfg.noise_prob = 1.0
+    dataset.cfg.noise_prob_scale_user = 0.0
+    dataset.cfg.noise_prob_low_pass = 0.0
+    dataset = StreamingSTTDataset(cfg=vars(dataset.cfg), tokenizer=dataset.tokenizer)
+    assert isinstance(dataset.audio_augmenter, AudioAugmenter)
+    augmented = dataset.get_batch_data(audios=audio.clone(), **kwargs)
+    assert clean.sample_ids == ["stable-id"]
+    assert clean.accounting_durations_s == [1.0]
+    assert not torch.equal(clean.audios, augmented.audios)
+    assert augmented.audios.dtype == dtype
+    assert torch.isfinite(augmented.audios).all()
+    for field in dataclasses.fields(clean):
+        if field.name == "audios":
+            continue
+        a, b = getattr(clean, field.name), getattr(augmented, field.name)
+        if isinstance(a, torch.Tensor):
+            assert torch.equal(a, b), field.name
+        else:
+            assert a == b, field.name
+    with torch.no_grad():
+        validation = dataset.get_batch_data(audios=audio.clone(), **kwargs)
+    assert torch.equal(validation.audios, clean.audios)
+    dataset.cfg.force_use_noise_augmentation = False
+    skipped = dataset.get_batch_data(audios=audio.clone(), **kwargs)
+    assert torch.equal(skipped.audios, clean.audios)
+    dataset.cfg.force_use_noise_augmentation = True
+    dataset.cfg.noise_prob = 0.0
+    skipped = dataset.get_batch_data(audios=audio.clone(), **kwargs)
+    assert torch.equal(skipped.audios, clean.audios)
+
+
+def test_otf_config_hydra_defaults_and_overrides():
+    from pathlib import Path
+    from dataclasses import fields
+    from hydra import compose, initialize_config_dir
+    from omegaconf import OmegaConf
+
+    root = Path(__file__).resolve().parents[3]
+    with initialize_config_dir(config_dir=str(root / "examples/speechlm2/conf"), version_base=None):
+        cfg = compose(config_name="streaming_stt")
+        defaults = OmegaConf.to_container(cfg.data.dataset, resolve=True)
+        assert set(defaults) <= {f.name for f in fields(StreamingSTTDataConfig)}
+        data = StreamingSTTDataConfig(**defaults)
+        assert not any((data.use_noise_aug, data.use_room_ir_aug, data.use_mic_ir_aug, data.use_codec_aug))
+        cfg = compose(config_name="streaming_stt", overrides=[
+            "data.dataset.use_noise_aug=true", "data.dataset.use_balanced_augmentation_controller=true",
+            "data.dataset.force_use_noise_augmentation=true", "data.dataset.noise_prob=0.25",
+            "data.dataset.noise_min_snr=30", "data.dataset.noise_aug_path=/caller/noise",
+            "data.dataset.noise_prob_scale_user=0", "data.dataset.noise_prob_low_pass=0",
+        ])
+        data = StreamingSTTDataConfig(**OmegaConf.to_container(cfg.data.dataset, resolve=True))
+        assert data.use_balanced_augmentation_controller and data.use_noise_aug
+        assert data.noise_prob == 0.25 and data.noise_min_snr == 30
+
+
+def test_noise_power_span_uses_first_substantive_turn_and_crop_relative_gt():
+    from nemo.collections.speechlm2.data.streaming_stt_dataset import MultiTurnSample, MultiTurnTargetSegment
+    dataset = TestStreamingSTTDatasetBoundaryIntegration()._make_dataset()
+    sr = dataset.cfg.sample_rate
+    sample = MultiTurnSample('lean_multi_turn_v3', 'hello later', (
+        MultiTurnTargetSegment('mhm', 0.1, 0.2, user_backchannel_event_id=1),
+        MultiTurnTargetSegment('hello', 1.0, 2.0, turn_ordinal=1),
+        MultiTurnTargetSegment('later', 3.0, 4.0, turn_ordinal=2),
+    ), 2, 1)
+    cuts = [SimpleNamespace(id='d7', custom={}),
+            SimpleNamespace(id='single', custom={'utterance_start_time': 0.5, 'utterance_end_time': 1.5}),
+            SimpleNamespace(id='asr', custom={})]
+    words = [[], [], [WordAlignment('word', 0.3, 0.7), WordAlignment('two', 0.8, 1.2)]]
+    spans = dataset._noise_speech_power_spans(cuts, [sample, None, None], words, [5, 2, 2])
+    assert spans == [(sr, 2 * sr), (int(0.5 * sr), int(1.5 * sr)), (int(0.3 * sr), int(1.2 * sr))]
+    with pytest.raises(ValueError, match='requires turn bounds'):
+        dataset._noise_speech_power_spans([cuts[2]], [None], [[]], [2])
+
+
+@pytest.mark.parametrize('mode', ['independent_stack', 'noise_plus_at_most_one'])
+def test_named_augmentation_mode_hydra_composes(mode):
+    from pathlib import Path
+    from hydra import compose, initialize_config_dir
+    from omegaconf import OmegaConf
+    from nemo.collections.speechlm2.data.streaming_stt_dataset import StreamingSTTDataConfig
+    config_dir = Path(__file__).resolve().parents[3] / 'examples/speechlm2/conf'
+    with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+        cfg = compose(config_name='streaming_stt', overrides=[f'data.dataset.augmentation_mode={mode}'])
+    data = StreamingSTTDataConfig(**OmegaConf.to_container(cfg.data.dataset, resolve=True))
+    assert data.augmentation_mode == mode

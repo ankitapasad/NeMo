@@ -43,6 +43,7 @@ from nemo.collections.speechlm2.parts.alignments import (
     add_utterance_boundary_alignments,
     get_word_alignments_for_batch,
 )
+from nemo.collections.speechlm2.parts.augmentation import AudioAugmenter
 from nemo.collections.speechlm2.parts.utils import to_dataclass
 
 AUDIO_TOKEN_IDX = -200
@@ -507,6 +508,41 @@ class StreamingSTTDataConfig:
     # online forced alignment is empty or falls outside the target region.
     # Zero preserves strict rejection of every unaligned substantive fragment.
     multiturn_unaligned_substantive_fallback_max_words: int = 0
+    # On-the-fly acoustic augmentation. Defaults are disabled so existing
+    # training and validation behavior is unchanged unless explicitly enabled.
+    force_use_noise_augmentation: bool = False
+    # When enabled, noise_prob is a top-level augmented-batch probability.
+    # Every selected batch gets additive noise, followed by at most one of
+    # room IR, mic IR, or codec using their probabilities as categorical mass.
+    augmentation_mode: Optional[str] = None
+    # Legacy alias, consulted only when augmentation_mode is unset.
+    use_balanced_augmentation_controller: bool = False
+    use_noise_aug: bool = False
+    noise_prob: float = 0.99
+    noise_aug_path: Optional[str] = None
+    noise_min_snr: int = 20
+    noise_max_snr: int = 50
+    noise_prob_scale_user: float = 0.3
+    # Preferred names; None falls back to the legacy SNR-named aliases.
+    speech_attenuation_min_db: Optional[float] = None
+    speech_attenuation_max_db: Optional[float] = None
+    noise_snr_measure_region: str = "first_turn"
+    noise_prob_scale_user_min_snr: float = -15.0
+    noise_prob_scale_user_max_snr: float = 24.0
+    snr_measure_dur: float = 0.0
+    noise_resample: bool = True
+    noise_prob_low_pass: float = 0.1
+    use_room_ir_aug: bool = False
+    roomir_prob: float = 0.0
+    roomir_aug_path: Optional[str] = None
+    roomir_use_loudness_norm: bool = True
+    use_mic_ir_aug: bool = False
+    micir_prob: float = 0.0
+    micir_aug_path: Optional[str] = None
+    micir_use_loudness_norm: bool = True
+    use_codec_aug: bool = False
+    codec_prob: float = 0.0
+    codec_settings: Optional[dict[str, list[str]]] = None
     # K — only effective in dynamic chunking (chunk_size == 0). Each audio
     # segment is rounded UP to a multiple of K frames (and total audio is
     # padded to K-multiple). The model implicitly learns to emit only at
@@ -515,6 +551,10 @@ class StreamingSTTDataConfig:
     chunk_step: int = 1
 
     def __post_init__(self):
+        if self.augmentation_mode not in {None, "independent_stack", "noise_plus_at_most_one"}:
+            raise ValueError("augmentation_mode must be independent_stack or noise_plus_at_most_one")
+        if self.noise_snr_measure_region not in {"first_turn", "full_waveform"}:
+            raise ValueError("noise_snr_measure_region must be first_turn or full_waveform")
         if self.utterance_start_boundary_delay_frames < 0:
             raise ValueError("utterance_start_boundary_delay_frames must be non-negative")
         if self.utterance_end_boundary_delay_frames < 0:
@@ -1872,6 +1912,16 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
         self.cfg: StreamingSTTDataConfig = to_dataclass(
             StreamingSTTDataConfig, _normalize_legacy_text_token_config(cfg)
         )
+        self.audio_augmenter = None
+        if any(
+            (
+                self.cfg.use_noise_aug,
+                self.cfg.use_room_ir_aug,
+                self.cfg.use_mic_ir_aug,
+                self.cfg.use_codec_aug,
+            )
+        ):
+            self.audio_augmenter = AudioAugmenter(sample_rate=self.cfg.sample_rate)
         if self.cfg.compact_text_end_only_no_blank and not self.cfg.compact_template:
             raise ValueError("compact_text_end_only_no_blank=True requires compact_template=True")
         if (
@@ -2002,6 +2052,60 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
                     )
                 self._eob_id = eob_ids[0]
                 self._user_backchannel_end_id = self._eob_id
+
+    def _is_augmentation_task(self, task: str) -> bool:
+        if self.cfg.force_use_noise_augmentation:
+            return True
+        return task not in ("s2s_duplex_overlap_as_s2s_duplex", "asr")
+
+    def _apply_audio_augmentation(
+        self,
+        cuts: CutSet | list,
+        audios: torch.Tensor,
+        audio_lens: torch.Tensor,
+        multiturn_samples=None,
+        alignments=None,
+        clip_audio_durations_secs=None,
+    ) -> torch.Tensor:
+        """Apply configured acoustic augmentation to training batches only."""
+        if self.audio_augmenter is None or not torch.is_grad_enabled():
+            return audios
+        first_cut = next(iter(cuts), None)
+        if first_cut is None or not self._is_augmentation_task(getattr(first_cut, "task", "s2s_duplex")):
+            return audios
+        spans = None
+        if self.cfg.use_noise_aug and self.cfg.noise_snr_measure_region == "first_turn":
+            spans = self._noise_speech_power_spans(
+                cuts, multiturn_samples, alignments, clip_audio_durations_secs
+            )
+        return self.audio_augmenter.augment_batch(vars(self.cfg), audios, audio_lens, speech_power_spans=spans)
+
+    def _noise_speech_power_spans(self, cuts, multiturn_samples, alignments, durations):
+        """Crop-relative first substantive turn, or aligned ASR speech span."""
+        spans = []
+        for cut, sample, words, duration in zip(cuts, multiturn_samples, alignments, durations):
+            custom = cut.custom or {}
+            if sample is not None:
+                substantive = [s for s in sample.segments if s.turn_ordinal > 0 and not s.user_backchannel_event_id]
+                first = min(s.turn_ordinal for s in substantive)
+                segments = [s for s in substantive if s.turn_ordinal == first]
+                start, end = min(s.start_time for s in segments), max(s.end_time for s in segments)
+            elif "utterance_start_time" in custom or "utterance_end_time" in custom:
+                start, end = custom.get("utterance_start_time"), custom.get("utterance_end_time")
+            elif words:
+                start, end = min(w.start_time for w in words), max(w.end_time for w in words)
+            else:
+                raise ValueError(f"Cut {cut.id!r}: first-turn noise power requires turn bounds or word alignments")
+            if (not isinstance(start, Real) or not isinstance(end, Real)
+                    or not math.isfinite(start) or not math.isfinite(end)
+                    or not 0 <= start < end <= duration + 1e-6):
+                raise ValueError(f"Cut {cut.id!r}: invalid speech power bounds {start}, {end} for {duration}s")
+            lo = math.floor(start * self.cfg.sample_rate)
+            hi = min(round(duration * self.cfg.sample_rate), math.ceil(end * self.cfg.sample_rate))
+            if hi <= lo:
+                raise ValueError(f"Cut {cut.id!r}: empty speech power span")
+            spans.append((lo, hi))
+        return spans
 
     def _get_multiturn_samples(
         self,
@@ -2725,6 +2829,10 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             target_token_lens = torch.tensor(
                 [target_tokens.shape[1] for _ in range(len(all_target_ids))], dtype=torch.long
             )
+
+        audios = self._apply_audio_augmentation(
+            cuts, audios, audio_lens, multiturn_samples, alignments, clip_audio_durations_secs
+        )
 
         return StreamingSTTBatch(
             **exposure_metadata(cuts),
