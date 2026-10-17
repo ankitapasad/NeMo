@@ -224,18 +224,21 @@ def search(test, maximum, memory_fraction=.80, start_size=1):
 def check_hardware(output, *, create=False):
     import torch
     hardware = dict(gpu_model=torch.cuda.get_device_name(), gpu_total_bytes=torch.cuda.get_device_properties(0).total_memory, torch_version=torch.__version__, cuda_version=torch.version.cuda)
-    path = output/'hardware.json'
-    if path.exists():
-        if load_json(path) != hardware:
-            raise ValueError('Profiling hardware/software changed: use matching GPUs or a fresh output directory')
-    elif create:
-        write_json(path, hardware)
-    else:
-        raise ValueError('Run collect before profiling bins')
+    # Independent bin workers may arrive simultaneously on different GPUs.
+    import fcntl
+    with (output/'hardware.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        path = output/'hardware.json'
+        if path.exists():
+            if load_json(path) != hardware:
+                raise ValueError('Profiling hardware/software changed: use matching GPUs or a fresh output directory')
+        elif create:
+            write_json(path, hardware)
+        else:
+            raise ValueError('Run a GPU bin trial before validation')
 
 
 def collect_all(plan_path, plan, output):
-    check_hardware(output, create=True)
     tasks = []
     for name in plan['profiles']:
         geometry = load_json(output/name/'geometry.json')
@@ -252,7 +255,7 @@ def profile_bin(plan_path, plan, output, name, bucket):
     geometry = load_json(output/name/'geometry.json')
     if bucket is None or not 0 <= bucket < len(geometry['bucket_duration_bins']):
         raise ValueError('Invalid bucket index')
-    check_hardware(output)
+    check_hardware(output, create=True)
     if load_json(output/name/'collect.json')['status'] != 'PASS':
         raise ValueError('Candidate collection must pass first')
     selected = search(lambda size: run_worker(plan_path, output, 'trial', name, bucket, size), plan['max_batch_size'], plan['memory_fraction'])
@@ -372,8 +375,24 @@ def finalize(plan, output):
             **shared, multi_config=True, sampler_fusion='randomized_round_robin',
             sampler_weights=calibration['selection_weights'], **children))
     OmegaConf.save(cfg, output/'training.yaml')
+    source_calibration = None
+    requested = {k:p for k,p in plan['profiles'].items() if p.get('source_target_shares')}
+    if requested:
+        if len(plan['profiles']) != 1:
+            raise ValueError('source_target_shares currently requires one shared profile; use standalone source calibration per loader')
+        from nemo.collections.speechlm2.data.source_weight_calibration import run as calibrate_sources
+        profile = next(iter(requested.values()))
+        for report in reports.values():
+            report['measurement_stage'] = 'before_source_calibration'
+        source_calibration = calibrate_sources(
+            output/'training.yaml', profile['source_target_shares'], output/'source_calibration',
+            **profile.get('source_calibration', {}))
+        if source_calibration['status'] != 'PASS':
+            raise RuntimeError('Shared source weights did not pass verification; inspect source_calibration/REPORT.json')
+        cfg = OmegaConf.load(output/'source_calibration/training.yaml')
+        OmegaConf.save(cfg, output/'training.yaml')
     write_json(output/'REPORT.json', dict(status='BOUNDED_SINGLE_GPU_VALIDATION_PASSED', profiles=reports,
-               calibration=calibration, memory_fraction=plan['memory_fraction'],
+               calibration=calibration, source_calibration=source_calibration, memory_fraction=plan['memory_fraction'],
                limitations=['Bounded real candidate set, not exhaustive token extrema or all stochastic crops',
                             'Sampler measurement uses one rank; verify production distributed mixture and resume separately',
                             'GPU trials test source-specific and mixed stress batches; finite samples cannot guarantee no future OOM'],

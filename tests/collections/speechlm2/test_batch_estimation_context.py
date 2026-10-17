@@ -274,3 +274,224 @@ def test_plain_manifest_without_sample_id_matches_subsegments(source):
     assert len(matched) == len(rows)
     assert len({sample_identity(c) for c in meta}) == len(rows)
     assert {sample_identity(c) for c in real} == {x['source_id'] for x in requests}
+
+
+def test_selective_tar_collection_reads_only_selected_members_once(source, tmp_path, monkeypatch):
+    from nemo.collections.speechlm2.data.batch_collection import SelectedTarIterator
+    from nemo.collections.speechlm2.data.batch_estimation import cuts_for, sample_identity
+    from nemo.collections.speechlm2.data.batch_profiling import selected_crops
+    manifest, audio_tar, cfg, rows, _ = source
+    item = OmegaConf.to_container(OmegaConf.load(cfg)[0], resolve=True)
+    item['tags'] = dict(system_prompt='Transcribe with boundary events.', add_utterance_boundary_tokens=True, data_seen_source='arbitrary_source')
+    modes = ('sampled', 'minimum', 'maximum_leading', 'maximum_trailing')
+    requests = []
+    expected = {}
+    for mode in modes:
+        real = list(cuts_for(item, mode, 42, False))
+        for cut in real:
+            if sample_identity(cut) in ('s1', 's9'):
+                requests.append(dict(source_id=sample_identity(cut), mode=mode, duration=cut.duration))
+                expected[mode, sample_identity(cut)] = cut
+    # Reverse manifest order; selected membership must not depend on archive order.
+    manifest.write_text(''.join(json.dumps(row)+'\n' for row in reversed(rows)))
+    reader = SelectedTarIterator(item, requests, 42, tmp_path/'cache')
+    extracted = []
+    original = tarfile.TarFile.extractfile
+    def tracked(archive, member):
+        extracted.append(member.name)
+        return original(archive, member)
+    monkeypatch.setattr(tarfile.TarFile, 'extractfile', tracked)
+    for mode in reversed(modes):
+        selected = [r for r in requests if r['mode'] == mode]
+        for _, cut in selected_crops(reader.for_mode(mode), selected):
+            baseline = expected[mode, sample_identity(cut)]
+            assert cut.duration == baseline.duration
+            assert cut.start == baseline.start
+            assert cut.source_audio_offset == baseline.source_audio_offset
+            for key, value in item['tags'].items():
+                assert cut.custom[key] == baseline.custom[key] == value
+            np.testing.assert_array_equal(cut.load_audio(), baseline.load_audio())
+    assert extracted == ['a1.wav', 'a9.wav']
+    assert reader.members_read == 2
+    assert reader.shards_opened == 1
+    # A new process-equivalent reader reuses validated cache without reopening tar.
+    audio_tar.rename(audio_tar.with_suffix('.hidden'))
+    resumed = SelectedTarIterator(item, requests, 42, tmp_path/'cache')
+    assert len(list(resumed.for_mode('sampled'))) == 2
+    assert resumed.members_read == resumed.shards_opened == 0
+    cached = next(p for p in (tmp_path/'cache').iterdir() if p.suffix == '')
+    cached.write_bytes(b'corrupt')
+    with pytest.raises(ValueError, match='Cached recording changed'):
+        list(resumed.for_mode('sampled'))
+
+
+def test_selective_collection_never_opens_unselected_shards(source, tmp_path):
+    from nemo.collections.speechlm2.data.batch_collection import SelectedTarIterator
+    manifest, audio_tar, cfg, rows, _ = source
+    item = OmegaConf.to_container(OmegaConf.load(cfg)[0], resolve=True)
+    other = tmp_path/'manifest_1.jsonl'
+    row = dict(rows[0], sample_id='unselected', shard_id=1)
+    other.write_text(json.dumps(row)+'\n')
+    item['manifest_filepath'] = [str(manifest), str(other)]
+    item['tarred_audio_filepaths'] = [str(audio_tar), str(tmp_path/'audio_1.tar')]
+    reader = SelectedTarIterator(item, [dict(source_id='s0')], 42, tmp_path/'cache')
+    assert len(list(reader.for_mode('sampled'))) == 1
+    assert reader.shards_opened == reader.members_read == 1
+    with pytest.raises(ValueError, match='absent from manifest'):
+        SelectedTarIterator(item, [dict(source_id='missing')], 42, tmp_path/'other_cache')
+
+
+def test_cpu_collection_resume_receipts_without_model_or_cuda(source, tmp_path, monkeypatch):
+    """Real audio/cache orchestration; formatter stub isolates model dependencies."""
+    import sys
+    import types
+    import torch
+    from nemo.collections.speechlm2.data.batch_collection import collect
+    from nemo.collections.speechlm2.data.batch_pipeline import write_json, load_json
+    from nemo.collections.speechlm2.data.batch_estimation import cuts_for, sample_identity
+    from nemo.collections.speechlm2.data.batch_profiling import worker
+    _, _, cfg_path, _, _ = source
+    source_cfg = OmegaConf.to_container(OmegaConf.load(cfg_path)[0], resolve=True)
+    selected = []
+    for mode in ('sampled', 'maximum_trailing'):
+        cut = next(iter(cuts_for(source_cfg, mode, 42, True)))
+        selected.append(dict(id='0:0:'+mode, source_index=0, source_id=sample_identity(cut),
+                             mode=mode, duration=cut.duration, bucket=0))
+    output = tmp_path/'output'
+    write_json(output/'dai/geometry.json', dict(sources=[source_cfg], candidates=selected))
+    model_cfg = tmp_path/'model.yaml'
+    OmegaConf.save(OmegaConf.create(dict(model={}, data=dict(dataset=dict(sample_rate=16000)))), model_cfg)
+    plan = dict(model_config=str(model_cfg), seed=42)
+    args = types.SimpleNamespace(action='collect', output=output, profile='dai')
+    calls = []
+    class Dataset:
+        def __init__(self, **kwargs): pass
+        def __getitem__(self, cuts):
+            calls.append('decode')
+            for cut in cuts:
+                cut.load_audio()
+            return types.SimpleNamespace(cuts=cuts, audios=None, audio_lens=[1], text=['hello'])
+        def get_batch_data(self, *args):
+            return types.SimpleNamespace(audio_lens=[1], input_token_lens=[3], target_token_lens=[2])
+    monkeypatch.setattr(sys.modules['nemo.collections.speechlm2'], 'StreamingSTTDataset', Dataset, raising=False)
+    fake_model = types.ModuleType('nemo.collections.speechlm2.models.streaming_stt_model')
+    fake_model.StreamingSTTModelConfig = object
+    fake_model.setup_streaming_tokenizer = lambda cfg: (object(), '')
+    monkeypatch.setitem(sys.modules, fake_model.__name__, fake_model)
+    utils = types.ModuleType('nemo.collections.speechlm2.parts.utils')
+    utils.to_dataclass = lambda cls, cfg: cfg
+    monkeypatch.setitem(sys.modules, utils.__name__, utils)
+    alignments = types.ModuleType('nemo.collections.speechlm2.parts.alignments')
+    alignments.get_word_alignments_for_batch = lambda cuts: [['hello'] for _ in cuts]
+    monkeypatch.setitem(sys.modules, alignments.__name__, alignments)
+    def forbidden(*args, **kwargs):
+        raise AssertionError('Collection attempted CUDA initialization')
+    monkeypatch.setattr(torch.cuda, 'set_device', forbidden)
+    assert worker(args, plan) == 0
+    result = load_json(output/'dai/collect.json')
+    assert result['collection_device'] == 'cpu'
+    assert result['members_read'] == 1
+    assert len(result['candidates']) == len(calls) == 2
+    # Simulate interruption before the final report; receipts must avoid reformatting.
+    (output/'dai/collect.json').unlink()
+    calls.clear()
+    assert collect(args, plan) == 0
+    assert calls == []
+    assert load_json(output/'dai/collect.json')['members_read'] == 0
+
+
+def test_context_near_full_member_keeps_exact_crop(source):
+    from nemo.collections.speechlm2.data.batch_estimation import cuts_for
+    _, _, cfg, _, _ = source
+    item = OmegaConf.to_container(OmegaConf.load(cfg)[0], resolve=True)
+    item['context_sampling'].update(max_leading_s=2.86, max_trailing_s=10., max_duration_s=10.)
+    metadata = list(cuts_for(item, 'maximum_leading', 42, True))
+    actual = list(cuts_for(item, 'maximum_leading', 42, False))
+    for meta, cut in zip(metadata, actual):
+        assert meta.duration == pytest.approx(9.86)
+        assert cut.duration == pytest.approx(meta.duration, abs=1/16000)
+        assert cut.load_audio().shape[-1] == round(9.86*16000)
+
+
+def test_exact_crop_preserves_audio_offset_within_legacy_codec_tolerance(tmp_path):
+    from lhotse import Recording
+    from nemo.collections.common.data.lhotse.nemo_adapters import make_cut_with_subset_inmemory_recording
+    audio = np.linspace(-.9, .9, 16000, dtype=np.float32)
+    path = tmp_path/'ramp.wav'
+    sf.write(path, audio, 16000, subtype='FLOAT')
+    recording = Recording.from_file(path)
+    original = recording.load_audio()
+    cut = make_cut_with_subset_inmemory_recording(recording, offset=.14, duration=.86, exact_crop=True)
+    assert cut.duration == .86
+    np.testing.assert_allclose(cut.load_audio(), original[:, 2240:], atol=4e-5)
+    # Existing non-context codec tolerance remains unchanged.
+    legacy = make_cut_with_subset_inmemory_recording(recording, offset=0., duration=.86)
+    assert legacy.duration == 1.
+
+
+@pytest.mark.parametrize('with_context', [False, True])
+def test_header_only_reader_preserves_tar_order_epochs_and_crops(source, monkeypatch, with_context):
+    from lhotse import Recording
+    manifest, audio_tar, _, rows, context = source
+    # Deliberately disagree with archive order and include an excluded example.
+    rows[3]['_skipme'] = True
+    manifest.write_text(''.join(json.dumps(row)+'\n' for row in reversed(rows)))
+    kwargs = dict(context_sampling=context if with_context else None, shard_seed=17,
+                  shuffle_shards=True, slice_length=8)
+    real = LazyNeMoTarredIterator(str(manifest), str(audio_tar), **kwargs)
+    headers = LazyNeMoTarredIterator(str(manifest), str(audio_tar), audio_metadata_only=True, **kwargs)
+    expected = [list(real), list(real)]
+    def forbid_audio(*args, **kwargs):
+        raise AssertionError('Header-only measurement must never decode audio')
+    monkeypatch.setattr(Recording, 'load_audio', forbid_audio)
+    actual = [list(headers), list(headers)]
+    for audio_epoch, header_epoch in zip(expected, actual):
+        assert len(audio_epoch) == len(header_epoch)
+        for audio, header in zip(audio_epoch, header_epoch):
+            assert (header.id, header.duration, header.start, header.num_samples) == (
+                audio.id, audio.duration, audio.start, audio.num_samples)
+            assert header.custom == audio.custom
+            assert header.recording.sources[0].source == b''
+
+
+def test_header_only_native_sampler_matches_audio_batches(source, tmp_path):
+    from nemo.collections.common.data.lhotse.dataloader import get_lhotse_dataloader_from_config
+    from nemo.collections.speechlm2.data.batch_pipeline import MeasureCuts
+    manifest, audio_tar, _, rows, context = source
+    manifest.write_text(''.join(json.dumps(row)+'\n' for row in reversed(rows)))
+    entries = [dict(type='nemo_tarred',manifest_filepath=str(manifest),
+                   tarred_audio_filepaths=str(audio_tar),context_sampling=context,
+                   weight=weight,tags={'data_seen_source':name})
+               for name, weight in [('short',1.),('long',2.)]]
+    def batches(headers):
+        current=copy.deepcopy(entries)
+        for entry in current: entry['tarred_audio_metadata_only']=headers
+        cfg=OmegaConf.create(dict(input_cfg=current,num_workers=0,force_iterable_dataset=True,
+            shuffle=True,seed=42,shard_seed=42,use_bucketing=True,bucket_duration_bins=[5.,9.],
+            bucket_batch_size=[3,1],bucket_buffer_size=20,shuffle_buffer_size=10,
+            concurrent_bucketing=False))
+        loader=get_lhotse_dataloader_from_config(cfg,global_rank=0,world_size=1,dataset=MeasureCuts())
+        import itertools
+        return list(itertools.islice(loader,100))
+    assert batches(True) == batches(False)
+
+
+def test_header_calibration_exports_audio_capable_input(source, tmp_path):
+    from nemo.collections.speechlm2.data.source_weight_calibration import run
+    manifest, audio_tar, _, _, context = source
+    inputs=tmp_path/'sources.yaml'
+    OmegaConf.save(OmegaConf.create([dict(type='nemo_tarred',manifest_filepath=str(manifest),
+        tarred_audio_filepaths=str(audio_tar),context_sampling=context,weight=1.,
+        tags={'data_seen_source':'only'})]),inputs)
+    config=tmp_path/'training.yaml'
+    OmegaConf.save(OmegaConf.create(dict(data=dict(train_ds=dict(input_cfg=str(inputs),num_workers=0,
+        shuffle=True,shard_seed=42,seed=42,use_bucketing=True,bucket_duration_bins=[9.],
+        bucket_batch_size=[2],bucket_buffer_size=8,shuffle_buffer_size=8,
+        concurrent_bucketing=False)))),config)
+    result=run(config,{'only':1.},tmp_path/'out',reader='headers',warmup_batches=5,
+               measurement_batches=10,verification_batches=10,max_iterations=1)
+    assert result['status']=='PASS' and result['reader']=='headers'
+    assert result['history'][0]['verification_counts']=={'only':20}
+    exported=OmegaConf.load(tmp_path/'out/input.yaml')
+    assert 'tarred_audio_metadata_only' not in exported[0]
+    assert OmegaConf.load(tmp_path/'out/input_iteration_0.yaml')[0].tarred_audio_metadata_only

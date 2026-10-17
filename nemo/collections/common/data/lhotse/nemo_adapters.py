@@ -834,6 +834,7 @@ class LazyNeMoTarredIterator:
         extra_fields: list[dict[str, str]] | None = None,
         slice_length: int = None,
         context_sampling: Mapping | None = None,
+        audio_metadata_only: bool = False,
     ) -> None:
         self.skip_missing_manifest_entries = skip_missing_manifest_entries
         self.shard_id_to_manifest: dict[int, Iterable[dict]]
@@ -880,6 +881,8 @@ class LazyNeMoTarredIterator:
         self.extra_fields = extra_fields
         self.slice_length = slice_length
         self.context_sampling = _validate_context_sampling_config(context_sampling)
+        # Analysis-only: preserve tar ordering/repetition while reading headers, not waveforms.
+        self.audio_metadata_only = audio_metadata_only
         self.epoch = 0
         self._validate()
         self.use_ais_get_batch = os.environ.get("USE_AIS_GET_BATCH", "False").lower() == "true"
@@ -900,6 +903,7 @@ class LazyNeMoTarredIterator:
                     text_field=self.text_field,
                     lang_field=self.lang_field,
                     context_sampling=self.context_sampling,
+                    audio_metadata_only=self.audio_metadata_only,
                 )
                 for path, tarpath in zip(self.paths, self.shard_id_to_tar_path.values())
             ]
@@ -1020,7 +1024,8 @@ class LazyNeMoTarredIterator:
             else -1
         )
         cntr = 0
-        with tarfile.open(fileobj=open_best(tar_path, mode="rb"), mode="r|*") as tar:
+        with tarfile.open(fileobj=open_best(tar_path, mode="rb"),
+                          mode="r:" if self.audio_metadata_only else "r|*") as tar:
             for idx, tar_info in enumerate(tar):
                 if idx < slice_offset:
                     continue
@@ -1028,7 +1033,15 @@ class LazyNeMoTarredIterator:
                     break
                 try:
                     data = shard_manifest[tar_info.name]
-                    raw_audio = tar.extractfile(tar_info).read()
+                    if self.audio_metadata_only:
+                        # Seek past uncompressed payloads; soundfile reads only their headers.
+                        # Invalid headers are handled by the same skip branch as the audio path.
+                        try:
+                            raw_audio = soundfile.info(tar.extractfile(tar_info))
+                        except Exception as error:
+                            raw_audio = error
+                    else:
+                        raw_audio = tar.extractfile(tar_info).read()
                     yield data, raw_audio, tar_info
                     cntr += 1
                 except KeyError as e:
@@ -1069,8 +1082,8 @@ class LazyNeMoTarredIterator:
             tar_path = self.shard_id_to_tar_path[sid]
 
             if self.use_ais_get_batch:
-                if self.context_sampling is not None:
-                    raise RuntimeError("context_sampling is not supported with USE_AIS_GET_BATCH=true")
+                if self.audio_metadata_only or self.context_sampling is not None:
+                    raise RuntimeError("context sampling/header-only analysis is not supported with USE_AIS_GET_BATCH=true")
                 # Use batch reading mode - URL-based recordings without opening tar files
                 yield from self._iter_batch_for_ais_get_batch(
                     tar_path, shard_manifest, manifest_path, rng, extra_fields
@@ -1079,13 +1092,18 @@ class LazyNeMoTarredIterator:
             try:
                 for data, raw_audio, tar_info in self._iter_sequential(tar_path, shard_manifest, manifest_path, rng):
                     try:
-                        meta = soundfile.info(BytesIO(raw_audio))
+                        if self.audio_metadata_only:
+                            if isinstance(raw_audio, Exception):
+                                raise raw_audio
+                            meta = raw_audio
+                        else:
+                            meta = soundfile.info(BytesIO(raw_audio))
                     except Exception:
                         logging.warning(f"Skipped corrupted file '{tar_info.path}' in {tar_path=}.")
                         continue
                     recording = Recording(
                         id=tar_info.path,
-                        sources=[AudioSource(type="memory", channels=list(range(meta.channels)), source=raw_audio)],
+                        sources=[AudioSource(type="memory", channels=list(range(meta.channels)), source=b"" if self.audio_metadata_only else raw_audio)],
                         sampling_rate=int(meta.samplerate),
                         num_samples=meta.frames,
                         duration=meta.duration,
@@ -1106,7 +1124,9 @@ class LazyNeMoTarredIterator:
                         data = _project_precomputed_word_alignments(data)
                         # Cut the recording into corresponding segment and discard audio data outside the segment.
                         cut = make_cut_with_subset_inmemory_recording(
-                            recording, offset=data.get("offset", 0.0), duration=data.get("duration")
+                            recording, offset=data.get("offset", 0.0), duration=data.get("duration"),
+                            exact_crop=self.context_sampling is not None,
+                            materialize_audio=not self.audio_metadata_only,
                         )
                         cut.supervisions.append(
                             SupervisionSegment(
@@ -1128,6 +1148,8 @@ class LazyNeMoTarredIterator:
                     del raw_audio
                     yield from cuts_for_recording
             except tarfile.ReadError:
+                if self.audio_metadata_only:
+                    raise ValueError("Header-only analysis requires readable uncompressed seekable tar files")
                 logging.warning(
                     f"Skipping tar file due to read errors (unstable storage or bad file?): {tar_path=}",
                 )
@@ -1142,7 +1164,8 @@ class LazyNeMoTarredIterator:
 
 
 def make_cut_with_subset_inmemory_recording(
-    recording: Recording, offset: float = 0.0, duration: float | None = None
+    recording: Recording, offset: float = 0.0, duration: float | None = None, *, exact_crop: bool = False,
+    materialize_audio: bool = True,
 ) -> Cut:
     """
     This method is built specifically to optimize CPU memory usage during dataloading
@@ -1156,7 +1179,13 @@ def make_cut_with_subset_inmemory_recording(
 
     # Fast path: no offset and (almost) matching duration (within 200ms; leeway for different audio codec behavior).
     cut = recording.to_cut()
-    if offset == 0.0 and duration is None or abs(duration - recording.duration) < 0.2:
+    if exact_crop:
+        # Context metadata and alignments describe this exact crop. The legacy
+        # codec tolerance can otherwise return extra leading audio (up to 200ms).
+        if offset == 0.0 and (duration is None or
+                             compute_num_samples(duration, recording.sampling_rate) == recording.num_samples):
+            return cut
+    elif offset == 0.0 and duration is None or abs(duration - recording.duration) < 0.2:
         return cut
 
     # Otherwise, apply the memory optimization.
@@ -1166,6 +1195,12 @@ def make_cut_with_subset_inmemory_recording(
         raise RuntimeError(
             f"Lhotse cut.truncate failed with offset={offset}, duration={duration}, recording={recording}: {e}"
         ) from e
+
+    if not materialize_audio:
+        # Match the materialized cut's zero-based geometry without loading audio.
+        return Recording(id=recording.id, sources=recording.sources,
+                         sampling_rate=recording.sampling_rate,
+                         num_samples=cut.num_samples, duration=cut.duration).to_cut()
 
     audiobytes = BytesIO()
     LibsndfileBackend().save_audio(audiobytes, cut.load_audio(), sampling_rate=cut.sampling_rate, format="wav")

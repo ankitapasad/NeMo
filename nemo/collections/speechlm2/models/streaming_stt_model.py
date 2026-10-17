@@ -138,6 +138,103 @@ def interleave_embeddings(
     return {"input_embeds": embeds, "attention_mask": attention_mask}
 
 
+def setup_streaming_tokenizer(core_cfg, resize_embeddings=None):
+    """Build the training tokenizer without loading model weights or using CUDA.
+
+    Collection and training must register tokens in the same order so formatted
+    targets have identical IDs. Keep all special-token registration here.
+    """
+    tokenizer = AutoTokenizer(core_cfg.pretrained_llm, use_fast=True)
+    compact_write_token = (None if core_cfg.compact_text_end_only_no_blank else
+                          core_cfg.text_start_token if core_cfg.use_text_tokens else core_cfg.write_token)
+    def add_tokens(tokens):
+        tokenizer.add_special_tokens({"additional_special_tokens": tokens})
+        if resize_embeddings is not None:
+            resize_embeddings(len(tokenizer.tokenizer))
+
+    # Ensure <blank> token is in the vocabulary.
+    # Unescape Python escape sequences (e.g. "\\n" → "\n") because Hydra/OmegaConf
+    # loads YAML strings literally without interpreting backslash escapes.
+    # An empty blank_token ("") disables the blank mechanism entirely
+    # (fixed chunking only — see StreamingSTTDataset for the guard).
+    blank_token = core_cfg.blank_token.encode().decode('unicode_escape')
+    if core_cfg.compact_text_end_only_no_blank:
+        blank_token = ""
+
+    if blank_token == "":
+        logging.info("blank_token is empty: blank mechanism disabled")
+    elif not token_in_vocab(blank_token, tokenizer):
+        add_tokens([blank_token])
+        logging.info(f"Added blank token `{blank_token}` to tokenizer: {tokenizer.text_to_ids(blank_token)[0]}")
+    else:
+        logging.info(f"Blank token `{str(blank_token)}` already in tokenizer: {tokenizer.text_to_ids(blank_token)[0]}")
+
+    if core_cfg.add_utterance_boundary_tokens:
+        boundary_tokens = [core_cfg.utterance_start_token, core_cfg.utterance_end_token]
+        missing_boundary_tokens = [tok for tok in boundary_tokens if not token_in_vocab(tok, tokenizer)]
+        if missing_boundary_tokens:
+            add_tokens(missing_boundary_tokens)
+            logging.info(f"Added utterance boundary tokens to tokenizer: {missing_boundary_tokens}")
+        else:
+            logging.info(f"Utterance boundary tokens already in tokenizer: {boundary_tokens}")
+
+    if core_cfg.user_backchannel_mode in {
+        USER_BACKCHANNEL_MODE_SOB_EOU,
+        USER_BACKCHANNEL_MODE_SOB_EOB,
+    }:
+        user_backchannel_tokens = [core_cfg.user_backchannel_start_token]
+        if core_cfg.user_backchannel_mode == USER_BACKCHANNEL_MODE_SOB_EOB:
+            user_backchannel_tokens.append(core_cfg.user_backchannel_end_token)
+        missing_user_backchannel_tokens = [
+            token
+            for token in user_backchannel_tokens
+            if not token_in_vocab(token, tokenizer)
+        ]
+        if missing_user_backchannel_tokens:
+            add_tokens(missing_user_backchannel_tokens)
+            logging.info(
+                "Added user backchannel tokens to tokenizer: %s",
+                missing_user_backchannel_tokens,
+            )
+        else:
+            logging.info(
+                "User backchannel tokens already in tokenizer: %s",
+                user_backchannel_tokens,
+            )
+
+    if core_cfg.enable_agent_backchannels:
+        backchannel_tokens = [
+            core_cfg.agent_backchannel_start_token,
+            core_cfg.agent_backchannel_end_token,
+        ]
+        missing_backchannel_tokens = [
+            token for token in backchannel_tokens if not token_in_vocab(token, tokenizer)
+        ]
+        if missing_backchannel_tokens:
+            add_tokens(missing_backchannel_tokens)
+            logging.info(f"Added agent backchannel tokens to tokenizer: {missing_backchannel_tokens}")
+        else:
+            logging.info(f"Agent backchannel tokens already in tokenizer: {backchannel_tokens}")
+
+    # Compact-template boundary tokens: default keeps the existing Qwen
+    # <|im_start|>/<|im_end|> behavior. When use_text_tokens=True, add the
+    # text markers if the tokenizer does not already know them.
+    if core_cfg.compact_template:
+        compact_tokens = []
+        if compact_write_token is not None:
+            compact_tokens.append(compact_write_token)
+        if core_cfg.use_text_tokens:
+            compact_tokens.append(core_cfg.text_end_token)
+        tokens_to_add = [tok for tok in compact_tokens if not token_in_vocab(tok, tokenizer)]
+        if tokens_to_add:
+            add_tokens(tokens_to_add)
+            logging.info(f"compact_template: added tokens {tokens_to_add} to tokenizer (random init)")
+        for tok in compact_tokens:
+            logging.info(f"compact_template: using token `{tok}`")
+
+    return tokenizer, blank_token
+
+
 @dataclass
 class StreamingSTTModelConfig:
     pretrained_llm: str
@@ -161,6 +258,8 @@ class StreamingSTTModelConfig:
     perception: Optional[dict] = None
     optimizer: Optional[dict] = None
     lr_scheduler: Optional[dict] = None
+    # Recompute LLM activations during backward; independent of saving checkpoints.
+    llm_gradient_checkpointing: bool = False
     audio_tag: str = "<audio>"
     att_context_size: Optional[List[int]] = None
     audio_pad_to: Optional[int] = None
@@ -453,6 +552,18 @@ class StreamingGenerationRecord:
 
 class StreamingSTTModel(LightningModule, HFHubMixin):
 
+    def _configure_activation_checkpointing(self):
+        if not self.core_cfg.llm_gradient_checkpointing:
+            return
+        # Native HF/PEFT support: non-reentrant checkpointing supports frozen
+        # embeddings and LoRA; preserve dropout RNG during recomputation.
+        self.llm.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False, "preserve_rng_state": True}
+        )
+        if not self.llm.is_gradient_checkpointing:
+            raise RuntimeError("Requested LLM gradient checkpointing was not enabled")
+        logging.info("LLM activation checkpointing enabled (non-reentrant, RNG preserved)")
+
     def __init__(
         self,
         cfg: dict,
@@ -570,98 +681,14 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             raise ValueError("agent backchannel start/end tokens must be non-empty and different")
 
         # --- LLM ---
-        self.tokenizer = AutoTokenizer(self.core_cfg.pretrained_llm, use_fast=True)
         self.llm = load_pretrained_hf(
             self.core_cfg.pretrained_llm,
             pretrained_weights=self.core_cfg.load_llm_weights,
         )
 
-        # Ensure <blank> token is in the vocabulary.
-        # Unescape Python escape sequences (e.g. "\\n" → "\n") because Hydra/OmegaConf
-        # loads YAML strings literally without interpreting backslash escapes.
-        # An empty blank_token ("") disables the blank mechanism entirely
-        # (fixed chunking only — see StreamingSTTDataset for the guard).
-        self.blank_token = self.core_cfg.blank_token.encode().decode('unicode_escape')
-        if self.core_cfg.compact_text_end_only_no_blank:
-            self.blank_token = ""
-
-        if self.blank_token == "":
-            logging.info("blank_token is empty: blank mechanism disabled")
-        elif not token_in_vocab(self.blank_token, self.tokenizer):
-            self.tokenizer.add_special_tokens({"additional_special_tokens": [self.blank_token]})
-            self.llm.resize_token_embeddings(len(self.tokenizer.tokenizer))
-            logging.info(f"Added blank token `{self.blank_token}` to tokenizer: {self.blank_token_id}")
-        else:
-            logging.info(f"Blank token `{str(self.blank_token)}` already in tokenizer: {self.blank_token_id}")
-
-        if self.core_cfg.add_utterance_boundary_tokens:
-            boundary_tokens = [self.core_cfg.utterance_start_token, self.core_cfg.utterance_end_token]
-            missing_boundary_tokens = [tok for tok in boundary_tokens if not token_in_vocab(tok, self.tokenizer)]
-            if missing_boundary_tokens:
-                self.tokenizer.add_special_tokens({"additional_special_tokens": missing_boundary_tokens})
-                self.llm.resize_token_embeddings(len(self.tokenizer.tokenizer))
-                logging.info(f"Added utterance boundary tokens to tokenizer: {missing_boundary_tokens}")
-            else:
-                logging.info(f"Utterance boundary tokens already in tokenizer: {boundary_tokens}")
-
-        if self.user_backchannel_mode in {
-            USER_BACKCHANNEL_MODE_SOB_EOU,
-            USER_BACKCHANNEL_MODE_SOB_EOB,
-        }:
-            user_backchannel_tokens = [self.user_backchannel_start_token]
-            if self.user_backchannel_mode == USER_BACKCHANNEL_MODE_SOB_EOB:
-                user_backchannel_tokens.append(self.user_backchannel_end_token)
-            missing_user_backchannel_tokens = [
-                token
-                for token in user_backchannel_tokens
-                if not token_in_vocab(token, self.tokenizer)
-            ]
-            if missing_user_backchannel_tokens:
-                self.tokenizer.add_special_tokens(
-                    {"additional_special_tokens": missing_user_backchannel_tokens}
-                )
-                self.llm.resize_token_embeddings(len(self.tokenizer.tokenizer))
-                logging.info(
-                    "Added user backchannel tokens to tokenizer: %s",
-                    missing_user_backchannel_tokens,
-                )
-            else:
-                logging.info(
-                    "User backchannel tokens already in tokenizer: %s",
-                    user_backchannel_tokens,
-                )
-
-        if self.core_cfg.enable_agent_backchannels:
-            backchannel_tokens = [
-                self.core_cfg.agent_backchannel_start_token,
-                self.core_cfg.agent_backchannel_end_token,
-            ]
-            missing_backchannel_tokens = [
-                token for token in backchannel_tokens if not token_in_vocab(token, self.tokenizer)
-            ]
-            if missing_backchannel_tokens:
-                self.tokenizer.add_special_tokens({"additional_special_tokens": missing_backchannel_tokens})
-                self.llm.resize_token_embeddings(len(self.tokenizer.tokenizer))
-                logging.info(f"Added agent backchannel tokens to tokenizer: {missing_backchannel_tokens}")
-            else:
-                logging.info(f"Agent backchannel tokens already in tokenizer: {backchannel_tokens}")
-
-        # Compact-template boundary tokens: default keeps the existing Qwen
-        # <|im_start|>/<|im_end|> behavior. When use_text_tokens=True, add the
-        # text markers if the tokenizer does not already know them.
-        if self.core_cfg.compact_template:
-            compact_tokens = []
-            if self._compact_write_token is not None:
-                compact_tokens.append(self._compact_write_token)
-            if self.core_cfg.use_text_tokens:
-                compact_tokens.append(self.core_cfg.text_end_token)
-            tokens_to_add = [tok for tok in compact_tokens if not token_in_vocab(tok, self.tokenizer)]
-            if tokens_to_add:
-                self.tokenizer.add_special_tokens({"additional_special_tokens": tokens_to_add})
-                self.llm.resize_token_embeddings(len(self.tokenizer.tokenizer))
-                logging.info(f"compact_template: added tokens {tokens_to_add} to tokenizer (random init)")
-            for tok in compact_tokens:
-                logging.info(f"compact_template: using token `{tok}`")
+        self.tokenizer, self.blank_token = setup_streaming_tokenizer(
+            self.core_cfg, resize_embeddings=self.llm.resize_token_embeddings
+        )
 
         # Separate embedding layer to avoid FSDP/TP conflicts (same pattern as SALM)
         self.embed_tokens = self.llm.model.embed_tokens
@@ -706,6 +733,8 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 freeze_module(self.llm.lm_head)
             else:
                 unfreeze_module(self.llm.lm_head)
+
+        self._configure_activation_checkpointing()
 
         if forced_aligner is not None:
             assert data_cfg is not None, "Dataset config is required for online forced alignment"

@@ -36,6 +36,9 @@ def selected_crops(cuts, requested):
 
 
 def worker(args, plan):
+    if args.action == 'collect':
+        from nemo.collections.speechlm2.data.batch_collection import collect
+        return collect(args, plan)
     import torch
     from lightning.pytorch import Trainer, Callback, seed_everything
     from omegaconf import OmegaConf
@@ -122,32 +125,6 @@ def worker(args, plan):
                 raise ValueError('Real target formatter dropped examples')
             return result
 
-        if args.action == 'collect':
-            geometry = load_json(destination/'geometry.json')
-            candidates = []
-            saved_cuts = []
-            audio_dir = destination/'candidate_audio'; audio_dir.mkdir(exist_ok=True)
-            by_source = {}
-            for c in geometry['candidates']:
-                by_source.setdefault((c['source_index'], c['mode']), []).append(c)
-            for (index, mode), requested in by_source.items():
-                cuts = cuts_for(geometry['sources'][index], mode, plan['seed'], False)
-                for item, cut in selected_crops(cuts, requested):
-                    cut = cut.resample(cfg.data.dataset.sample_rate)
-                    # Materialize only the bounded selected crops into this private run directory.
-                    path = audio_dir/(item['id'].replace(':', '_')+'.wav')
-                    cut = cut.save_audio(str(path))
-                    cut.id = item['id']
-                    batch = formatted(CutSet.from_cuts([cut]))
-                    candidates.append(dict(item, input_tokens=int(batch.input_token_lens[0]),
-                                           target_tokens=int(batch.target_token_lens[0]), audio_sha256=digest(path)))
-                    saved_cuts.append(cut)
-            cuts_path = destination/'candidates.jsonl.gz'
-            CutSet.from_cuts(saved_cuts).to_file(cuts_path)
-            write_json(report_path, dict(status='PASS', candidates=candidates, cuts_sha256=digest(cuts_path),
-                                        gpu_model=torch.cuda.get_device_name(), gpu_total_bytes=torch.cuda.get_device_properties(0).total_memory))
-            return 0
-
         collected = load_json(destination/'collect.json')
         cuts_path = destination/'candidates.jsonl.gz'
         if digest(cuts_path) != collected['cuts_sha256']:
@@ -218,6 +195,7 @@ def worker(args, plan):
                     gpu_total_bytes=torch.cuda.get_device_properties(0).total_memory,
                     budgeted_peak_bytes=max(r['budgeted_peak_bytes'] for r in records),
                     trainable_parameters=sum(p.numel() for p in model.parameters() if p.requires_grad),
+                    llm_gradient_checkpointing=bool(model.llm.is_gradient_checkpointing),
                     selected_sha256=digest(destination/'selected.json') if selected is not None else None))
         return 0
     except torch.cuda.OutOfMemoryError as error:
